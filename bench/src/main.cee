@@ -14,6 +14,7 @@
 //   GET  /crash          traps (an index out of bounds), which ends the process
 //   GET  /spin           computes without end, which stops the event loop
 //   GET  /gz/{n:int}     n bytes of JSON-like text through `Compression`: gzip for a client that accepts it
+//   GET  /z/{n:int}      the same text through `Codings`: zstd or Brotli, or gzip for a client that takes neither
 //   GET  /chat           a WebSocket: every message a session sends goes to all the sessions of this process
 //   GET  /bloat          allocates until an allocation fails, then answers how many MiB it got
 //
@@ -28,6 +29,7 @@ import web_transport;
 import web_http;
 import httpserver;
 import httpserver_ws;
+import httpserver_compress;
 import web_ws;
 import json.JsonWriter;
 
@@ -251,6 +253,30 @@ fn word(k: u32) -> StringView => match (k) {
     _ => "null,",
 };
 
+/// `n` bytes of the JSON-like text.
+fn jsonLike(n: usize) -> Result<Vector<u8>, HandlerError> {
+    var body = Vector<u8>.create();
+    var x: u32 = 12345;
+    while (body.length < n) {
+        x = x.wrappingMul(1103515245).wrappingAdd(12345);
+        for (b in word((x >> 16) % 8).bytes()) {
+            if (body.length < n) {
+                match (body.push(b)) {
+                    Ok() => {}
+                    Err(_) => { return Err(HandlerError.Internal); }
+                }
+            }
+        }
+    }
+    return Ok(body);
+}
+
+/// The route's `n`, up to 16 MiB.
+fn asked(ctx: borrow Context<St>) -> usize {
+    let wanted = ctx.paramInt("n") ?? 0;
+    return if (wanted < 0 || wanted > 16777216) 0usize else truncate<usize>(wanted);
+}
+
 impl Handler<St> for Packed {
     async fn handle(
         borrow this,
@@ -258,22 +284,25 @@ impl Handler<St> for Packed {
         request: borrow Request,
         exchange: borrow mut Exchange,
     ) -> Result<void, HandlerError> {
-        let wanted = ctx.paramInt("n") ?? 0;
-        let n = if (wanted < 0 || wanted > 16777216) 0usize else truncate<usize>(wanted);
-        var body = Vector<u8>.create();
-        var x: u32 = 12345;
-        while (body.length < n) {
-            x = x.wrappingMul(1103515245).wrappingAdd(12345);
-            for (b in word((x >> 16) % 8).bytes()) {
-                if (body.length < n) {
-                    match (body.push(b)) {
-                        Ok() => {}
-                        Err(_) => { return Err(HandlerError.Internal); }
-                    }
-                }
-            }
-        }
+        let body = jsonLike(asked(ctx))?;
         return await this.compression.send(request, exchange, Status.ok(), "application/json", body.view());
+    }
+}
+
+/// The same text through `Codings`.
+struct Coded {
+    codings: Codings;
+}
+
+impl Handler<St> for Coded {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut Context<St>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        let body = jsonLike(asked(ctx))?;
+        return await this.codings.send(request, exchange, Status.ok(), "application/json", body.view());
     }
 }
 
@@ -422,6 +451,13 @@ fn application(worker: u32) -> Result<App<St>, RouteError> {
     app.get("/spin", handler(Box.create(Spin {}))?)?;
     app.get("/bloat", handler(Box.create(Bloat {}))?)?;
     app.get("/chat", handler(Box.create(Chat {}))?)?;
+    var coding = CodingOptions.defaults();
+    coding.gzip = true;
+    let codings = match (Codings.create(coding)) {
+        Ok(c) => c,
+        Err(_) => { return Err(RouteError.OutOfMemory); },
+    };
+    app.get("/z/{n:int}", handler(Box.create(Coded { codings: codings }))?)?;
     let compression = match (Compression.create(1024)) {
         Ok(c) => c,
         Err(_) => { return Err(RouteError.OutOfMemory); },

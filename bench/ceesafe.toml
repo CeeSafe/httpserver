@@ -8,6 +8,7 @@ ceesafec = ">=0.62.2"
 [dependencies]
 httpserver = { path = ".." }
 httpserver_ws = { path = "../ws" }
+httpserver_compress = { path = "../compress" }
 web_ws = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "4bb64c6712d9c876a78d33d0214ea8b875f222ff", dir = "packages/web_ws" }
 web_core = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "4bb64c6712d9c876a78d33d0214ea8b875f222ff", dir = "packages/web_core" }
 web_transport = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "4bb64c6712d9c876a78d33d0214ea8b875f222ff", dir = "packages/web_transport" }

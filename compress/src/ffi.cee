@@ -1,0 +1,47 @@
+// The package's bridge to libzstd and libbrotli: their functions declared directly, with C's `size_t` as `usize`,
+// `int` as `i32` and their opaque types as `void *`. Both libraries allocate with their own allocators, which
+// CeeSafe's `alloc` effect does not track; a failed allocation inside them comes back as an error.
+
+extern "C" {
+    /// A compression context, to be freed with `ZSTD_freeCCtx`; null if out of memory.
+    @effects()
+    fn ZSTD_createCCtx() -> *mut void;
+    @effects()
+    fn ZSTD_freeCCtx(context: *mut void) -> usize;
+    /// The most bytes `sourceSize` bytes can compress to.
+    @effects()
+    fn ZSTD_compressBound(sourceSize: usize) -> usize;
+    /// Compresses into one frame; the frame's size, or an error code (`ZSTD_isError`).
+    @effects()
+    fn ZSTD_compressCCtx(
+        context: *mut void,
+        destination: *mut u8,
+        capacity: usize,
+        source: *u8,
+        sourceSize: usize,
+        level: i32,
+    ) -> usize;
+    @effects()
+    fn ZSTD_decompress(destination: *mut u8, capacity: usize, source: *u8, sourceSize: usize) -> usize;
+    @effects()
+    fn ZSTD_isError(code: usize) -> u32;
+
+    /// The most bytes `inputSize` bytes can compress to, or 0 if that is too large to say.
+    @effects()
+    fn BrotliEncoderMaxCompressedSize(inputSize: usize) -> usize;
+    /// Compresses in one call; `mode` is 0 (generic) or 1 (UTF-8 text). On entry `*encodedSize` is the room, on
+    /// success (1) the size.
+    @effects()
+    fn BrotliEncoderCompress(
+        quality: i32,
+        window: i32,
+        mode: i32,
+        inputSize: usize,
+        input: *u8,
+        encodedSize: *mut usize,
+        encoded: *mut u8,
+    ) -> i32;
+    /// 1 on success.
+    @effects()
+    fn BrotliDecoderDecompress(encodedSize: usize, encoded: *u8, decodedSize: *mut usize, decoded: *mut u8) -> i32;
+}

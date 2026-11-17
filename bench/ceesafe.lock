@@ -5,6 +5,10 @@ name = "httpserver"
 source = "path+.."
 
 [[package]]
+name = "httpserver_compress"
+source = "path+../compress"
+
+[[package]]
 name = "httpserver_ws"
 source = "path+../ws"
 

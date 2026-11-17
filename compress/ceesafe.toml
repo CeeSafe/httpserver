@@ -1,0 +1,22 @@
+[package]
+name = "httpserver_compress"
+version = "0.1.0"
+kind = "library"
+sources = ["src"]
+tests = ["tests"]
+ceesafec = ">=0.62.2"
+# Zstandard and Brotli are the reference C libraries, called directly (src/ffi.cee declares what it calls; no header
+# is needed). libbrotlidec is linked for the tests, which inflate what was compressed.
+links = ["zstd", "brotlienc", "brotlidec"]
+
+# Homebrew (Apple Silicon): `brew install zstd brotli`. On Linux the distribution's libraries are on the default
+# paths: `apt install libzstd-dev libbrotli-dev`.
+[target.macos]
+lib-dirs = ["/opt/homebrew/opt/zstd/lib", "/opt/homebrew/opt/brotli/lib"]
+
+[dependencies]
+httpserver = { path = ".." }
+web_core = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "4bb64c6712d9c876a78d33d0214ea8b875f222ff", dir = "packages/web_core" }
+web_transport = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "4bb64c6712d9c876a78d33d0214ea8b875f222ff", dir = "packages/web_transport" }   # the tests' mock connection
+web_http = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "4bb64c6712d9c876a78d33d0214ea8b875f222ff", dir = "packages/web_http" }
+web_http1 = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "4bb64c6712d9c876a78d33d0214ea8b875f222ff", dir = "packages/web_http1" }

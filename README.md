@@ -64,20 +64,14 @@ impl Handler<Shop> for Item {
   so nothing is stored, nothing is shared between workers, and there is no session id to fix; `Csrf` is the signed
   double-submit token: a cookie on the first visit, and 403 for a request that changes something without the same
   token in `x-csrf-token`.
-- **Compression.** `Compression.send` answers with gzip when the request accepts it, the body is not small and gzip
-  makes it smaller, and marks such responses `vary: accept-encoding`. The encoder uses fixed Huffman codes: JSON-like
-  text comes out at about a sixth of its size. `tools/gzip_check.py` checks it against Python's gzip.
-- **Forms.** `Form.value` for a URL-encoded body, and `Multipart` for `multipart/form-data` (RFC 7578): the parts
-  of a body already read, as views of it (name, file name, content type, bytes), with `failed()` for a body that is
-  not multipart or was cut.
-- **Static files** (`static/`, the package `httpserver_static`, on CeeSafe.Web's `web_static`): `Files` serves a
-  root with media types, ETag and Last-Modified, conditional requests, one range, and `sendFile`; a path that leaves
-  the root is 404. `FilesOptions.singlePage("index.html")` answers a single-page application's routes with its page.
-- **A WebSocket hub** (`ws/`, the package `httpserver_ws`, on CeeSafe.Web's `web_ws`): the sessions of an
-  application, and messages to all of them, to a group or to one. A message is queued for each session without
-  waiting, so a client that does not read holds up nobody; what its full queue missed is counted. A membership leaves
-  the hub when it is dropped. The hub is one process's: under the supervisor a broadcast reaches the sessions of the
-  worker that makes it. `tools/ws_check.py` checks it end to end with clients written from RFC 6455.
+- **Compression** (`compress/`, the package `httpserver_compress`, on libzstd and libbrotli): `Codings.send`
+  answers with Zstandard (`zstd`) where the request accepts it, else Brotli (`br`), when the body is not small and
+  the coding makes it smaller, and marks such responses `vary: accept-encoding`. A client that takes neither gets
+  the body as it is, or gzip with `CodingOptions.gzip`. The package needs the two libraries (`brew install zstd
+  brotli`; `apt install libzstd-dev libbrotli-dev`).
+- **gzip without a library.** `Compression.send` in the core package does the same with gzip alone, from an encoder
+  written here (fixed Huffman codes), for a program that must not depend on C libraries. `tools/gzip_check.py`
+  checks it against Python's gzip.
 - **Replies.** `Reply.text`, `html`, `json`, `bytes`, `empty`, `redirect` and `problem` (RFC 9457).
 - **The query.** `Query.raw`, `Query.value` (decoded) and `Query.number`.
 - **HTTP/1.1 and HTTP/2** on one port: `h2` by ALPN over TLS (`web_tls`'s acceptor), or by its preface in clear.
@@ -115,7 +109,7 @@ still answering.
 
 ## What is not here yet
 
-Of CosmoApiServer: request timeouts, logging and tracing, Brotli, response and output caching, tokens signed with RSA or Ed25519 and authorisation policies, the scheduler. The rate limit counts in one process: under the supervisor, each worker has its own counters. Not planned: reflection controllers and
+Of CosmoApiServer: request timeouts, logging and tracing, response and output caching, tokens signed with RSA or Ed25519 and authorisation policies, the scheduler. The rate limit counts in one process: under the supervisor, each worker has its own counters. Not planned: reflection controllers and
 dependency injection (handlers are structs), Razor and Blazor, the front-end development helpers, SignalR's wire
 protocol; gRPC and OpenAPI unless asked for.
 
@@ -152,6 +146,10 @@ answers the same routes (server GC). One machine and one run each: read the rati
 - The stock filters a public API would run together (security headers, CORS for any origin, the rate limit) cost
   about 15 % on the smallest response: 81 000 `/small` a second against 97 000 on one core, at 64 connections with an
   `Origin` on each request. They add seven response fields and read the clock once.
+- Compressing 64 KiB of JSON-like text for each request, one core answers 2 800 a second with Zstandard (level 3),
+  1 100 with Brotli (quality 4) and 710 with the core's gzip, against 3 700 uncompressed; at 4 KiB, 25 300, 12 000 and
+  10 500 against 36 800. All three send about a sixth of the bytes (0.16, 0.17, 0.17). The text is made of a few
+  repeated words, which flatters every coding.
 - Under the supervisor, four workers answer about 275 000 `/small` a second in either listener mode. While a
   worker was made to trap twice a second, no request was answered wrongly; the load generator does not reconnect, so
   its rate fell as it lost the connections of each worker that ended.
@@ -167,6 +165,7 @@ ceesafec test --cflag -fsanitize=address,undefined
 (cd auth && ceesafec test)
 (cd static && ceesafec test)
 (cd ws && ceesafec test)
+(cd compress && ceesafec test)   # needs libzstd and libbrotli
 (cd bench && ceesafec build)      # then: python3 <CeeSafe.Web>/benchmarks/servers/conform.py --port 8090
 python3 tools/supervisor_check.py # the supervisor, against bench/out/bench
 python3 tools/gzip_check.py       # compressed responses, against Python's gzip

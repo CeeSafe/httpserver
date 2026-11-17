@@ -1,0 +1,191 @@
+// Zstandard and Brotli: bodies compressed here inflate to themselves with the libraries' own decoders, and
+// `Codings.send` picks the coding by the request's `Accept-Encoding` (RFC 9110 §12.5.3).
+import web_core;
+import web_transport;
+import web_http;
+import web_http1;
+import httpserver;
+
+struct St {}
+
+fn alloc<T>(r: Result<T, AllocError>) -> Result<T, TestFailure> {
+    match (r) {
+        Ok(v) => { return Ok(v); }
+        Err(_) => { return Err(TestFailure.create("out of memory")); }
+    }
+}
+
+fn routed<T>(r: Result<T, RouteError>) -> Result<T, TestFailure> {
+    match (r) {
+        Ok(v) => { return Ok(v); }
+        Err(_) => { return Err(TestFailure.create("a route error")); }
+    }
+}
+
+/// `n` bytes that read like JSON, the same for the same `n`.
+fn text(n: usize) -> Result<Vector<u8>, TestFailure> {
+    var out = Vector<u8>.create();
+    var x: u32 = 12345;
+    while (out.length < n) {
+        x = x.wrappingMul(1103515245).wrappingAdd(12345);
+        let word = match ((x >> 16) % 5) {
+            0 => "\"status\":",
+            1 => "\"ok\",",
+            2 => "\"id\":",
+            3 => "true,",
+            _ => "null,",
+        };
+        for (b in word.bytes()) {
+            if (out.length < n) {
+                alloc(out.push(b))?;
+            }
+        }
+    }
+    return Ok(out);
+}
+
+@test
+fn bodiesInflateToThemselves() -> Result<void, TestFailure> {
+    let codings = alloc(Codings.create(CodingOptions.defaults()))?;
+    for (n in [0usize, 1usize, 100usize, 1024usize, 65536usize, 1000003usize]) {
+        let body = text(n)?;
+        let z = codings.zstd(body.view()) ?? { return Err(TestFailure.create("zstd could not compress")); };
+        let zBack = Inflate.zstd(z.readable(), n) ?? { return Err(TestFailure.create("not a zstd frame")); };
+        Check.equalBytes(body.view(), zBack.readable())?;
+        let b = codings.brotli(body.view()) ?? { return Err(TestFailure.create("brotli could not compress")); };
+        let bBack = Inflate.brotli(b.readable(), n) ?? { return Err(TestFailure.create("not a brotli stream")); };
+        Check.equalBytes(body.view(), bBack.readable())?;
+        if (n >= 1024) {
+            Check.isTrue(z.readable().length * 3 < n, "zstd at least three times smaller")?;
+            Check.isTrue(b.readable().length * 3 < n, "brotli at least three times smaller")?;
+        }
+    }
+    // A Zstandard frame starts with its magic number, 0xFD2FB528 little-endian (RFC 8878 §3.1.1).
+    let frame = codings.zstd("hello".bytes()) ?? { return Err(TestFailure.create("zstd could not compress")); };
+    Check.equalBytes([0x28u8, 0xB5u8, 0x2Fu8, 0xFDu8][..], frame.readable()[0..4])?;
+    // What is not a frame or a stream is refused.
+    Check.isTrue(Inflate.zstd("hello".bytes(), 100).isNull(), "not a frame")?;
+    Check.isTrue(Inflate.brotli([0xFFu8, 0xFFu8, 0xFFu8][..], 100).isNull(), "not a stream")?;
+    return Ok();
+}
+
+fn number(c: Coding) -> u64 => match (c) {
+    Coding.Zstd => 1,
+    Coding.Brotli => 2,
+    Coding.Gzip => 3,
+    Coding.Identity => 0,
+};
+
+@test
+fn theCodingChosen() -> Result<void, TestFailure> {
+    let codings = alloc(Codings.create(CodingOptions.defaults()))?;
+    Check.equalU64(0, number(codings.choose(null)))?;
+    Check.equalU64(1, number(codings.choose(Some("gzip, deflate, br, zstd".bytes()))))?; // what browsers send
+    Check.equalU64(2, number(codings.choose(Some("gzip, deflate, br".bytes()))))?;
+    Check.equalU64(0, number(codings.choose(Some("gzip, deflate".bytes()))))?; // gzip is off
+    Check.equalU64(2, number(codings.choose(Some("br;q=1.0, zstd;q=0".bytes()))))?;
+    Check.equalU64(0, number(codings.choose(Some("zstd;q=0.0, BR; q=0".bytes()))))?;
+    Check.equalU64(1, number(codings.choose(Some("*".bytes()))))?;
+    Check.equalU64(2, number(codings.choose(Some("*, zstd;q=0".bytes()))))?;
+    Check.equalU64(0, number(codings.choose(Some("identity".bytes()))))?;
+    var options = CodingOptions.defaults();
+    options.gzip = true;
+    options.zstdLevel = 0;
+    let other = alloc(Codings.create(options))?;
+    Check.equalU64(2, number(other.choose(Some("gzip, br, zstd".bytes()))))?;
+    Check.equalU64(3, number(other.choose(Some("gzip, zstd".bytes()))))?;
+    return Ok();
+}
+
+/// Answers 6000 bytes of the test's text, or 100 at `/small`, through `Codings`.
+struct Packed {
+    codings: Codings;
+}
+
+impl Handler<St> for Packed {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut Context<St>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        let body = match (text(if (request.path() == "/small") 100 else 6000)) {
+            Ok(b) => b,
+            Err(_) => { return Err(HandlerError.Internal); },
+        };
+        return await this.codings.send(request, exchange, Status.ok(), "application/json", body.view());
+    }
+}
+
+async fn served(app: borrow App<St>, text: StringView) -> Result<Vector<u8>, TestFailure> {
+    var conn = match (MockTransport.create(text.bytes())) {
+        Ok(m) => m,
+        Err(_) => { return Err(TestFailure.create("a mock")); },
+    };
+    let drain = match (Drain.create()) {
+        Ok(d) => d,
+        Err(_) => { return Err(TestFailure.create("a drain")); },
+    };
+    let ctx = ConnectionContext.acceptedNow(1, drain);
+    match (await web_http1.serve(mut conn, ctx, app, app.limits())) {
+        Ok() => {}
+        Err(e) => { return Err(TestFailure.create(NetErrors.describe(e))); }
+    }
+    var out = Vector<u8>.create();
+    alloc(out.extend(conn.written()))?;
+    return Ok(out);
+}
+
+/// Checks that `response` starts with `head` followed by a length and an empty line, and gives its body.
+fn bodyAfter<region r>(response: Slice<r, u8>, head: StringView) -> Result<Slice<r, u8>, TestFailure> {
+    let h = head.bytes();
+    Check.isTrue(response.length > h.length, head)?;
+    Check.equalBytes(h, response[0..h.length])?;
+    var at = h.length;
+    while (at + 4 <= response.length && !(response[at] == 13 && response[at + 1] == 10 && response[at + 2] == 13 && response[at + 3] == 10)) {
+        Check.isTrue(response[at] >= 48 && response[at] <= 57, "only the length's digits before the empty line")?;
+        at += 1;
+    }
+    Check.isTrue(at + 4 <= response.length, "an empty line")?;
+    return Ok(response[at + 4..]);
+}
+
+@test
+async fn responsesByWhatTheRequestAccepts() -> Result<void, TestFailure> {
+    var limits = Limits.defaults();
+    limits.sendDate = false;
+    var a = routed(App<St>.create(St {}, limits))?;
+    let big: Box<dyn Handler<St> + Send + Share> =
+        alloc(Box.create(Packed { codings: alloc(Codings.create(CodingOptions.defaults()))? }))?;
+    routed(a.get("/big", big))?;
+    let small: Box<dyn Handler<St> + Send + Share> =
+        alloc(Box.create(Packed { codings: alloc(Codings.create(CodingOptions.defaults()))? }))?;
+    routed(a.get("/small", small))?;
+    let whole = text(6000)?;
+
+    let browser = await served(a, "GET /big HTTP/1.1\r\nhost: a\r\naccept-encoding: gzip, deflate, br, zstd\r\n\r\n")?;
+    let z = bodyAfter(
+        browser.view(),
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nvary: accept-encoding\r\ncontent-encoding: zstd\r\ncontent-length: ",
+    )?;
+    let zBack = Inflate.zstd(z, 6000) ?? { return Err(TestFailure.create("not a zstd frame")); };
+    Check.equalBytes(whole.view(), zBack.readable())?;
+
+    let older = await served(a, "GET /big HTTP/1.1\r\nhost: a\r\naccept-encoding: gzip, deflate, br\r\n\r\n")?;
+    let b = bodyAfter(
+        older.view(),
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nvary: accept-encoding\r\ncontent-encoding: br\r\ncontent-length: ",
+    )?;
+    let bBack = Inflate.brotli(b, 6000) ?? { return Err(TestFailure.create("not a brotli stream")); };
+    Check.equalBytes(whole.view(), bBack.readable())?;
+
+    // A client that takes neither gets the body as it is, marked as varying.
+    let plain = await served(a, "GET /big HTTP/1.1\r\nhost: a\r\naccept-encoding: gzip\r\n\r\n")?;
+    let p = bodyAfter(plain.view(), "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nvary: accept-encoding\r\ncontent-length: ")?;
+    Check.equalBytes(whole.view(), p)?;
+    // Under the floor nothing is compressed or marked.
+    let little = await served(a, "GET /small HTTP/1.1\r\nhost: a\r\naccept-encoding: zstd\r\n\r\n")?;
+    let l = bodyAfter(little.view(), "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: ")?;
+    Check.equalU64(100, l.length as u64)?;
+    return Ok();
+}

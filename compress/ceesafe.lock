@@ -1,0 +1,40 @@
+# Written by ceesafec fetch (spec/tooling.md §4.3). Commit it with ceesafe.toml.
+
+[[package]]
+name = "httpserver"
+source = "path+.."
+
+[[package]]
+name = "web_core"
+source = "git+https://github.com/CeeSafe/CeeSafe.Web.git"
+commit = "4bb64c6712d9c876a78d33d0214ea8b875f222ff"
+dir = "packages/web_core"
+hash = "sha256:d06487217199835e061256cba71b91354f3b6e5dd049215e123b0eb5f423579a"
+
+[[package]]
+name = "web_http"
+source = "git+https://github.com/CeeSafe/CeeSafe.Web.git"
+commit = "4bb64c6712d9c876a78d33d0214ea8b875f222ff"
+dir = "packages/web_http"
+hash = "sha256:7f446959257ce8dbf2d4a9bb0c049613dc951adccb417e5887d8f28f6ea07289"
+
+[[package]]
+name = "web_http1"
+source = "git+https://github.com/CeeSafe/CeeSafe.Web.git"
+commit = "4bb64c6712d9c876a78d33d0214ea8b875f222ff"
+dir = "packages/web_http1"
+hash = "sha256:3710d657d0e715063589b5ba2013108421bc251d77eb4664571d6f5f8c8ffb00"
+
+[[package]]
+name = "web_http2"
+source = "git+https://github.com/CeeSafe/CeeSafe.Web.git"
+commit = "4bb64c6712d9c876a78d33d0214ea8b875f222ff"
+dir = "packages/web_http2"
+hash = "sha256:f9fb11ada7f934c951b9230c5843ea0f2cfc72d7457f2657b7d131ad25f6307a"
+
+[[package]]
+name = "web_transport"
+source = "git+https://github.com/CeeSafe/CeeSafe.Web.git"
+commit = "4bb64c6712d9c876a78d33d0214ea8b875f222ff"
+dir = "packages/web_transport"
+hash = "sha256:a70380914c02645dfdfb4dfc3f3f2016017d956b9ef410894a318fae944aa232"

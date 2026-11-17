@@ -1,0 +1,275 @@
+// Compressed responses with Zstandard (RFC 8878, `zstd`) and Brotli (RFC 7932, `br`).
+//
+// A response's body cannot be changed after the handler has sent it (httpserver's CEESAFE_FINDINGS.md, S10), so this
+// is not a middleware: the handler answers through `Codings.send`, which picks the coding the request accepts.
+import web_core;
+import web_http;
+import httpserver;
+
+/// A content coding.
+public enum Coding {
+    Zstd,
+    Brotli,
+    Gzip,
+    /// Not compressed.
+    Identity,
+}
+
+/// What `Codings` does. Zstandard is preferred where the client takes both: at these levels it compresses several
+/// times faster than Brotli for about the same size. Brotli is what every browser takes.
+public struct CodingOptions {
+    /// Bodies of this many bytes or more are compressed.
+    public minBytes: usize;
+    /// Zstandard's level, 1 (fastest) to 19; 3 is the library's default. 0 never uses Zstandard.
+    public zstdLevel: i32;
+    /// Brotli's quality, 0 (fastest) to 11 (smallest, far too slow for a response made on the spot); 4 suits
+    /// responses compressed as they are made. -1 never uses Brotli.
+    public brotliQuality: i32;
+    /// Whether to answer with gzip a client that takes neither (httpserver's own encoder). Off: such a client gets
+    /// the body as it is.
+    public gzip: bool;
+
+    /// From 1024 bytes, Zstandard at 3, Brotli at 4, no gzip.
+    public fn defaults() -> CodingOptions =>
+        CodingOptions { minBytes: 1024, zstdLevel: 3, brotliQuality: 4, gzip: false };
+}
+
+/// Sends bodies compressed with the best coding the request accepts.
+public struct Codings {
+    private options: CodingOptions;
+    /// The Zstandard context's address, kept for the life of this value: making one for each body costs more than
+    /// compressing a small body does. Locked while a body is compressed.
+    private context: Mutex<usize>;
+    private gzip: Compression;
+
+    /// Safety: `ZSTD_createCCtx` takes nothing and returns a context or null; null is reported, never kept.
+    public fn create(options: CodingOptions) -> Result<Codings, AllocError> {
+        let raw = unsafe { ZSTD_createCCtx() };
+        if (raw == 0 as *mut void) {
+            return Err(AllocError.OutOfMemory);
+        }
+        let context = match (Mutex<usize>.create(raw as usize)) {
+            Ok(m) => m,
+            Err(e) => {
+                unsafe { ZSTD_freeCCtx(raw); }
+                return Err(e);
+            },
+        };
+        return Ok(Codings { options: options, context: context, gzip: Compression.create(options.minBytes)? });
+    }
+
+    /// The coding `Codings` would use for a request with this `Accept-Encoding` (null: the field is absent).
+    public fn choose(borrow this, acceptEncoding: Slice<u8>?) -> Coding {
+        let list = acceptEncoding ?? { return Coding.Identity; };
+        if (this.options.zstdLevel != 0 && accepts(list, "zstd")) {
+            return Coding.Zstd;
+        }
+        if (this.options.brotliQuality >= 0 && accepts(list, "br")) {
+            return Coding.Brotli;
+        }
+        if (this.options.gzip && accepts(list, "gzip")) {
+            return Coding.Gzip;
+        }
+        return Coding.Identity;
+    }
+
+    /// `data` as one Zstandard frame; null if it could not be compressed (no memory, or the context is in use by
+    /// another thread, which one event loop never finds).
+    /// Safety: the destination is `bound` writable bytes of a buffer this function owns, the source is `data`, read
+    /// only during the call; the context is this value's, alive until its drop and held under the lock.
+    public fn zstd(borrow this, data: Slice<u8>) -> OwnedBuffer? {
+        var guard = this.context.tryLock() ?? { return null; };
+        let context = *guard.data() as *mut void;
+        let bound = unsafe { ZSTD_compressBound(data.length) };
+        var out = match (OwnedBuffer.create(if (bound == 0) 1 else bound)) {
+            Ok(b) => b,
+            Err(_) => { return null; },
+        };
+        let room = out.spare();
+        let written = unsafe { ZSTD_compressCCtx(
+            context,
+            room.ptr,
+            room.length,
+            data.ptr,
+            data.length,
+            this.options.zstdLevel,
+        ) };
+        if (unsafe { ZSTD_isError(written) } != 0 || out.commit(written).isErr()) {
+            return null;
+        }
+        return Some(out);
+    }
+
+    /// `data` as one Brotli stream; null if it could not be compressed.
+    /// Safety: as `zstd`; `size` is the room on entry and the size written on success.
+    public fn brotli(borrow this, data: Slice<u8>) -> OwnedBuffer? {
+        let bound = unsafe { BrotliEncoderMaxCompressedSize(data.length) };
+        if (bound == 0) {
+            return null;
+        }
+        var out = match (OwnedBuffer.create(bound)) {
+            Ok(b) => b,
+            Err(_) => { return null; },
+        };
+        let room = out.spare();
+        var size: usize = room.length;
+        let ok = unsafe { BrotliEncoderCompress(
+            this.options.brotliQuality,
+            22,
+            0,
+            data.length,
+            data.ptr,
+            borrow mut size as *mut usize,
+            room.ptr,
+        ) };
+        if (ok != 1 || out.commit(size).isErr()) {
+            return null;
+        }
+        return Some(out);
+    }
+
+    /// Answers `status` with `body` as `contentType`, compressed with the coding the request's `Accept-Encoding`
+    /// allows (`choose`) when the body has `minBytes` or more and the coding makes it smaller. A body that could
+    /// have been compressed is marked `vary: accept-encoding` either way, so a cache keeps the forms apart.
+    public async fn send(
+        borrow this,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+        status: StatusCode,
+        contentType: StringView,
+        body: Slice<u8>,
+    ) -> Result<void, HandlerError> {
+        exchange.header("content-type", contentType.bytes())?;
+        if (body.length < this.options.minBytes) {
+            return await exchange.send(status, body);
+        }
+        exchange.header("vary", "accept-encoding".bytes())?;
+        let coding = this.choose(request.headers().get(HeaderName.AcceptEncoding));
+        var name = "";
+        var packed: OwnedBuffer? = null;
+        match (coding) {
+            Coding.Zstd => {
+                packed = this.zstd(body);
+                name = "zstd";
+            }
+            Coding.Brotli => {
+                packed = this.brotli(body);
+                name = "br";
+            }
+            Coding.Gzip => {
+                var zipped = Vector<u8>.create();
+                let done = match (this.gzip.gzip(body, mut zipped)) {
+                    Ok(d) => d,
+                    Err(_) => false,
+                };
+                if (done && zipped.length < body.length) {
+                    exchange.header("content-encoding", "gzip".bytes())?;
+                    return await exchange.send(status, zipped.view());
+                }
+            }
+            Coding.Identity => {}
+        }
+        match (borrow packed) {
+            Some(p) => {
+                if (p.readable().length < body.length) {
+                    exchange.header("content-encoding", name.bytes())?;
+                    return await exchange.send(status, p.readable());
+                }
+            }
+            null => {}
+        }
+        return await exchange.send(status, body);
+    }
+
+    /// Safety: the context came from `ZSTD_createCCtx` in `create` and is freed once, here, when nothing can hold
+    /// the lock.
+    drop {
+        match (this.context.tryLock()) {
+            Some(guard) => {
+                var g = guard;
+                unsafe { ZSTD_freeCCtx(*g.data() as *mut void); }
+            }
+            null => {}
+        }
+    }
+}
+
+/// Whether the `Accept-Encoding` value `list` takes `coding`: it names it, or `*`, and not with a quality of 0
+/// (RFC 9110 §12.5.3). A coding named with quality 0 is refused even if `*` is accepted.
+fn accepts(list: Slice<u8>, coding: StringView) -> bool {
+    var at: usize = 0;
+    var star = false;
+    while (at < list.length) {
+        var end = at;
+        while (end < list.length && list[end] != 44) {
+            end += 1;
+        }
+        let item = trimWhitespace(list[at..end]);
+        var semi = item.length;
+        for (i in 0..item.length) {
+            if (item[i] == 59) {
+                semi = i;
+                break;
+            }
+        }
+        let named = trimWhitespace(item[0..semi]);
+        let refused = semi < item.length && zeroQuality(item[semi + 1..]);
+        if (Ascii.equalsIgnoringCase(named, coding)) {
+            return !refused;
+        }
+        if (Ascii.equals(named, "*") && !refused) {
+            star = true;
+        }
+        at = end + 1;
+    }
+    return star;
+}
+
+/// Whether the parameters `text` (after a coding's `;`) give it the quality 0: `q=0`, `q=0.0`, …
+fn zeroQuality(text: Slice<u8>) -> bool {
+    let p = trimWhitespace(text);
+    if (p.length < 3 || Ascii.lower(p[0]) != 113 || p[1] != 61) {
+        return false;
+    }
+    for (i in 2..p.length) {
+        if (p[i] != 48 && p[i] != 46) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Inflating, for tests and tools: what a client would do with a body.
+public struct Inflate {
+    /// The bytes the Zstandard frame `data` holds, if they are at most `most`; null if it is not a frame or holds
+    /// more.
+    /// Safety: the destination is `most` writable bytes this function owns; the source is read during the call.
+    public fn zstd(data: Slice<u8>, most: usize) -> OwnedBuffer? {
+        var out = match (OwnedBuffer.create(if (most == 0) 1 else most)) {
+            Ok(b) => b,
+            Err(_) => { return null; },
+        };
+        let room = out.spare();
+        let n = unsafe { ZSTD_decompress(room.ptr, most, data.ptr, data.length) };
+        if (unsafe { ZSTD_isError(n) } != 0 || out.commit(n).isErr()) {
+            return null;
+        }
+        return Some(out);
+    }
+
+    /// The bytes the Brotli stream `data` holds, if they are at most `most`.
+    /// Safety: as `zstd`; `size` is the room on entry and the size written on success.
+    public fn brotli(data: Slice<u8>, most: usize) -> OwnedBuffer? {
+        var out = match (OwnedBuffer.create(if (most == 0) 1 else most)) {
+            Ok(b) => b,
+            Err(_) => { return null; },
+        };
+        let room = out.spare();
+        var size: usize = most;
+        let ok = unsafe { BrotliDecoderDecompress(data.length, data.ptr, borrow mut size as *mut usize, room.ptr) };
+        if (ok != 1 || out.commit(size).isErr()) {
+            return null;
+        }
+        return Some(out);
+    }
+}
