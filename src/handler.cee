@@ -28,16 +28,19 @@ public interface Middleware<S> {
     async fn after(borrow this, request: borrow Request, head: borrow mut ResponseHead) -> Result<void, HandlerError>;
 }
 
-/// Something a middleware left for the handler: a name and bytes.
+/// One thing left in a scope: where its name and its value lie in the scope's bytes.
 struct Item {
-    name: Vector<u8>;
-    value: Vector<u8>;
+    name: u32;
+    nameLength: u32;
+    value: u32;
+    valueLength: u32;
 }
 
 /// The part of a request's context that does not depend on the application's state: the connection, and what
 /// middleware leaves for what runs after it. A `Filter` sees this much.
 public struct Scope<region r> {
     private conn: borrow(r) ConnectionContext<r>;
+    private bytes: Vector<u8>;
     private items: Vector<Item>;
 
     /// The connection: its id, addresses, age, and whether the server is draining.
@@ -47,43 +50,59 @@ public struct Scope<region r> {
     /// (`"user"`, set by authentication), a request id. A second `put` of a name replaces the first. False if out of
     /// memory.
     public fn put(borrow mut this, name: StringView, value: Slice<u8>) -> bool {
-        var item = Item { name: Vector<u8>.create(), value: Vector<u8>.create() };
-        // One allocation each, not one for every doubling.
-        if (item.name.reserve(name.length).isErr() || item.value.reserve(value.length).isErr()) {
+        // Names and values lie one after the other in one buffer: a request's first `put` allocates it and the
+        // list, and most requests' others allocate nothing.
+        if (this.bytes.length == 0) {
+            if (this.bytes.reserve(256).isErr() || this.items.reserve(4).isErr()) {
+                return false;
+            }
+        }
+        let at = this.bytes.length;
+        if (at + name.length + value.length > 0xFFFFFFFF) {
             return false;
         }
-        for (b in name.bytes()) {
-            match (item.name.push(b)) {
-                Ok() => {}
-                Err(_) => { return false; }
-            }
-        }
-        for (b in value) {
-            match (item.value.push(b)) {
-                Ok() => {}
-                Err(_) => { return false; }
-            }
-        }
+        var found = this.items.length;
         for (i in 0..this.items.length) {
-            if (sameBytes(this.items[i].name.view(), name.bytes())) {
-                this.items[i] = item;
-                return true;
+            if (sameBytes(this.name(i), name.bytes())) {
+                found = i;
+                break;
             }
         }
-        if (this.items.length == 0 && this.items.reserve(4).isErr()) {
+        var item = Item { name: 0, nameLength: 0, value: 0, valueLength: truncate<u32>(value.length) };
+        if (found < this.items.length) {
+            // The name stays where it is; the old value is left behind.
+            item.name = this.items[found].name;
+            item.nameLength = this.items[found].nameLength;
+        } else {
+            if (!put(mut this.bytes, name.bytes())) {
+                return false;
+            }
+            item.name = truncate<u32>(at);
+            item.nameLength = truncate<u32>(name.length);
+        }
+        item.value = truncate<u32>(this.bytes.length);
+        if (!put(mut this.bytes, value)) {
             return false;
         }
-        match (this.items.push(item)) {
-            Ok() => { return true; }
-            Err(_) => { return false; }
+        if (found < this.items.length) {
+            this.items[found] = item;
+            return true;
         }
+        return this.items.push(item).isOk();
+    }
+
+    /// The name of item `i`.
+    fn name(borrow this, i: usize) -> Slice<u8> {
+        let item = this.items[i];
+        return this.bytes.view()[item.name as usize..(item.name + item.nameLength) as usize];
     }
 
     /// What was `put` under `name`, or null.
     public fn value(borrow this, name: StringView) -> Slice<u8>? {
         for (i in 0..this.items.length) {
-            if (sameBytes(this.items[i].name.view(), name.bytes())) {
-                return Some(this.items[i].value.view());
+            if (sameBytes(this.name(i), name.bytes())) {
+                let item = this.items[i];
+                return Some(this.bytes.view()[item.value as usize..(item.value + item.valueLength) as usize]);
             }
         }
         return null;
@@ -117,7 +136,7 @@ public struct Context<region r, S> {
         params: Params,
     ) -> Context<r, S> =>
         Context {
-            shared: Scope { conn: connection, items: Vector<Item>.create() },
+            shared: Scope { conn: connection, bytes: Vector<u8>.create(), items: Vector<Item>.create() },
             appState: state,
             routes: router,
             routePath: path,

@@ -183,8 +183,8 @@ answers the same routes (server GC). One machine and one run each: read the rati
   about 20% (81 000) with standard output sent to `/dev/null`.
 - The output cache answers 4 KiB of JSON-like text 83 000 to 85 000 times a second against 33 000 when the handler
   makes it each time, and 64 KiB 45 000 times against 3 600 to 4 000.
-- The trace filter costs 5% to 17% on `/small` (84 000 to 96 000 a second over four runs, against 100 000 to
-  103 000): four values left for the handler, each two allocations, and one more response field.
+- The trace filter costs about 10% on `/small` (90 000 to 93 000 a second, against 98 000 to 105 000): four values
+  left for the handler and one more response field.
 - CosmoApiServer answered 56 and 16 of about 1.3 million `/users/42` requests with a status that was not 2xx; not
   looked into.
 
