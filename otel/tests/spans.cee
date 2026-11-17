@@ -1,0 +1,115 @@
+// Spans kept from an application on mock connections, and the OTLP/JSON made of them. tools/otel_check.py checks
+// the whole of it with a collector written in Python.
+import web_core;
+import web_transport;
+import web_http;
+import web_http1;
+import httpserver;
+
+fn alloc<T>(r: Result<T, AllocError>) -> Result<T, TestFailure> {
+    match (r) {
+        Ok(v) => { return Ok(v); }
+        Err(_) => { return Err(TestFailure.create("out of memory")); }
+    }
+}
+
+fn routed<T>(r: Result<T, RouteError>) -> Result<T, TestFailure> {
+    match (r) {
+        Ok(v) => { return Ok(v); }
+        Err(_) => { return Err(TestFailure.create("a route error")); }
+    }
+}
+
+struct St {}
+
+struct Fine {}
+
+impl Handler<St> for Fine {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut Context<St>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> =>
+        await exchange.send(Status.ok(), "ok".bytes());
+}
+
+async fn asked(app: borrow App<St>, text: StringView) -> Result<void, TestFailure> {
+    var conn = match (MockTransport.create(text.bytes())) {
+        Ok(m) => m,
+        Err(_) => { return Err(TestFailure.create("a mock")); },
+    };
+    let drain = match (Drain.create()) {
+        Ok(d) => d,
+        Err(_) => { return Err(TestFailure.create("a drain")); },
+    };
+    let ctx = ConnectionContext.acceptedNow(1, drain);
+    match (await web_http1.serve(mut conn, ctx, app, app.limits())) {
+        Ok() => { return Ok(); }
+        Err(e) => { return Err(TestFailure.create(NetErrors.describe(e))); }
+    }
+}
+
+/// Whether `text` has `part` in it.
+fn has(text: Slice<u8>, part: StringView) -> bool {
+    let p = part.bytes();
+    var at: usize = 0;
+    while (at + p.length <= text.length) {
+        var same = true;
+        for (i in 0..p.length) {
+            if (text[at + i] != p[i]) {
+                same = false;
+                break;
+            }
+        }
+        if (same) {
+            return true;
+        }
+        at += 1;
+    }
+    return false;
+}
+
+@test
+async fn requestsKeptAsSpans() -> Result<void, TestFailure> {
+    let spans = alloc(Arc<Spans>.create(alloc(Spans.create(2))?))?;
+    var a = routed(App<St>.create(St {}, Limits.defaults()))?;
+    let trace: Box<dyn Filter + Send + Share> = alloc(Box.create(Trace.create(false)))?;
+    let log: Box<dyn AccessLog + Send + Share> = alloc(Box.create(SpanLog.create(spans.clone())))?;
+    a.logTo(log);
+    let h: Box<dyn Handler<St> + Send + Share> = alloc(Box.create(Fine {}))?;
+    routed(a.get("/{*rest}", h))?;
+
+    // Without the trace filter a request has no trace, and leaves no span.
+    await asked(a, "GET /early HTTP/1.1\r\nhost: a\r\n\r\n")?;
+    Check.equalU64(0, spans.get().waiting() as u64)?;
+    var out = Vector<u8>.create();
+    Check.equalU64(0, spans.get().encode("svc", mut out) as u64)?;
+    Check.equalU64(0, out.length as u64)?;
+
+    routed(a.filter(trace))?;
+    await asked(
+        a,
+        "GET /a%22b HTTP/1.1\r\nhost: a\r\ntraceparent: 00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01\r\n\r\n",
+    )?;
+    await asked(a, "GET /second HTTP/1.1\r\nhost: a\r\n\r\n")?;
+    // The queue holds two: the third is dropped, and counted.
+    await asked(a, "GET /third HTTP/1.1\r\nhost: a\r\n\r\n")?;
+    Check.equalU64(2, spans.get().waiting() as u64)?;
+    Check.equalU64(1, spans.get().dropped())?;
+
+    Check.equalU64(2, spans.get().encode("my \"svc\"", mut out) as u64)?;
+    Check.equalU64(0, spans.get().waiting() as u64)?;
+    let start = "{\"resourceSpans\":[{\"resource\":{\"attributes\":[{\"key\":\"service.name\",\"value\":{\"stringValue\":\"my \\\"svc\\\"\"}}]},\"scopeSpans\":[{\"scope\":{\"name\":\"httpserver\"},\"spans\":[{\"traceId\":\"0af7651916cd43dd8448eb211c80319c\",\"spanId\":\"";
+    Check.equalBytes(start.bytes(), out.view()[0..start.bytes().length])?;
+    Check.isTrue(has(out.view(), "\",\"parentSpanId\":\"b7ad6b7169203331\",\"name\":\"GET\",\"kind\":2,\"startTimeUnixNano\":\""), "the first span's parent")?;
+    Check.isTrue(has(out.view(), "{\"key\":\"url.path\",\"value\":{\"stringValue\":\"/a%22b\"}}"), "the first span's path")?;
+    Check.isTrue(has(out.view(), "{\"key\":\"http.response.status_code\",\"value\":{\"intValue\":\"200\"}}]},{\"traceId\":\""), "two spans")?;
+    Check.isTrue(has(out.view(), "{\"key\":\"url.path\",\"value\":{\"stringValue\":\"/second\"}}"), "the second span's path")?;
+    Check.isTrue(!has(out.view(), "/third") && !has(out.view(), "\"status\":"), "no third span, no error")?;
+    let end = "\"}}]}]}]}]}";
+    Check.equalBytes(end.bytes(), out.view()[out.length - end.bytes().length..])?;
+    // Taken once: there is nothing to encode again.
+    Check.equalU64(0, spans.get().encode("svc", mut out) as u64)?;
+    return Ok();
+}

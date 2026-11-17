@@ -1,0 +1,293 @@
+// Spans for a collector: each request the `Trace` filter placed in a trace is kept as a span and posted, in
+// batches, as OTLP over HTTP in JSON (the OpenTelemetry protocol, `/v1/traces`).
+//
+// `SpanLog` is an access log (`App.logTo`) that keeps a span for each request; `export` is raced against the
+// server, as `tend` is, and posts what has gathered every so often. The queue is bounded: when the collector is
+// slow or away, spans are dropped and counted, and requests are not held up. A request without a trace (no `Trace`
+// filter before it, or cancelled when its time was up) leaves no span.
+import web_core;
+import web_http;
+import web_client;
+import httpserver;
+
+/// One request as a span.
+struct Span {
+    trace: [u8; 32];
+    span: [u8; 16];
+    parent: [u8; 16];
+    hasParent: bool;
+    method: Vector<u8>;
+    path: Vector<u8>;
+    status: u16;
+    /// Unix time in nanoseconds.
+    start: u64;
+    end: u64;
+}
+
+/// `text` as a JSON string's contents, appended to `out`.
+fn escaped(out: borrow mut Vector<u8>, text: Slice<u8>) -> bool {
+    let digits = "0123456789abcdef".bytes();
+    var ok = true;
+    for (b in text) {
+        if (b == 34 || b == 92) {
+            ok = ok && out.push(92).isOk() && out.push(b).isOk();
+        } else if (b < 32 || b >= 127) {
+            // Control characters, and bytes that may not be UTF-8: as the code points of the same number.
+            ok = ok && out.push(92).isOk() && out.push(117).isOk() && out.push(48).isOk() && out.push(48).isOk();
+            ok = ok && out.push(digits[(b >> 4) as usize]).isOk() && out.push(digits[(b & 15) as usize]).isOk();
+        } else {
+            ok = ok && out.push(b).isOk();
+        }
+    }
+    return ok;
+}
+
+fn add(out: borrow mut Vector<u8>, text: StringView) -> bool {
+    var ok = true;
+    for (b in text.bytes()) {
+        ok = ok && out.push(b).isOk();
+    }
+    return ok;
+}
+
+fn addBytes(out: borrow mut Vector<u8>, bytes: Slice<u8>) -> bool {
+    var ok = true;
+    for (b in bytes) {
+        ok = ok && out.push(b).isOk();
+    }
+    return ok;
+}
+
+fn addNumber(out: borrow mut Vector<u8>, value: u64) -> bool {
+    var text = [0u8; 20];
+    var w = TextWriter.create(mut text[..]);
+    w.decimal(value);
+    return addBytes(out, w.written());
+}
+
+/// The spans kept until they are posted.
+public struct Spans {
+    private queue: Mutex<Vector<Span>>;
+    private capacity: usize;
+    private lost: AtomicU64;
+    private refused: AtomicU64;
+    private sent: AtomicU64;
+
+    /// A queue of at most `capacity` spans.
+    public fn create(capacity: usize) -> Result<Spans, AllocError> =>
+        Ok(Spans {
+            queue: Mutex<Vector<Span>>.create(Vector<Span>.create())?,
+            capacity: capacity,
+            lost: AtomicU64.create(0),
+            refused: AtomicU64.create(0),
+            sent: AtomicU64.create(0),
+        });
+
+    /// Spans dropped because the queue was full or memory was short.
+    public fn dropped(borrow this) -> u64 => this.lost.load();
+
+    /// Spans in batches the collector did not take (it was away, or answered other than 2xx).
+    public fn failed(borrow this) -> u64 => this.refused.load();
+
+    /// Spans the collector took.
+    public fn exported(borrow this) -> u64 => this.sent.load();
+
+    /// How many spans wait.
+    public fn waiting(borrow this) -> usize {
+        var guard = this.queue.tryLock() ?? { return 0; };
+        return guard.data().length;
+    }
+
+    /// Keeps a span for a request that ended now and took `micros`, if its scope has a trace.
+    fn keep(borrow this, request: borrow Request, scope: borrow Scope, status: u16, micros: u64) {
+        let trace = scope.value("trace") ?? { return; };
+        let mine = scope.value("span") ?? { return; };
+        if (trace.length != 32 || mine.length != 16) {
+            return;
+        }
+        let now = Clock.now();
+        let end = if (now.seconds < 0) 0u64 else truncate<u64>(now.seconds) * 1000000000 + now.nanoseconds as u64;
+        var s = Span {
+            trace: [48u8; 32],
+            span: [48u8; 16],
+            parent: [48u8; 16],
+            hasParent: false,
+            method: Vector<u8>.create(),
+            path: Vector<u8>.create(),
+            status: status,
+            start: if (end > micros * 1000) end - micros * 1000 else 0u64,
+            end: end,
+        };
+        for (i in 0..32usize) {
+            s.trace[i] = trace[i];
+        }
+        for (i in 0..16usize) {
+            s.span[i] = mine[i];
+        }
+        match (scope.value("parent")) {
+            Some(p) => {
+                if (p.length == 16) {
+                    s.hasParent = true;
+                    for (i in 0..16usize) {
+                        s.parent[i] = p[i];
+                    }
+                }
+            }
+            null => {}
+        }
+        if (!add(mut s.method, Methods.text(request.method())) || !addBytes(mut s.path, request.path().bytes())) {
+            this.lost.store(this.lost.load() + 1);
+            return;
+        }
+        var guard = this.queue.tryLock() ?? {
+            this.lost.store(this.lost.load() + 1);
+            return;
+        };
+        let queue = guard.data();
+        if (queue.length >= this.capacity || queue.push(s).isErr()) {
+            this.lost.store(this.lost.load() + 1);
+        }
+    }
+
+    /// Takes the spans that wait and writes them to `out` (cleared first) as one OTLP/JSON request for the service
+    /// `service`; how many there were. If memory is short they are dropped, and counted.
+    public fn encode(borrow this, service: StringView, out: borrow mut Vector<u8>) -> usize {
+        out.clear();
+        var batch = Vector<Span>.create();
+        {
+            var guard = this.queue.tryLock() ?? { return 0; };
+            let queue = guard.data();
+            if (queue.length == 0) {
+                return 0;
+            }
+            // The queue's vector is taken whole, and an empty one left.
+            var taken = Vector<Span>.create();
+            for (i in 0..queue.length) {
+                let s = queue.pop() ?? { break; };
+                if (taken.push(s).isErr()) {
+                    this.lost.store(this.lost.load() + 1);
+                }
+            }
+            // `pop` took them newest first.
+            loop {
+                let s = taken.pop() ?? { break; };
+                if (batch.push(s).isErr()) {
+                    this.lost.store(this.lost.load() + 1);
+                }
+            }
+        }
+        var ok = add(
+            out,
+            "{\"resourceSpans\":[{\"resource\":{\"attributes\":[{\"key\":\"service.name\",\"value\":{\"stringValue\":\"",
+        ) &&
+            escaped(out, service.bytes()) &&
+            add(out, "\"}}]},\"scopeSpans\":[{\"scope\":{\"name\":\"httpserver\"},\"spans\":[");
+        for (i in 0..batch.length) {
+            let s = borrow batch[i];
+            ok = ok &&
+                add(out, if (i == 0) "{\"traceId\":\"" else ",{\"traceId\":\"") &&
+                addBytes(out, s.trace[..]) &&
+                add(out, "\",\"spanId\":\"") &&
+                addBytes(out, s.span[..]);
+            if (s.hasParent) {
+                ok = ok && add(out, "\",\"parentSpanId\":\"") && addBytes(out, s.parent[..]);
+            }
+            // kind 2: a server's span. The name is the method: the path is not a route's pattern, and a name for
+            // every path would be too many.
+            ok = ok &&
+                add(out, "\",\"name\":\"") &&
+                escaped(out, s.method.view()) &&
+                add(out, "\",\"kind\":2,\"startTimeUnixNano\":\"") &&
+                addNumber(out, s.start) &&
+                add(out, "\",\"endTimeUnixNano\":\"") &&
+                addNumber(out, s.end) &&
+                add(out, "\",\"attributes\":[{\"key\":\"http.request.method\",\"value\":{\"stringValue\":\"") &&
+                escaped(out, s.method.view()) &&
+                add(out, "\"}},{\"key\":\"url.path\",\"value\":{\"stringValue\":\"") &&
+                escaped(out, s.path.view()) &&
+                add(out, "\"}},{\"key\":\"http.response.status_code\",\"value\":{\"intValue\":\"") &&
+                addNumber(out, s.status as u64) &&
+                add(out, "\"}}]");
+            // A server's span is an error for 5xx only (the HTTP semantic conventions).
+            if (s.status >= 500) {
+                ok = ok && add(out, ",\"status\":{\"code\":2}");
+            }
+            ok = ok && add(out, "}");
+        }
+        ok = ok && add(out, "]}]}]}");
+        if (!ok) {
+            this.lost.store(this.lost.load() + batch.length as u64);
+            out.clear();
+            return 0;
+        }
+        return batch.length;
+    }
+}
+
+/// The access log that keeps the spans: `app.logTo(Box.create(SpanLog.create(spans.clone())))`.
+public struct SpanLog {
+    private spans: Arc<Spans>;
+
+    /// A log keeping its spans in `spans`.
+    public fn create(spans: Arc<Spans>) -> SpanLog => SpanLog { spans: spans };
+}
+
+impl AccessLog for SpanLog {
+    async fn record(borrow this, request: borrow Request, scope: borrow Scope, status: u16, micros: u64) {
+        this.spans.get().keep(request, scope, status, micros);
+    }
+}
+
+/// Posts one batch; whether the collector took it.
+async fn post(client: borrow Client, endpoint: StringView, body: Slice<u8>) -> bool {
+    var request = match (ClientRequest.create(Method.Post, endpoint)) {
+        Ok(r) => r,
+        Err(_) => { return false; },
+    };
+    if (request.header("content-type", "application/json".bytes()).isErr()) {
+        return false;
+    }
+    var payload = match (BytesBody.of(body)) {
+        Ok(b) => b,
+        Err(_) => { return false; },
+    };
+    var response = match (await client.send(request, mut payload)) {
+        Ok(r) => r,
+        Err(_) => { return false; },
+    };
+    let status = response.status();
+    let _ = await response.finish(client);
+    return status >= 200 && status < 300;
+}
+
+/// Posts the spans of `spans` to the collector at `endpoint` (`http://127.0.0.1:4318/v1/traces`) every `everyMs`,
+/// as the service `service`; to race against the server. It returns only an error. A batch the collector does not
+/// take is dropped and counted (`Spans.failed`): spans are not worth holding requests' memory for. The endpoint
+/// is plain HTTP; a collector that wants TLS is reached through an agent on the same machine.
+public async fn export<T>(
+    spans: borrow Spans,
+    endpoint: StringView,
+    service: StringView,
+    everyMs: u64,
+) -> Result<T, NetError> {
+    let client = match (Client.create(ClientOptions.defaults(), null)) {
+        Ok(c) => c,
+        Err(_) => { return Err(NetError.OutOfMemory); },
+    };
+    var body = Vector<u8>.create();
+    loop {
+        match (await Timer.sleep(everyMs)) {
+            Ok() => {}
+            Err(e) => { return Err(NetErrors.fromAsync(e)); }
+        }
+        let count = spans.encode(service, mut body) as u64;
+        if (count == 0) {
+            continue;
+        }
+        if (await post(client, endpoint, body.view())) {
+            spans.sent.store(spans.sent.load() + count);
+        } else {
+            spans.refused.store(spans.refused.load() + count);
+        }
+    }
+}

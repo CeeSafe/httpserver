@@ -91,7 +91,11 @@ impl Handler<Shop> for Item {
   standard output; an application's own can count, sample, or write somewhere else.
 - **Trace context.** The filter `Trace` reads the caller's W3C `traceparent` or starts a trace, gives the request
   a span id of its own, and leaves `"trace"`, `"span"`, `"parent"` and `"traceparent"` (the header to send on) for
-  the handler; with `respond`, the response says them in `traceresponse`. Spans are not exported to a collector.
+  the handler; with `respond`, the response says them in `traceresponse`.
+- **Spans for a collector** (`otel/`, the package `httpserver_otel`, on CeeSafe.Web's `web_client`): `SpanLog` is an
+  access log that keeps each traced request as a span in a bounded queue, and `export`, raced against the server,
+  posts them in batches as OTLP/JSON to a collector's `/v1/traces` over plain HTTP. A batch the collector does not
+  take is dropped and counted; requests are never held up. A request that timed out leaves no span.
 - **Output cache.** A handler that answers through `OutputCache.send(request, exchange, status, type, body,
   seconds)` has its response kept in memory; the filter `Cached` before it answers the next GET and HEAD requests
   for the same path and query without running it, with `age`, and with 304 for a client that sends the `etag` back
@@ -150,7 +154,8 @@ still answering.
 
 ## What is not here yet
 
-Of CosmoApiServer: spans exported to a collector. Not planned: reflection controllers and
+Of CosmoApiServer, nothing that was planned. Spans go to a collector over plain HTTP only (TLS through an agent),
+and a span is named by its method, not its route's pattern. Not planned: reflection controllers and
 dependency injection (handlers are structs), Razor and Blazor, the front-end development helpers, SignalR's wire
 protocol; gRPC and OpenAPI unless asked for.
 
@@ -222,11 +227,13 @@ ceesafec test --cflag -fsanitize=address,undefined
 (cd static && ceesafec test)
 (cd ws && ceesafec test)
 (cd compress && ceesafec test)   # needs libzstd and libbrotli
+(cd otel && ceesafec test)
 (cd bench && ceesafec build)      # then: python3 <CeeSafe.Web>/benchmarks/servers/conform.py --port 8090
 python3 tools/supervisor_check.py # the supervisor, against bench/out/bench
 python3 tools/gzip_check.py       # compressed responses, against Python's gzip
 python3 tools/ratelimit_check.py  # one rate limit for four workers (add --inherit on macOS)
 python3 tools/bus_check.py        # the bus between four workers (add --inherit on macOS)
+python3 tools/otel_check.py       # exported spans, with a collector written here (build otel/demo first)
 python3 tools/ws_check.py         # the hub, with WebSocket clients written from RFC 6455
 python3 tools/ws_check.py --workers 4   # the same over four workers and the bus (add --inherit on macOS)
 ```
@@ -235,7 +242,7 @@ The compiler: ceesafec 0.62.2 or later. The supervisor is POSIX only.
 
 ## License
 
-httpserver, httpserver_auth, httpserver_static, httpserver_ws and httpserver_compress are licensed under the GNU
+httpserver, httpserver_auth, httpserver_static, httpserver_ws, httpserver_compress and httpserver_otel are licensed under the GNU
 General Public License, version 2 only ([COPYING](COPYING)), as CeeSafe and CeeSafe.Web are, with an exception that
 permits linking them with OpenSSL ([COPYING.OPENSSL](COPYING.OPENSSL)), which httpserver_auth does through `pkey`
 and a TLS server does through `web_tls`. httpserver_compress links libzstd (BSD or GPL v2) and libbrotli (MIT).

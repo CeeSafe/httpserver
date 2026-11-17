@@ -1,0 +1,107 @@
+// A server whose requests are exported as spans, for tools/otel_check.py: `/` answers 200 and `/fail` 500, on
+// OTEL_PORT; the spans go to OTEL_ENDPOINT every 200 ms as the service `demo`.
+import web_core;
+import web_transport;
+import web_http;
+import httpserver;
+import httpserver_otel;
+
+struct St {}
+
+/// Answers with its status.
+struct Answers {
+    status: u16;
+}
+
+impl Handler<St> for Answers {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut Context<St>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        let status = StatusCode.of(this.status) ?? { return Err(HandlerError.Internal); };
+        return await exchange.send(status, "done".bytes());
+    }
+}
+
+fn application(spans: Arc<Spans>) -> Result<App<St>, RouteError> {
+    var app = App<St>.create(St {}, Limits.defaults())?;
+    let trace: Box<dyn Filter + Send + Share> = match (Box.create(Trace.create(true))) {
+        Ok(b) => b,
+        Err(_) => { return Err(RouteError.OutOfMemory); },
+    };
+    app.filter(trace)?;
+    let log: Box<dyn AccessLog + Send + Share> = match (Box.create(SpanLog.create(spans))) {
+        Ok(b) => b,
+        Err(_) => { return Err(RouteError.OutOfMemory); },
+    };
+    app.logTo(log);
+    let ok: Box<dyn Handler<St> + Send + Share> = match (Box.create(Answers { status: 200 })) {
+        Ok(b) => b,
+        Err(_) => { return Err(RouteError.OutOfMemory); },
+    };
+    app.get("/{*rest}", ok)?;
+    let fails: Box<dyn Handler<St> + Send + Share> = match (Box.create(Answers { status: 500 })) {
+        Ok(b) => b,
+        Err(_) => { return Err(RouteError.OutOfMemory); },
+    };
+    app.get("/fail", fails)?;
+    return Ok(app);
+}
+
+async fn serve(
+    app: App<St>,
+    spans: Arc<Spans>,
+    listener: borrow Listener,
+    endpoint: StringView,
+) -> Result<ServerReport, NetError> {
+    let drain = Drain.create()?;
+    let limits = ConnectionLimits.defaults();
+    let bounds = borrow limits;
+    let draining = borrow drain;
+    let kept = borrow spans;
+    let r: Result<Raced<ServerReport>, NetError> = await Async.race(
+        async move () => await app.run(listener, PlainAcceptor {}, bounds, draining),
+        async move () => await export<ServerReport>(kept.get(), endpoint, "demo", 200),
+    );
+    return match (r) {
+        Ok(raced) => Ok(raced.value),
+        Err(e) => Err(e),
+    };
+}
+
+fn main() {
+    let port = match (Environment.variable("OTEL_PORT")) {
+        Some(t) => Ascii.parseDecimal(t.bytes()) ?? 8095,
+        null => 8095,
+    };
+    let endpoint = Environment.variable("OTEL_ENDPOINT") ?? "http://127.0.0.1:4318/v1/traces";
+    let made = match (Spans.create(4096)) {
+        Ok(s) => Arc<Spans>.create(s),
+        Err(e) => Err(e),
+    };
+    let spans = match (made) {
+        Ok(a) => a,
+        Err(_) => { Process.exit(1); },
+    };
+    let app = match (application(spans.clone())) {
+        Ok(a) => a,
+        Err(_) => { Process.exit(1); },
+    };
+    let options = ListenOptions { backlog: 0, reuseAddress: true, reusePort: false, v6Only: false };
+    let listener = match (Listener.bindWith(SocketAddresses.v4Loopback(truncate<u16>(port)), options)) {
+        Ok(l) => l,
+        Err(e) => {
+            Console.writeLine(NetErrors.describe(e));
+            Process.exit(1);
+        },
+    };
+    match (Async.run(serve(app, spans, listener, endpoint))) {
+        Ok(_) => {}
+        Err(e) => {
+            Console.writeLine(NetErrors.describe(e));
+            Process.exit(1);
+        }
+    }
+}
