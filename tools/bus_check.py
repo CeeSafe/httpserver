@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Checks the bus between the supervisor's workers (`Bus`, `carry`) with four workers of the benchmark server:
-a number said to one worker is heard by all four, and a cached response forgotten through one is forgotten by all.
+a number said to one worker is heard by all four, a cached response forgotten through one is forgotten by all,
+and workers started again after a trap hear and are heard.
 Without the bus only the worker asked hears and forgets.
 
 usage: python3 tools/bus_check.py [--port 18493] [--inherit]   (after `ceesafec build` in bench/)
@@ -55,17 +56,34 @@ def run(bus):
         get("/forget/4096")
         time.sleep(0.1)
         after = misses()        # every worker that forgot makes it once more
-        return results, (first, again, after)
+        # A worker that traps is started again in its place on the bus: it hears, and is heard.
+        crashed = 0
+        for _ in range(3):
+            try:
+                get("/crash")
+            except (http.client.HTTPException, OSError):
+                crashed += 1
+            time.sleep(0.6)
+        back = []
+        for number in (99, 100, 101, 102, 103, 104, 105, 106):   # said through whichever worker answers
+            said = get(f"/bus/say/{number}")[1]
+            time.sleep(0.1)
+            seen = heard()
+            back.append((said, len(seen), sum(1 for v in seen.values() if v == number)))
+        return results, (first, again, after), (crashed, back)
     finally:
         proc.terminate()
         proc.wait(10)
 
 problems = 0
-said, kept = run(True)
+said, kept, (crashed, back) = run(True)
 ok = all(s == (b"ok", 4, 4) for s in said) and kept == (4, 0, 4)
 print(f"{'ok  ' if ok else 'FAIL'} with the bus:    said/workers/heard {said}  handler runs before, kept, after forget {kept}")
 problems += 0 if ok else 1
-said, kept = run(False)
+ok = crashed == 3 and all(s == (b"ok", 4, 4) for s in back)
+print(f"{'ok  ' if ok else 'FAIL'} after {crashed} traps:    eight numbers said, each heard by all four workers: {ok}")
+problems += 0 if ok else 1
+said, kept, _ = run(False)
 ok = all(s == (b"ok", 4, 1) for s in said) and kept == (4, 0, 1)
 print(f"{'ok  ' if ok else 'FAIL'} without the bus: said/workers/heard {said}  handler runs before, kept, after forget {kept}")
 problems += 0 if ok else 1

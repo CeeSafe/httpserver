@@ -206,7 +206,8 @@ answers the same routes (server GC). One machine and one run each: read the rati
   and no limit 254 000 to 275 000. `tools/ratelimit_check.py`: of 992 requests against a limit of 200, exactly 200
   are answered with the shared words, 727 to 800 without.
 - `tools/bus_check.py`, four workers: a number said to one is heard by all four, and a cached response forgotten
-  through one is made again by all four (by one, without the bus). A bus nobody publishes on costs nothing
+  through one is made again by all four (by one, without the bus); after three workers trap and are started
+  again, eight numbers said through whichever worker answers are each heard by all four. A bus nobody publishes on costs nothing
   measurable (272 000 to 276 000 `/small` a second with it, 263 000 to 278 000 without).
 - CosmoApiServer answered 56 and 16 of about 1.3 million `/users/42` requests with a status that was not 2xx; not
   looked into.
