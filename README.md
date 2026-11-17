@@ -182,3 +182,10 @@ python3 tools/ws_check.py         # the hub, with WebSocket clients written from
 ```
 
 The compiler: ceesafec 0.62.2 or later. The supervisor is POSIX only.
+
+## License
+
+httpserver, httpserver_auth, httpserver_static, httpserver_ws and httpserver_compress are licensed under the GNU
+General Public License, version 2 only ([COPYING](COPYING)), as CeeSafe and CeeSafe.Web are, with an exception that
+permits linking them with OpenSSL ([COPYING.OPENSSL](COPYING.OPENSSL)), which httpserver_auth does through `pkey`
+and a TLS server does through `web_tls`. httpserver_compress links libzstd (BSD or GPL v2) and libbrotli (MIT).
