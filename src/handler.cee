@@ -1,0 +1,187 @@
+// Handlers, middleware and the per-request context.
+import web_core;
+import web_http;
+
+/// Handles requests for an application whose state is `S`. A handler is a struct with its own fields; the state is
+/// lent per request as `ctx.state()`.
+public interface Handler<S> {
+    /// Reads the request's body and writes its response through `exchange`.
+    async fn handle(borrow this, ctx: borrow mut Context<S>, request: borrow Request, exchange: borrow mut Exchange,) -> Result<void, HandlerError>;
+}
+
+/// Whether a middleware's `before` let the request through.
+public enum Flow {
+    /// Go on to the next middleware and the handler.
+    Continue,
+    /// The middleware answered (401, a CORS preflight): skip the rest and the handler.
+    Responded,
+}
+
+/// Hooks around handlers. A middleware added to the application runs for every request, routed or not; one added to
+/// a group runs for that group's routes, after the application's.
+public interface Middleware<S> {
+    /// Before the handler, in the order added. Response fields can be set here (`exchange.header`).
+    async fn before(borrow this, ctx: borrow mut Context<S>, request: borrow Request, exchange: borrow mut Exchange,) -> Result<Flow, HandlerError>;
+
+    /// Just before the response head is sent, in reverse order; may add fields. It is called for the application's
+    /// middleware only: a group's sets its fields in `before`.
+    async fn after(borrow this, request: borrow Request, head: borrow mut ResponseHead) -> Result<void, HandlerError>;
+}
+
+/// Something a middleware left for the handler: a name and bytes.
+struct Item {
+    name: Vector<u8>;
+    value: Vector<u8>;
+}
+
+/// The part of a request's context that does not depend on the application's state: the connection, and what
+/// middleware leaves for what runs after it. A `Filter` sees this much.
+public struct Scope<region r> {
+    private conn: borrow(r) ConnectionContext<r>;
+    private items: Vector<Item>;
+
+    /// The connection: its id, addresses, age, and whether the server is draining.
+    public fn connection(borrow this) -> borrow(r) ConnectionContext<r> => this.conn;
+
+    /// Leaves `value` under `name` for the middleware and the handler that run after: who the request is from
+    /// (`"user"`, set by authentication), a request id. A second `put` of a name replaces the first. False if out of
+    /// memory.
+    public fn put(borrow mut this, name: StringView, value: Slice<u8>) -> bool {
+        var item = Item { name: Vector<u8>.create(), value: Vector<u8>.create() };
+        for (b in name.bytes()) {
+            match (item.name.push(b)) {
+                Ok() => {}
+                Err(_) => { return false; }
+            }
+        }
+        for (b in value) {
+            match (item.value.push(b)) {
+                Ok() => {}
+                Err(_) => { return false; }
+            }
+        }
+        for (i in 0..this.items.length) {
+            if (sameBytes(this.items[i].name.view(), name.bytes())) {
+                this.items[i] = item;
+                return true;
+            }
+        }
+        match (this.items.push(item)) {
+            Ok() => { return true; }
+            Err(_) => { return false; }
+        }
+    }
+
+    /// What was `put` under `name`, or null.
+    public fn value(borrow this, name: StringView) -> Slice<u8>? {
+        for (i in 0..this.items.length) {
+            if (sameBytes(this.items[i].name.view(), name.bytes())) {
+                return Some(this.items[i].value.view());
+            }
+        }
+        return null;
+    }
+}
+
+/// Middleware that needs nothing of the application's state, so one type serves every application: CORS, security
+/// headers, rate limiting, authentication. It runs in the same chains as `Middleware<S>`, in the order added.
+public interface Filter {
+    /// Before the handler. Response fields can be set here (`exchange.header`).
+    async fn before(borrow this, scope: borrow mut Scope, request: borrow Request, exchange: borrow mut Exchange,) -> Result<Flow, HandlerError>;
+
+    /// Just before the response head is sent; for the application's filters only, as `Middleware.after`.
+    async fn after(borrow this, request: borrow Request, head: borrow mut ResponseHead) -> Result<void, HandlerError>;
+}
+
+/// What a handler knows besides the request.
+public struct Context<region r, S> {
+    private shared: Scope<r>;
+    private appState: borrow(r) S;
+    private routes: borrow(r) Router<S>;
+    private routePath: StringView<r>;
+    private matched: Params;
+
+    /// A context for one request.
+    public fn create(
+        state: borrow(r) S,
+        connection: borrow(r) ConnectionContext<r>,
+        router: borrow(r) Router<S>,
+        path: StringView<r>,
+        params: Params,
+    ) -> Context<r, S> =>
+        Context {
+            shared: Scope { conn: connection, items: Vector<Item>.create() },
+            appState: state,
+            routes: router,
+            routePath: path,
+            matched: params,
+        };
+
+    /// The application's state.
+    public fn state(borrow this) -> borrow(r) S => this.appState;
+
+    /// The connection: its id, addresses, age, and whether the server is draining.
+    public fn connection(borrow this) -> borrow(r) ConnectionContext<r> => this.shared.conn;
+
+    /// The state-free part, which filters see.
+    public fn scope(borrow mut this) -> borrow mut Scope<r> => borrow mut this.shared;
+
+    /// The route parameter `name`, as sent (percent-encoded), or null.
+    public fn param(borrow this, name: StringView) -> StringView<r>? {
+        return match (this.routes.paramRange(this.matched, name)) {
+            Some(range) => Some(this.routePath[range.start..range.end]),
+            null => null,
+        };
+    }
+
+    /// The route parameter `name`, percent-decoded into `out` (cleared first); false if there is none, its escapes
+    /// are malformed, or `out` could not grow.
+    public fn paramDecoded(borrow this, name: StringView, out: borrow mut Vector<u8>) -> bool {
+        out.clear();
+        return match (this.param(name)) {
+            Some(v) => percentDecode(v.bytes(), false, out),
+            null => false,
+        };
+    }
+
+    /// The route parameter `name` as a number: what an `{name:int}` or `{name:long}` matched. Null if there is
+    /// none or it is not a number that fits.
+    public fn paramInt(borrow this, name: StringView) -> i64? {
+        let text = this.param(name) ?? { return null; };
+        let bytes = text.bytes();
+        if (bytes.length == 0) {
+            return null;
+        }
+        let negative = bytes[0] == 45;
+        let digits = if (negative) bytes[1..] else bytes;
+        if (digits.length == 0 || digits.length > 19) {
+            return null;
+        }
+        var v: u64 = 0;
+        for (b in digits) {
+            if (b < 48 || b > 57) {
+                return null;
+            }
+            v = v * 10 + (b - 48) as u64;
+        }
+        if (negative) {
+            if (v > 9223372036854775808) {
+                return null;
+            }
+            if (v == 9223372036854775808) {
+                return Some(-9223372036854775807 - 1);
+            }
+            return Some(0 - truncate<i64>(v));
+        }
+        if (v > 9223372036854775807) {
+            return null;
+        }
+        return Some(truncate<i64>(v));
+    }
+
+    /// `Scope.put`: leaves `value` under `name` for what runs after.
+    public fn put(borrow mut this, name: StringView, value: Slice<u8>) -> bool => this.shared.put(name, value);
+
+    /// `Scope.value`: what was `put` under `name`, or null.
+    public fn value(borrow this, name: StringView) -> Slice<u8>? => this.shared.value(name);
+}

@@ -1,0 +1,146 @@
+// CORS (the Fetch standard's CORS protocol): which other origins' pages may read this server's responses.
+import web_http;
+
+/// What `Cors` allows. Built once, then given to `Cors.create`.
+public struct CorsOptions {
+    /// The origins allowed, as browsers send them (`https://app.example.com`); none means any origin.
+    private origins: Vector<Vector<u8>>;
+    /// `Access-Control-Allow-Methods` for a preflight.
+    private methods: Vector<u8>;
+    /// `Access-Control-Allow-Headers` for a preflight; empty: what the preflight asks for.
+    private headers: Vector<u8>;
+    /// `Access-Control-Expose-Headers`; empty: none.
+    private exposed: Vector<u8>;
+    private credentials: bool;
+    private maxAge: Vector<u8>;
+
+    /// Any origin, `GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS`, the headers a preflight asks for, no credentials,
+    /// and preflights cached for ten minutes.
+    public fn any() -> Result<CorsOptions, AllocError> {
+        var o = CorsOptions {
+            origins: Vector<Vector<u8>>.create(),
+            methods: Vector<u8>.create(),
+            headers: Vector<u8>.create(),
+            exposed: Vector<u8>.create(),
+            credentials: false,
+            maxAge: Vector<u8>.create(),
+        };
+        appendTo(mut o.methods, "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS".bytes())?;
+        appendTo(mut o.maxAge, "600".bytes())?;
+        return Ok(o);
+    }
+
+    /// Allows `origin` (scheme, host and port as the browser sends them, no path). The first call ends "any origin".
+    public fn allowOrigin(borrow mut this, origin: StringView) -> Result<void, AllocError> {
+        var copy = Vector<u8>.create();
+        appendTo(mut copy, origin.bytes())?;
+        return this.origins.push(copy);
+    }
+
+    /// The methods a preflight is told are allowed (`"GET, POST"`).
+    public fn allowMethods(borrow mut this, list: StringView) -> Result<void, AllocError> {
+        this.methods.clear();
+        return appendTo(mut this.methods, list.bytes());
+    }
+
+    /// The request headers a preflight is told are allowed (`"content-type, authorization"`).
+    public fn allowHeaders(borrow mut this, list: StringView) -> Result<void, AllocError> {
+        this.headers.clear();
+        return appendTo(mut this.headers, list.bytes());
+    }
+
+    /// The response headers a page may read besides the safelisted ones.
+    public fn exposeHeaders(borrow mut this, list: StringView) -> Result<void, AllocError> {
+        this.exposed.clear();
+        return appendTo(mut this.exposed, list.bytes());
+    }
+
+    /// Allows requests with credentials (cookies, HTTP authentication). The allowed origin is then always the
+    /// request's own, never `*`, as the protocol requires.
+    public fn allowCredentials(borrow mut this) {
+        this.credentials = true;
+    }
+
+    /// How long a browser may cache a preflight's answer.
+    public fn maxAgeSeconds(borrow mut this, seconds: u32) -> Result<void, AllocError> {
+        this.maxAge.clear();
+        var text = [0u8; 20];
+        var w = TextWriter.create(mut text[..]);
+        w.decimal(seconds as u64);
+        return appendTo(mut this.maxAge, w.written());
+    }
+}
+
+fn appendTo(out: borrow mut Vector<u8>, bytes: Slice<u8>) -> Result<void, AllocError> {
+    for (b in bytes) {
+        out.push(b)?;
+    }
+    return Ok();
+}
+
+/// The CORS middleware. A request without `Origin`, or from an origin not allowed, goes on untouched: the browser,
+/// seeing no `Access-Control-Allow-Origin`, keeps the response from the page. A preflight (OPTIONS with
+/// `Access-Control-Request-Method`) from an allowed origin is answered here with 204.
+public struct Cors {
+    private options: CorsOptions;
+
+    public fn create(options: CorsOptions) -> Cors => Cors { options: options };
+
+    fn allows(borrow this, origin: Slice<u8>) -> bool {
+        if (this.options.origins.length == 0) {
+            return true;
+        }
+        for (i in 0..this.options.origins.length) {
+            if (sameBytes(this.options.origins[i].view(), origin)) {
+                return true;
+            }
+        }
+        return false;
+    }
+}
+
+impl Filter for Cors {
+    async fn before(
+        borrow this,
+        scope: borrow mut Scope,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<Flow, HandlerError> {
+        let origin = request.headers().get(HeaderName.Origin) ?? { return Ok(Flow.Continue); };
+        if (!this.allows(origin)) {
+            return Ok(Flow.Continue);
+        }
+        let wildcard = this.options.origins.length == 0 && !this.options.credentials;
+        if (wildcard) {
+            exchange.header("access-control-allow-origin", "*".bytes())?;
+        } else {
+            exchange.header("access-control-allow-origin", origin)?;
+            exchange.header("vary", "origin".bytes())?; // the answer depends on who asks: caches must know
+        }
+        if (this.options.credentials) {
+            exchange.header("access-control-allow-credentials", "true".bytes())?;
+        }
+        let asked = request.headers().getNamed("access-control-request-method");
+        if (Methods.same(request.method(), Method.Options) && asked.isSome()) {
+            exchange.header("access-control-allow-methods", this.options.methods.view())?;
+            if (this.options.headers.length > 0) {
+                exchange.header("access-control-allow-headers", this.options.headers.view())?;
+            } else {
+                match (request.headers().getNamed("access-control-request-headers")) {
+                    Some(wanted) => { exchange.header("access-control-allow-headers", wanted)?; }
+                    null => {}
+                }
+            }
+            exchange.header("access-control-max-age", this.options.maxAge.view())?;
+            await exchange.send(Status.noContent(), "".bytes())?;
+            return Ok(Flow.Responded);
+        }
+        if (this.options.exposed.length > 0) {
+            exchange.header("access-control-expose-headers", this.options.exposed.view())?;
+        }
+        return Ok(Flow.Continue);
+    }
+
+    async fn after(borrow this, request: borrow Request, head: borrow mut ResponseHead) -> Result<void, HandlerError> =>
+        Ok();
+}

@@ -1,0 +1,243 @@
+// `App<S>` over HTTP/1.1's driver on mock connections: routing by method, parameter kinds and their order, the
+// table of parameterless routes, groups and their middleware, and the replies. Every expected response is written
+// out by hand from RFC 9110 and the rules in src/route.cee and src/app.cee.
+import web_core;
+import web_http;
+
+/// `GET /users` (h1), `POST /users` (h2), `POST /users/new` (h3), `GET /users/{id:int}` (h4), `GET /users/{name}`
+/// (h5), `GET /files/{*rest}` (shown), `GET /show/{id}` (shown), `GET /` (h6).
+fn plain() -> Result<App<St>, TestFailure> {
+    var a = routed(App<St>.create(state(), quiet()))?;
+    routed(a.get("/users", named(1)?))?;
+    routed(a.post("/users", named(2)?))?;
+    routed(a.post("/users/new", named(3)?))?;
+    routed(a.get("/users/{name}", named(5)?))?;
+    routed(a.get("/users/{id:int}", named(4)?))?;
+    routed(a.get("/files/{*rest}", shown()?))?;
+    routed(a.get("/show/{id}", shown()?))?;
+    routed(a.get("/", named(6)?))?;
+    return Ok(a);
+}
+
+async fn body(a: borrow App<St>, request: StringView, expected: StringView) -> Result<void, TestFailure> {
+    let got = await served(a, request)?;
+    return Check.equalBytes(expected.bytes(), got.view());
+}
+
+@test
+async fn routesByMethodAndKind() -> Result<void, TestFailure> {
+    let a = plain()?;
+    await body(a, "GET /users HTTP/1.1\r\nhost: a\r\n\r\n", "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nh1")?;
+    await body(a, "GET / HTTP/1.1\r\nhost: a\r\n\r\n", "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nh6")?;
+    await body(
+        a,
+        "POST /users HTTP/1.1\r\nhost: a\r\ncontent-length: 0\r\n\r\n",
+        "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nh2",
+    )?;
+    // A number goes to the `int` route though the plain parameter was added first; anything else to the plain one.
+    await body(a, "GET /users/42 HTTP/1.1\r\nhost: a\r\n\r\n", "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nh4")?;
+    await body(a, "GET /users/-7 HTTP/1.1\r\nhost: a\r\n\r\n", "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nh4")?;
+    await body(a, "GET /users/bob HTTP/1.1\r\nhost: a\r\n\r\n", "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nh5")?;
+    // 2147483648 does not fit an int.
+    await body(
+        a,
+        "GET /users/2147483648 HTTP/1.1\r\nhost: a\r\n\r\n",
+        "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nh5",
+    )?;
+    // `/users/new` has only a POST: a GET of it is the parameter's.
+    await body(a, "GET /users/new HTTP/1.1\r\nhost: a\r\n\r\n", "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nh5")?;
+    await body(
+        a,
+        "POST /users/new HTTP/1.1\r\nhost: a\r\ncontent-length: 0\r\n\r\n",
+        "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nh3",
+    )?;
+    // An escaped literal still matches, through the tree.
+    await body(a, "GET /us%65rs HTTP/1.1\r\nhost: a\r\n\r\n", "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nh1")?;
+    // HEAD through GET: GET's length, no content (RFC 9110 §9.3.2).
+    await body(a, "HEAD /users HTTP/1.1\r\nhost: a\r\n\r\n", "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n")?;
+    return Ok();
+}
+
+@test
+async fn unroutedRequests() -> Result<void, TestFailure> {
+    let a = plain()?;
+    await body(a, "GET /nope HTTP/1.1\r\nhost: a\r\n\r\n", "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n")?;
+    await body(a, "GET /users/ HTTP/1.1\r\nhost: a\r\n\r\n", "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n")?;
+    // 405 lists the path's methods and OPTIONS (RFC 9110 §15.5.6).
+    await body(
+        a,
+        "DELETE /users HTTP/1.1\r\nhost: a\r\n\r\n",
+        "HTTP/1.1 405 Method Not Allowed\r\nallow: GET, HEAD, POST, OPTIONS\r\ncontent-length: 0\r\n\r\n",
+    )?;
+    // The literal place is asked first: `/users/new` has a POST.
+    await body(
+        a,
+        "DELETE /users/new HTTP/1.1\r\nhost: a\r\n\r\n",
+        "HTTP/1.1 405 Method Not Allowed\r\nallow: POST, OPTIONS\r\ncontent-length: 0\r\n\r\n",
+    )?;
+    // OPTIONS on a routed path: 204 with `Allow`, and no length field (RFC 9110 §9.3.7, §8.6).
+    await body(
+        a,
+        "OPTIONS /users/7 HTTP/1.1\r\nhost: a\r\n\r\n",
+        "HTTP/1.1 204 No Content\r\nallow: GET, HEAD, OPTIONS\r\n\r\n",
+    )?;
+    await body(a, "OPTIONS * HTTP/1.1\r\nhost: a\r\n\r\n", "HTTP/1.1 204 No Content\r\n\r\n")?;
+    return Ok();
+}
+
+@test
+async fn parametersAndTheQuery() -> Result<void, TestFailure> {
+    let a = plain()?;
+    await body(
+        a,
+        "GET /show/a%2Fb?x=1&q=two+words%21 HTTP/1.1\r\nhost: a\r\n\r\n",
+        "HTTP/1.1 200 OK\r\ncontent-length: 15\r\n\r\na/b||two words!",
+    )?;
+    await body(
+        a,
+        "GET /files/css/site.css HTTP/1.1\r\nhost: a\r\n\r\n",
+        "HTTP/1.1 200 OK\r\ncontent-length: 14\r\n\r\n|css/site.css|",
+    )?;
+    // The rest of the path may be empty.
+    await body(a, "GET /files/ HTTP/1.1\r\nhost: a\r\n\r\n", "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n||")?;
+    return Ok();
+}
+
+@test
+async fn patternsThatAreRefused() -> Result<void, TestFailure> {
+    var a = routed(App<St>.create(state(), quiet()))?;
+    routed(a.get("/a/{id}", named(1)?))?;
+    Check.isTrue(a.get("a", named(1)?).isErr(), "refused")?;
+    Check.isTrue(a.get("/a/{id}", named(1)?).isErr(), "refused")?; // twice
+    Check.isTrue(a.post("/a/{other}", named(1)?).isErr(), "refused")?; // another name at the same place
+    Check.isTrue(a.get("/b/{id:float}", named(1)?).isErr(), "refused")?; // an unknown kind
+    Check.isTrue(a.get("/b/{*rest}/c", named(1)?).isErr(), "refused")?; // the rest is not last
+    Check.isTrue(a.get("/b/{}", named(1)?).isErr(), "refused")?;
+    Check.isTrue(a.get("/b/{id", named(1)?).isErr(), "refused")?;
+    Check.isTrue(a.routeIn(9, Method.Get, "/x", named(1)?).isErr(), "refused")?;
+    Check.isTrue(a.group("api").isErr(), "refused")?;
+    // The other spelling, and another kind beside the plain parameter.
+    routed(a.get("/c/:id/*rest", named(1)?))?;
+    routed(a.get("/a/{key:guid}", named(2)?))?;
+    await body(
+        a,
+        "GET /a/0f8fad5b-d9cb-469f-a165-70867728950e HTTP/1.1\r\nhost: a\r\n\r\n",
+        "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nh2",
+    )?;
+    await body(a, "GET /a/0f8fad5b HTTP/1.1\r\nhost: a\r\n\r\n", "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nh1")?;
+    return Ok();
+}
+
+@test
+async fn groupsAndTheirMiddleware() -> Result<void, TestFailure> {
+    var a = routed(App<St>.create(state(), quiet()))?;
+    routed(a.use(mark(1)?))?;
+    let api = routed(a.group("/api"))?;
+    routed(a.useIn(api, mark(2)?))?;
+    let admin = routed(a.groupIn(api, "/admin"))?;
+    routed(a.useIn(admin, mark(3)?))?;
+    routed(a.use(mark(4)?))?;
+    routed(a.get("/open", named(1)?))?;
+    routed(a.routeIn(api, Method.Get, "/", named(2)?))?;
+    routed(a.routeIn(api, Method.Get, "/items/{id:int}", named(3)?))?;
+    routed(a.routeIn(admin, Method.Get, "/stats", named(4)?))?;
+    // The application's middleware only; `after` in reverse order.
+    await body(
+        a,
+        "GET /open HTTP/1.1\r\nhost: a\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nx-b1: 1\r\nx-b4: 1\r\nx-a4: 1\r\nx-a1: 1\r\ncontent-length: 2\r\n\r\nh1",
+    )?;
+    Check.equalU64(14, a.state().befores.load())?;
+    // The application's, then the group's.
+    a.state().befores.store(0);
+    await body(
+        a,
+        "GET /api/items/9 HTTP/1.1\r\nhost: a\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nx-b1: 1\r\nx-b4: 1\r\nx-b2: 1\r\nx-a4: 1\r\nx-a1: 1\r\ncontent-length: 2\r\n\r\nh3",
+    )?;
+    Check.equalU64(142, a.state().befores.load())?;
+    await body(
+        a,
+        "GET /api HTTP/1.1\r\nhost: a\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nx-b1: 1\r\nx-b4: 1\r\nx-b2: 1\r\nx-a4: 1\r\nx-a1: 1\r\ncontent-length: 2\r\n\r\nh2",
+    )?;
+    // A group under a group runs both.
+    a.state().befores.store(0);
+    await body(
+        a,
+        "GET /api/admin/stats HTTP/1.1\r\nhost: a\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nx-b1: 1\r\nx-b4: 1\r\nx-b2: 1\r\nx-b3: 1\r\nx-a4: 1\r\nx-a1: 1\r\ncontent-length: 2\r\n\r\nh4",
+    )?;
+    Check.equalU64(1423, a.state().befores.load())?;
+    // A group's middleware answers: the handler does not run, and the application's `after` still edits the head.
+    await body(
+        a,
+        "GET /api/admin/stats HTTP/1.1\r\nhost: a\r\nx-deny: 3\r\n\r\n",
+        "HTTP/1.1 401 Unauthorized\r\nx-b1: 1\r\nx-b4: 1\r\nx-b2: 1\r\nx-b3: 1\r\nx-a4: 1\r\nx-a1: 1\r\ncontent-length: 0\r\n\r\n",
+    )?;
+    // The application's middleware runs for what has no route; a group's does not.
+    a.state().befores.store(0);
+    await body(
+        a,
+        "GET /api/nope HTTP/1.1\r\nhost: a\r\n\r\n",
+        "HTTP/1.1 404 Not Found\r\nx-b1: 1\r\nx-b4: 1\r\nx-a4: 1\r\nx-a1: 1\r\ncontent-length: 0\r\n\r\n",
+    )?;
+    Check.equalU64(14, a.state().befores.load())?;
+    return Ok();
+}
+
+/// Answers with one of `Reply`'s responses, chosen by the query's `kind`.
+struct Replies {}
+
+impl Handler<St> for Replies {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut Context<St>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        let kind = Query.number(request.query(), "kind") ?? 0;
+        if (kind == 1) {
+            return await Reply.text(exchange, Status.ok(), "hi");
+        }
+        if (kind == 2) {
+            return await Reply.json(exchange, Status.created(), "{\"a\":1}".bytes());
+        }
+        if (kind == 3) {
+            return await Reply.redirect(exchange, "/there".bytes(), true, true);
+        }
+        if (kind == 4) {
+            return await Reply.problem(exchange, Status.notFound(), "", "no \"such\" thing");
+        }
+        return await Reply.empty(exchange, Status.noContent());
+    }
+}
+
+@test
+async fn replies() -> Result<void, TestFailure> {
+    var a = routed(App<St>.create(state(), quiet()))?;
+    let h: Box<dyn Handler<St> + Send + Share> = alloc(Box.create(Replies {}))?;
+    routed(a.get("/r", h))?;
+    await body(
+        a,
+        "GET /r?kind=1 HTTP/1.1\r\nhost: a\r\n\r\n",
+        "HTTP/1.1 200 OK\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: 2\r\n\r\nhi",
+    )?;
+    await body(
+        a,
+        "GET /r?kind=2 HTTP/1.1\r\nhost: a\r\n\r\n",
+        "HTTP/1.1 201 Created\r\ncontent-type: application/json\r\ncontent-length: 7\r\n\r\n{\"a\":1}",
+    )?;
+    await body(
+        a,
+        "GET /r?kind=3 HTTP/1.1\r\nhost: a\r\n\r\n",
+        "HTTP/1.1 308 Permanent Redirect\r\nlocation: /there\r\ncontent-length: 0\r\n\r\n",
+    )?;
+    await body(
+        a,
+        "GET /r?kind=4 HTTP/1.1\r\nhost: a\r\n\r\n",
+        "HTTP/1.1 404 Not Found\r\ncontent-type: application/problem+json\r\ncontent-length: 84\r\n\r\n{\"type\":\"about:blank\",\"title\":\"Not Found\",\"status\":404,\"detail\":\"no \\\"such\\\" thing\"}",
+    )?;
+    await body(a, "GET /r HTTP/1.1\r\nhost: a\r\n\r\n", "HTTP/1.1 204 No Content\r\n\r\n")?;
+    return Ok();
+}

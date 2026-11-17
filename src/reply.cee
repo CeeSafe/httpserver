@@ -1,0 +1,196 @@
+// Responses in one call, and the query string.
+import web_http;
+
+/// Whole responses. Each sets the content type, then sends the status, the length and the body in one write.
+public struct Reply {
+    /// `body` as `text/plain; charset=utf-8`.
+    public async fn text(
+        exchange: borrow mut Exchange,
+        status: StatusCode,
+        body: StringView,
+    ) -> Result<void, HandlerError> {
+        exchange.header("content-type", "text/plain; charset=utf-8".bytes())?;
+        return await exchange.send(status, body.bytes());
+    }
+
+    /// `body` as `text/html; charset=utf-8`.
+    public async fn html(
+        exchange: borrow mut Exchange,
+        status: StatusCode,
+        body: Slice<u8>,
+    ) -> Result<void, HandlerError> {
+        exchange.header("content-type", "text/html; charset=utf-8".bytes())?;
+        return await exchange.send(status, body);
+    }
+
+    /// `body`, JSON text already written, as `application/json`.
+    public async fn json(
+        exchange: borrow mut Exchange,
+        status: StatusCode,
+        body: Slice<u8>,
+    ) -> Result<void, HandlerError> {
+        exchange.header("content-type", "application/json".bytes())?;
+        return await exchange.send(status, body);
+    }
+
+    /// `body` as `contentType`.
+    public async fn bytes(
+        exchange: borrow mut Exchange,
+        status: StatusCode,
+        contentType: StringView,
+        body: Slice<u8>,
+    ) -> Result<void, HandlerError> {
+        exchange.header("content-type", contentType.bytes())?;
+        return await exchange.send(status, body);
+    }
+
+    /// `status` with no content.
+    public async fn empty(exchange: borrow mut Exchange, status: StatusCode) -> Result<void, HandlerError> =>
+        await exchange.send(status, "".bytes());
+
+    /// A redirect to `location`: 302, or 301 when `permanent`; with `keepMethod`, 307 or 308, which the client
+    /// repeats with the same method and body (RFC 9110 §15.4).
+    public async fn redirect(
+        exchange: borrow mut Exchange,
+        location: Slice<u8>,
+        permanent: bool,
+        keepMethod: bool,
+    ) -> Result<void, HandlerError> {
+        let code: u16 = if (keepMethod) (if (permanent) 308u16 else 307u16) else (if (permanent) 301u16 else 302u16);
+        let status = StatusCode.of(code) ?? { return Err(HandlerError.Internal); };
+        exchange.header("location", location)?;
+        return await exchange.send(status, "".bytes());
+    }
+
+    /// A problem (RFC 9457) as `application/problem+json`: `{"type":"about:blank","title":…,"status":…,"detail":…}`.
+    /// The title is the status's reason phrase when `title` is empty; `detail` is left out when empty.
+    public async fn problem(
+        exchange: borrow mut Exchange,
+        status: StatusCode,
+        title: StringView,
+        detail: StringView,
+    ) -> Result<void, HandlerError> {
+        var body = Vector<u8>.create();
+        let heading = if (title.length == 0) status.reason() else title;
+        var ok = put(
+            mut body,
+            "{\"type\":\"about:blank\",\"title\":\"".bytes(),
+        ) && putEscaped(mut body, heading.bytes());
+        ok = ok && put(mut body, "\",\"status\":".bytes()) && putDecimal(mut body, status.code() as u64);
+        if (detail.length > 0) {
+            ok = ok && put(mut body, ",\"detail\":\"".bytes()) && putEscaped(mut body, detail.bytes()) &&
+                put(mut body, "\"".bytes());
+        }
+        ok = ok && put(mut body, "}".bytes());
+        if (!ok) {
+            return Err(HandlerError.Internal);
+        }
+        exchange.header("content-type", "application/problem+json".bytes())?;
+        return await exchange.send(status, body.view());
+    }
+}
+
+fn put(out: borrow mut Vector<u8>, bytes: Slice<u8>) -> bool {
+    for (b in bytes) {
+        match (out.push(b)) {
+            Ok() => {}
+            Err(_) => { return false; }
+        }
+    }
+    return true;
+}
+
+fn putDecimal(out: borrow mut Vector<u8>, value: u64) -> bool {
+    var digits = [0u8; 20];
+    var i: usize = 20;
+    var v = value;
+    loop {
+        i -= 1;
+        digits[i] = truncate<u8>(48 + v % 10);
+        v /= 10;
+        if (v == 0) {
+            break;
+        }
+    }
+    return put(out, digits[i..]);
+}
+
+/// `text` as the inside of a JSON string (RFC 8259 §7): quotes, backslashes and control characters escaped.
+fn putEscaped(out: borrow mut Vector<u8>, text: Slice<u8>) -> bool {
+    let hex = "0123456789abcdef".bytes();
+    for (b in text) {
+        var ok = true;
+        if (b == 34 || b == 92) {
+            var pair = [92u8, 0u8];
+            pair[1] = b;
+            ok = put(out, pair[..]);
+        } else if (b < 32) {
+            var escape = [92u8, 117u8, 48u8, 48u8, 0u8, 0u8]; // \u00XX
+            escape[4] = hex[(b >> 4) as usize];
+            escape[5] = hex[(b & 15) as usize];
+            ok = put(out, escape[..]);
+        } else {
+            var one = [0u8; 1];
+            one[0] = b;
+            ok = put(out, one[..]);
+        }
+        if (!ok) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// A request's query string (`request.query()`): `name=value` pairs separated by `&`.
+public struct Query {
+    /// The value of the first `name` in `query`, as sent (still encoded); empty for a name without `=`. Null if
+    /// the query has no such name. `name` is compared with the names as sent, so give it as it is written in a URL.
+    public fn raw<region r>(query: StringView<r>?, name: StringView) -> StringView<r>? {
+        let q = query ?? { return null; };
+        let bytes = q.bytes();
+        let wanted = name.bytes();
+        var at: usize = 0;
+        while (at <= bytes.length) {
+            var end = at;
+            while (end < bytes.length && bytes[end] != 38) {
+                end += 1;
+            }
+            var eq = at;
+            while (eq < end && bytes[eq] != 61) {
+                eq += 1;
+            }
+            if (eq - at == wanted.length) {
+                var same = true;
+                for (i in 0..wanted.length) {
+                    if (bytes[at + i] != wanted[i]) {
+                        same = false;
+                        break;
+                    }
+                }
+                if (same) {
+                    return Some(if (eq < end) q[eq + 1..end] else q[end..end]);
+                }
+            }
+            at = end + 1;
+        }
+        return null;
+    }
+
+    /// The value of the first `name` in `query`, decoded into `out` (cleared first): escapes resolved and `+` as a
+    /// space. False if there is no such name, its escapes are malformed, or `out` could not grow.
+    public fn value(query: StringView?, name: StringView, out: borrow mut Vector<u8>) -> bool {
+        out.clear();
+        return match (Query.raw(query, name)) {
+            Some(v) => percentDecode(v.bytes(), true, out),
+            null => false,
+        };
+    }
+
+    /// The value of the first `name` in `query` as an unsigned number, or null.
+    public fn number(query: StringView?, name: StringView) -> u64? {
+        return match (Query.raw(query, name)) {
+            Some(v) => Ascii.parseDecimal(v.bytes()),
+            null => null,
+        };
+    }
+}

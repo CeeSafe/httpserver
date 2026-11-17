@@ -1,0 +1,139 @@
+// Response headers set on every response: any fixed set (`FixedHeaders`), and the usual security set built with
+// `SecurityHeaders`. And the redirect from HTTP to HTTPS.
+import web_core;
+import web_http;
+
+/// A field set on every response.
+struct FixedField {
+    name: String;
+    value: Vector<u8>;
+}
+
+/// A filter that sets the same fields on every response, unless the handler sets its own of that name.
+public struct FixedHeaders {
+    private fields: Vector<FixedField>;
+
+    /// No fields yet.
+    public fn create() -> FixedHeaders => FixedHeaders { fields: Vector<FixedField>.create() };
+
+    /// Adds `name: value`; a name already added gets the new value. The name is a field name in lower case.
+    public fn set(borrow mut this, name: StringView, value: StringView) -> Result<void, AllocError> {
+        var f = FixedField { name: String.create(), value: Vector<u8>.create() };
+        f.name.append(name)?;
+        for (b in value.bytes()) {
+            f.value.push(b)?;
+        }
+        for (i in 0..this.fields.length) {
+            if (this.fields[i].name.view() == name) {
+                this.fields[i] = f;
+                return Ok();
+            }
+        }
+        return this.fields.push(f);
+    }
+}
+
+impl Filter for FixedHeaders {
+    async fn before(
+        borrow this,
+        scope: borrow mut Scope,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<Flow, HandlerError> =>
+        Ok(Flow.Continue);
+
+    /// The fields are added last, so a handler's own field of the same name stands.
+    async fn after(borrow this, request: borrow Request, head: borrow mut ResponseHead) -> Result<void, HandlerError> {
+        for (i in 0..this.fields.length) {
+            let name = this.fields[i].name.view();
+            if (head.has(name)) {
+                continue;
+            }
+            match (head.add(name, this.fields[i].value.view())) {
+                Ok() => {}
+                Err(_) => { return Err(HandlerError.Internal); }
+            }
+        }
+        return Ok();
+    }
+}
+
+/// The security headers a site usually wants, as a `FixedHeaders`.
+public struct SecurityHeaders {
+    /// `x-content-type-options: nosniff`, `x-frame-options: DENY`, `referrer-policy:
+    /// strict-origin-when-cross-origin`, and `cross-origin-opener-policy: same-origin`. Add to it with `set`: a
+    /// `content-security-policy`, a `permissions-policy`, and `hsts` for a site served over HTTPS.
+    public fn defaults() -> Result<FixedHeaders, AllocError> {
+        var h = FixedHeaders.create();
+        h.set("x-content-type-options", "nosniff")?;
+        h.set("x-frame-options", "DENY")?;
+        h.set("referrer-policy", "strict-origin-when-cross-origin")?;
+        h.set("cross-origin-opener-policy", "same-origin")?;
+        return Ok(h);
+    }
+
+    /// Adds `strict-transport-security` (RFC 6797) to `headers`: browsers use HTTPS only for this host for
+    /// `maxAgeSeconds`, and for its subdomains too with `subdomains`. Only for a host that is always served over
+    /// HTTPS: a browser that has seen it will not come back over HTTP.
+    public fn hsts(headers: borrow mut FixedHeaders, maxAgeSeconds: u64, subdomains: bool) -> Result<void, AllocError> {
+        var text = [0u8; 64];
+        var w = TextWriter.create(mut text[..]);
+        w.text("max-age=");
+        w.decimal(maxAgeSeconds);
+        if (subdomains) {
+            w.text("; includeSubDomains");
+        }
+        let value = StringView.fromUtf8(w.written()) ?? "max-age=0";
+        return headers.set("strict-transport-security", value);
+    }
+}
+
+/// Sends every request to the same host and path over HTTPS, with 308, so the method and body are kept. A request
+/// without `Host` is 400. A connection does not say whether it came over TLS (CEESAFE_FINDINGS.md, S8), so this is
+/// for the application served on the plain port: one whose only work is to redirect.
+public struct HttpsRedirect {
+    /// The HTTPS port, left out of the location when it is 443.
+    private port: u16;
+
+    public fn create(httpsPort: u16) -> HttpsRedirect => HttpsRedirect { port: httpsPort };
+}
+
+impl Filter for HttpsRedirect {
+    async fn before(
+        borrow this,
+        scope: borrow mut Scope,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<Flow, HandlerError> {
+        let host = request.headers().get(HeaderName.Host) ?? {
+            await exchange.send(Status.badRequest(), "".bytes())?;
+            return Ok(Flow.Responded);
+        };
+        // The host without its port.
+        var end = host.length;
+        for (i in 0..host.length) {
+            if (host[i] == 58 && (host.length == 0 || host[0] != 91)) {
+                end = i;
+                break;
+            }
+            if (host[i] == 93) {
+                end = i + 1; // an IPv6 literal ends at its bracket
+                break;
+            }
+        }
+        var location = Vector<u8>.create();
+        var ok = put(mut location, "https://".bytes()) && put(mut location, host[0..end]);
+        if (this.port != 443) {
+            ok = ok && put(mut location, ":".bytes()) && putDecimal(mut location, this.port as u64);
+        }
+        ok = ok && put(mut location, request.target().bytes());
+        if (!ok) {
+            return Err(HandlerError.Internal);
+        }
+        await Reply.redirect(exchange, location.view(), true, true)?;
+        return Ok(Flow.Responded);
+    }
+
+    async fn after(borrow this, request: borrow Request, head: borrow mut ResponseHead) -> Result<void, HandlerError> =>
+        Ok();
+}

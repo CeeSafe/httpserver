@@ -1,0 +1,288 @@
+// JSON Web Tokens (RFC 7519) signed with HMAC-SHA-256 (`HS256`, RFC 7518 §3.2), and the filter that asks a request
+// for one (`Authorization: Bearer <token>`, RFC 6750).
+import web_core;
+import web_http;
+import httpserver;
+import sha256;
+import encoding;
+import json.Json;
+import json.JsonValue;
+
+/// Why a token was refused.
+public enum JwtError {
+    /// Not three base64url parts, or a part is not JSON.
+    Malformed,
+    /// The header's `alg` is not `HS256`: `none` and every other algorithm are refused, whatever the token says.
+    Algorithm,
+    /// The signature is not this key's.
+    Signature,
+    /// `exp` has passed, or is missing when it is required.
+    Expired,
+    /// `nbf` is still to come.
+    NotYet,
+    /// `iss` is not the issuer asked for.
+    Issuer,
+    /// `aud` does not name the audience asked for.
+    Audience,
+    /// Out of memory.
+    OutOfMemory,
+}
+
+/// Checks tokens signed with one secret.
+public struct JwtVerifier {
+    private secret: Vector<u8>;
+    private issuer: Vector<u8>;
+    private audience: Vector<u8>;
+    /// How far this clock may differ from the issuer's.
+    private leeway: i64;
+    private needsExpiry: bool;
+
+    /// Tokens signed with `secret`, which must carry an `exp`; 30 seconds of leeway; any issuer and audience.
+    public fn hs256(secret: Slice<u8>) -> Result<JwtVerifier, AllocError> {
+        var v = JwtVerifier {
+            secret: Vector<u8>.create(),
+            issuer: Vector<u8>.create(),
+            audience: Vector<u8>.create(),
+            leeway: 30,
+            needsExpiry: true,
+        };
+        copied(mut v.secret, secret)?;
+        return Ok(v);
+    }
+
+    /// Only tokens whose `iss` is `issuer`.
+    public fn requireIssuer(borrow mut this, issuer: StringView) -> Result<void, AllocError> {
+        this.issuer.clear();
+        return copied(mut this.issuer, issuer.bytes());
+    }
+
+    /// Only tokens whose `aud` is `audience` or a list with it.
+    public fn requireAudience(borrow mut this, audience: StringView) -> Result<void, AllocError> {
+        this.audience.clear();
+        return copied(mut this.audience, audience.bytes());
+    }
+
+    /// The seconds this clock may differ from the issuer's when `exp` and `nbf` are checked.
+    public fn leewaySeconds(borrow mut this, seconds: u32) {
+        this.leeway = seconds as i64;
+    }
+
+    /// Accepts tokens without an `exp`, which never expire.
+    public fn allowNoExpiry(borrow mut this) {
+        this.needsExpiry = false;
+    }
+
+    /// The claims of `token` if it is this key's and valid at `nowSeconds` (Unix time).
+    public fn verify(borrow this, token: Slice<u8>, nowSeconds: i64) -> Result<JsonValue, JwtError> {
+        // header.payload.signature
+        var firstDot: usize = token.length;
+        var secondDot: usize = token.length;
+        for (i in 0..token.length) {
+            if (token[i] != 46) {
+                continue;
+            }
+            if (firstDot == token.length) {
+                firstDot = i;
+            } else if (secondDot == token.length) {
+                secondDot = i;
+            } else {
+                return Err(JwtError.Malformed);
+            }
+        }
+        if (secondDot == token.length) {
+            return Err(JwtError.Malformed);
+        }
+        var headerBytes = Vector<u8>.create();
+        decoded(token[0..firstDot], mut headerBytes)?;
+        let header = match (Json.parse(headerBytes.view())) {
+            Ok(v) => v,
+            Err(_) => { return Err(JwtError.Malformed); },
+        };
+        let algorithm = match (header.get("alg")) {
+            Some(v) => v.asStr() ?? "",
+            null => "",
+        };
+        if (algorithm != "HS256") {
+            return Err(JwtError.Algorithm);
+        }
+        var signature = Vector<u8>.create();
+        decoded(token[secondDot + 1..], mut signature)?;
+        let expected = HmacSha256.mac(this.secret.view(), token[0..secondDot]);
+        if (!constantTimeEqual(expected[..], signature.view())) {
+            return Err(JwtError.Signature);
+        }
+        var payload = Vector<u8>.create();
+        decoded(token[firstDot + 1..secondDot], mut payload)?;
+        let claims = match (Json.parse(payload.view())) {
+            Ok(v) => v,
+            Err(_) => { return Err(JwtError.Malformed); },
+        };
+        if (!claims.isObject()) {
+            return Err(JwtError.Malformed);
+        }
+        match (claims.get("exp")) {
+            Some(v) => {
+                let exp = v.asI64() ?? { return Err(JwtError.Malformed); };
+                if (nowSeconds - this.leeway >= exp) {
+                    return Err(JwtError.Expired);
+                }
+            }
+            null => {
+                if (this.needsExpiry) {
+                    return Err(JwtError.Expired);
+                }
+            }
+        }
+        match (claims.get("nbf")) {
+            Some(v) => {
+                let nbf = v.asI64() ?? { return Err(JwtError.Malformed); };
+                if (nowSeconds + this.leeway < nbf) {
+                    return Err(JwtError.NotYet);
+                }
+            }
+            null => {}
+        }
+        if (this.issuer.length > 0) {
+            let issuer = match (claims.get("iss")) {
+                Some(v) => v.asStr() ?? "",
+                null => "",
+            };
+            if (!same(issuer.bytes(), this.issuer.view())) {
+                return Err(JwtError.Issuer);
+            }
+        }
+        if (this.audience.length > 0 && !this.named(claims)) {
+            return Err(JwtError.Audience);
+        }
+        return Ok(claims);
+    }
+
+    /// Whether `claims`' `aud`, a string or a list of them, names the audience asked for.
+    fn named(borrow this, claims: borrow JsonValue) -> bool {
+        let aud = claims.get("aud") ?? { return false; };
+        match (aud.asStr()) {
+            Some(one) => { return same(one.bytes(), this.audience.view()); }
+            null => {}
+        }
+        if (!aud.isArray()) {
+            return false;
+        }
+        for (i in 0..aud.length()) {
+            match (aud.at(i)) {
+                Some(entry) => {
+                    match (entry.asStr()) {
+                        Some(one) => {
+                            if (same(one.bytes(), this.audience.view())) {
+                                return true;
+                            }
+                        }
+                        null => {}
+                    }
+                }
+                null => {}
+            }
+        }
+        return false;
+    }
+}
+
+/// Making tokens.
+public struct Jwt {
+    /// A token whose claims are `claims` (a JSON object's text), signed with `secret`, appended to `out`.
+    public fn signHs256(claims: Slice<u8>, secret: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+        let start = out.length;
+        Base64.encodeUrl("{\"alg\":\"HS256\",\"typ\":\"JWT\"}".bytes(), out)?;
+        out.push(46)?;
+        Base64.encodeUrl(claims, out)?;
+        let signature = HmacSha256.mac(secret, out.view()[start..]);
+        out.push(46)?;
+        return Base64.encodeUrl(signature[..], out);
+    }
+}
+
+fn copied(out: borrow mut Vector<u8>, bytes: Slice<u8>) -> Result<void, AllocError> {
+    for (b in bytes) {
+        out.push(b)?;
+    }
+    return Ok();
+}
+
+fn same(a: Slice<u8>, b: Slice<u8>) -> bool {
+    if (a.length != b.length) {
+        return false;
+    }
+    for (i in 0..a.length) {
+        if (a[i] != b[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// The bytes the base64url `text` stands for.
+fn decoded(text: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, JwtError> {
+    match (Base64.decodeUrl(text, out)) {
+        Ok() => { return Ok(); }
+        Err(_) => { return Err(JwtError.Malformed); }
+    }
+}
+
+/// Lets through only requests with a valid token in `Authorization: Bearer <token>`; the others are answered 401
+/// with `WWW-Authenticate: Bearer` (RFC 6750 §3). For what runs after, it leaves the token's `sub` as `"user"` and
+/// its claims, as JSON text, as `"claims"` (`ctx.value("user")`).
+public struct BearerAuth {
+    private verifier: JwtVerifier;
+
+    public fn create(verifier: JwtVerifier) -> BearerAuth => BearerAuth { verifier: verifier };
+}
+
+async fn refused(exchange: borrow mut Exchange, challenge: StringView) -> Result<Flow, HandlerError> {
+    exchange.header("www-authenticate", challenge.bytes())?;
+    let status = StatusCode.of(401) ?? { return Err(HandlerError.Internal); };
+    await Reply.problem(exchange, status, "", "")?;
+    return Ok(Flow.Responded);
+}
+
+impl Filter for BearerAuth {
+    async fn before(
+        borrow this,
+        scope: borrow mut Scope,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<Flow, HandlerError> {
+        let header = request.headers().get(HeaderName.Authorization) ?? {
+            return await refused(exchange, "Bearer");
+        };
+        if (header.length < 8 || !Ascii.equalsIgnoringCase(header[0..7], "bearer ")) {
+            return await refused(exchange, "Bearer");
+        }
+        var start: usize = 7;
+        while (start < header.length && header[start] == 32) {
+            start += 1;
+        }
+        let claims = match (this.verifier.verify(header[start..], Clock.now().seconds)) {
+            Ok(c) => c,
+            Err(JwtError.OutOfMemory) => { return Err(HandlerError.Internal); },
+            Err(JwtError.Expired) => {
+                return await refused(exchange, "Bearer error=\"invalid_token\", error_description=\"expired\"");
+            },
+            Err(_) => { return await refused(exchange, "Bearer error=\"invalid_token\""); },
+        };
+        let subject = match (claims.get("sub")) {
+            Some(v) => v.asStr() ?? "",
+            null => "",
+        };
+        var text = Vector<u8>.create();
+        match (claims.write(mut text)) {
+            Ok() => {}
+            Err(_) => { return Err(HandlerError.Internal); }
+        }
+        if (!scope.put("user", subject.bytes()) || !scope.put("claims", text.view())) {
+            return Err(HandlerError.Internal);
+        }
+        return Ok(Flow.Continue);
+    }
+
+    async fn after(borrow this, request: borrow Request, head: borrow mut ResponseHead) -> Result<void, HandlerError> =>
+        Ok();
+}

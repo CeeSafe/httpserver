@@ -1,0 +1,484 @@
+// The application: its state, routes, groups and middleware, served over CeeSafe.Web's connection server and its
+// HTTP/1.1 and HTTP/2 drivers. `App<S>` is a `web_http` `Application`, so the same value can be served over HTTP/3
+// (`applicationOf` and `web_http3`'s `Http3Server.serve`).
+import web_core;
+import web_transport;
+import web_http;
+import web_http1;
+import web_http2;
+
+/// Marks a chain entry as an index into `filters`.
+const FILTER: u32 = 0x80000000;
+
+/// A group of routes: a path prefix and the middleware its routes run. Group 0 is the application itself.
+struct Group {
+    prefix: Vector<u8>;
+    parent: u32;
+    /// The middleware in the order it runs: an index into the application's `hooks`, or into its `filters` with
+    /// `FILTER` set.
+    chain: Vector<u32>;
+}
+
+/// An HTTP application whose state is `S`.
+public struct App<S: Send + Share> {
+    private appState: S;
+    private routes: Router<S>;
+    private hooks: Vector<Box<dyn Middleware<S> + Send + Share>>;
+    private filters: Vector<Box<dyn Filter + Send + Share>>;
+    private groups: Vector<Group>;
+    private httpLimits: Limits;
+    /// The UDP port the same application is served on over HTTP/3, advertised in `Alt-Svc`.
+    private http3Port: u16?;
+
+    /// An application owning `state`, with no routes and no middleware; `limits` bound each connection's requests.
+    public fn create(state: S, limits: Limits) -> Result<App<S>, RouteError> {
+        let routes = Router<S>.create()?;
+        var groups = Vector<Group>.create();
+        match (groups.push(Group { prefix: Vector<u8>.create(), parent: 0, chain: Vector<u32>.create() })) {
+            Ok() => {}
+            Err(_) => { return Err(RouteError.OutOfMemory); }
+        }
+        return Ok(App {
+            appState: state,
+            routes: routes,
+            hooks: Vector<Box<dyn Middleware<S> + Send + Share>>.create(),
+            filters: Vector<Box<dyn Filter + Send + Share>>.create(),
+            groups: groups,
+            httpLimits: limits,
+            http3Port: null,
+        });
+    }
+
+    /// Adds `m` for every request, after the middleware already added: its `before` runs after theirs, its `after`
+    /// before theirs.
+    public fn use(borrow mut this, m: Box<dyn Middleware<S> + Send + Share>) -> Result<void, RouteError> =>
+        this.useIn(0, m);
+
+    /// Adds `m` for the routes of `group` and of the groups under it, after the middleware they already have.
+    public fn useIn(borrow mut this, group: u32, m: Box<dyn Middleware<S> + Send + Share>) -> Result<void, RouteError> {
+        if (group as usize >= this.groups.length) {
+            return Err(RouteError.NoSuchGroup);
+        }
+        match (this.hooks.push(m)) {
+            Ok() => {}
+            Err(_) => { return Err(RouteError.OutOfMemory); }
+        }
+        return this.chained(group, truncate<u32>(this.hooks.length - 1));
+    }
+
+    /// `use` for a filter: middleware that does not see the application's state.
+    public fn filter(borrow mut this, f: Box<dyn Filter + Send + Share>) -> Result<void, RouteError> =>
+        this.filterIn(0, f);
+
+    /// `useIn` for a filter.
+    public fn filterIn(borrow mut this, group: u32, f: Box<dyn Filter + Send + Share>) -> Result<void, RouteError> {
+        if (group as usize >= this.groups.length) {
+            return Err(RouteError.NoSuchGroup);
+        }
+        match (this.filters.push(f)) {
+            Ok() => {}
+            Err(_) => { return Err(RouteError.OutOfMemory); }
+        }
+        return this.chained(group, truncate<u32>(this.filters.length - 1) | FILTER);
+    }
+
+    /// Adds chain entry `index` to `group` and the groups under it.
+    fn chained(borrow mut this, group: u32, index: u32) -> Result<void, RouteError> {
+        for (g in 0..this.groups.length) {
+            // The application's own middleware is kept in group 0 alone: it runs before any group's.
+            if ((group == 0 && g != 0) || !this.within(truncate<u32>(g), group)) {
+                continue;
+            }
+            match (this.groups[g].chain.push(index)) {
+                Ok() => {}
+                Err(_) => { return Err(RouteError.OutOfMemory); }
+            }
+        }
+        return Ok();
+    }
+
+    /// Whether group `g` is `ancestor` or under it.
+    fn within(borrow this, g: u32, ancestor: u32) -> bool {
+        var at = g;
+        loop {
+            if (at == ancestor) {
+                return true;
+            }
+            if (at == 0) {
+                return false;
+            }
+            at = this.groups[at as usize].parent;
+        }
+    }
+
+    /// A group of routes under `prefix` (`/api`; empty for a group that only shares middleware).
+    public fn group(borrow mut this, prefix: StringView) -> Result<u32, RouteError> => this.groupIn(0, prefix);
+
+    /// A group under `parent`: its prefix follows the parent's, and it starts with the parent's middleware.
+    public fn groupIn(borrow mut this, parent: u32, prefix: StringView) -> Result<u32, RouteError> {
+        if (parent as usize >= this.groups.length) {
+            return Err(RouteError.NoSuchGroup);
+        }
+        let p = prefix.bytes();
+        if (p.length > 0 && (p[0] != 47 || p[p.length - 1] == 47)) {
+            return Err(RouteError.BadPattern);
+        }
+        var g = Group { prefix: Vector<u8>.create(), parent: parent, chain: Vector<u32>.create() };
+        copyInto(mut g.prefix, this.groups[parent as usize].prefix.view())?;
+        copyInto(mut g.prefix, p)?;
+        if (parent != 0) {
+            for (i in 0..this.groups[parent as usize].chain.length) {
+                match (g.chain.push(this.groups[parent as usize].chain[i])) {
+                    Ok() => {}
+                    Err(_) => { return Err(RouteError.OutOfMemory); }
+                }
+            }
+        }
+        match (this.groups.push(g)) {
+            Ok() => { return Ok(truncate<u32>(this.groups.length - 1)); }
+            Err(_) => { return Err(RouteError.OutOfMemory); }
+        }
+    }
+
+    /// Routes `method` requests for `pattern` to `handler` (the patterns: `Router`).
+    public fn route(
+        borrow mut this,
+        method: Method,
+        pattern: StringView,
+        handler: Box<dyn Handler<S> + Send + Share>,
+    ) -> Result<void, RouteError> =>
+        this.routes.add(method, pattern.bytes(), 0, handler);
+
+    /// Routes `method` requests for `group`'s prefix followed by `pattern` to `handler`, behind the group's
+    /// middleware. `/` as the pattern is the prefix itself.
+    public fn routeIn(
+        borrow mut this,
+        group: u32,
+        method: Method,
+        pattern: StringView,
+        handler: Box<dyn Handler<S> + Send + Share>,
+    ) -> Result<void, RouteError> {
+        if (group as usize >= this.groups.length) {
+            return Err(RouteError.NoSuchGroup);
+        }
+        let p = pattern.bytes();
+        if (p.length == 0 || p[0] != 47) {
+            return Err(RouteError.BadPattern);
+        }
+        var whole = Vector<u8>.create();
+        copyInto(mut whole, this.groups[group as usize].prefix.view())?;
+        if (p.length > 1 || whole.length == 0) {
+            copyInto(mut whole, p)?;
+        }
+        return this.routes.add(method, whole.view(), group, handler);
+    }
+
+    /// `route` for GET.
+    public fn get(
+        borrow mut this,
+        pattern: StringView,
+        handler: Box<dyn Handler<S> + Send + Share>,
+    ) -> Result<void, RouteError> =>
+        this.routes.add(Method.Get, pattern.bytes(), 0, handler);
+
+    /// `route` for POST.
+    public fn post(
+        borrow mut this,
+        pattern: StringView,
+        handler: Box<dyn Handler<S> + Send + Share>,
+    ) -> Result<void, RouteError> =>
+        this.routes.add(Method.Post, pattern.bytes(), 0, handler);
+
+    /// `route` for PUT.
+    public fn put(
+        borrow mut this,
+        pattern: StringView,
+        handler: Box<dyn Handler<S> + Send + Share>,
+    ) -> Result<void, RouteError> =>
+        this.routes.add(Method.Put, pattern.bytes(), 0, handler);
+
+    /// `route` for DELETE.
+    public fn delete(
+        borrow mut this,
+        pattern: StringView,
+        handler: Box<dyn Handler<S> + Send + Share>,
+    ) -> Result<void, RouteError> =>
+        this.routes.add(Method.Delete, pattern.bytes(), 0, handler);
+
+    /// `route` for PATCH.
+    public fn patch(
+        borrow mut this,
+        pattern: StringView,
+        handler: Box<dyn Handler<S> + Send + Share>,
+    ) -> Result<void, RouteError> =>
+        this.routes.add(Method.Patch, pattern.bytes(), 0, handler);
+
+    /// Runs chain entry `entry`'s `before`.
+    async fn enter(
+        borrow this,
+        entry: u32,
+        ctx: borrow mut Context<S>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<Flow, HandlerError> {
+        if ((entry & FILTER) != 0) {
+            return await this.filters[(entry & 0x7FFFFFFF) as usize].before(ctx.scope(), request, exchange);
+        }
+        return await this.hooks[entry as usize].before(ctx, request, exchange);
+    }
+
+    /// Advertises HTTP/3 on UDP `port` of the same host: every HTTP/1.1 and HTTP/2 response gains
+    /// `alt-svc: h3=":<port>"; ma=86400` (RFC 7838 §3), unless the handler or a middleware set its own.
+    public fn advertiseHttp3(borrow mut this, port: u16) {
+        this.http3Port = Some(port);
+    }
+
+    /// The application's state.
+    public fn state(borrow this) -> borrow S => borrow this.appState;
+
+    /// The HTTP limits each connection's requests are held to.
+    public fn limits(borrow this) -> borrow Limits => borrow this.httpLimits;
+
+    /// Serves connections from `incoming` (a `Listener`, or a `MockIncoming` in tests) through `acceptor`, until
+    /// `drain` finishes or `incoming` ends. A connection is HTTP/2 when TLS negotiated `h2`, or when it starts with
+    /// HTTP/2's preface (prior knowledge, RFC 9113 §3.3); HTTP/1.1 otherwise.
+    public async fn run(
+        this,
+        incoming: borrow dyn Incoming,
+        acceptor: borrow dyn Acceptor,
+        limits: borrow ConnectionLimits,
+        drain: borrow Drain,
+    ) -> Result<ServerReport, NetError> {
+        let httpLimits = this.httpLimits;
+        let app = applicationOf(this)?;
+        let service = Service { app: app, httpLimits: httpLimits };
+        return await ConnectionServer.run(incoming, acceptor, service, limits, drain);
+    }
+}
+
+/// `app` as a shared `web_http` application, which it owns from now on: what `run` serves over TCP, and what
+/// `web_http3`'s `Http3Server.serve` takes to serve the same routes over HTTP/3.
+public fn applicationOf<S: Send + Share>(app: App<S>) -> Result<Arc<Box<dyn Application + Send + Share>>, NetError> {
+    let boxed: Box<dyn Application + Send + Share> = match (Box.create(app)) {
+        Ok(b) => b,
+        Err(_) => { return Err(NetError.OutOfMemory); },
+    };
+    match (Arc<Box<dyn Application + Send + Share>>.create(boxed)) {
+        Ok(shared) => { return Ok(shared); }
+        Err(_) => { return Err(NetError.OutOfMemory); }
+    }
+}
+
+/// An application served over HTTP/1.1 and HTTP/2: the protocol is chosen per connection.
+struct Service {
+    app: Arc<Box<dyn Application + Send + Share>>;
+    httpLimits: Limits;
+}
+
+impl ConnectionHandler for Service {
+    async fn serve(
+        borrow this,
+        conn: borrow mut dyn Transport,
+        ctx: borrow ConnectionContext,
+    ) -> Result<void, NetError> {
+        let h2 = match (conn.alpn()) {
+            Alpn.Http2 => true,
+            _ => false,
+        };
+        if (h2) {
+            return await serveH2(conn, ctx, this.app, this.httpLimits, "".bytes());
+        }
+        // Cleartext, or TLS without `h2`: the first bytes tell HTTP/2's preface from an HTTP/1.1 request line. They
+        // differ by the second byte at the latest, so this reads one segment as a rule.
+        var first = [0u8; 24];
+        var n: usize = 0;
+        let text = clientPreface();
+        let preface = text.bytes();
+        let deadline = Deadline.after(this.httpLimits.headerTimeoutMs);
+        while (n < first.length && prefixOf(first[0..n], preface)) {
+            let got = match (await Transports.readWithin(conn, mut first[n..], deadline)) {
+                Ok(v) => v,
+                Err(NetError.TimedOut) => { return Ok(); },
+                Err(e) => { return Err(e); },
+            };
+            if (got == 0) {
+                return Ok(); // the client closed before a request
+            }
+            n += got;
+        }
+        if (n == first.length && prefixOf(first[..], preface)) {
+            return await serveH2(conn, ctx, this.app, this.httpLimits, first[..]);
+        }
+        let app: borrow dyn Application = this.app.get();
+        return await web_http1.serveFrom(conn, ctx, app, this.httpLimits, first[0..n]);
+    }
+}
+
+/// Whether `bytes` is where `whole` starts.
+fn prefixOf(bytes: Slice<u8>, whole: Slice<u8>) -> bool {
+    if (bytes.length > whole.length) {
+        return false;
+    }
+    for (i in 0..bytes.length) {
+        if (bytes[i] != whole[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+impl<S: Send + Share> Application for App<S> {
+    /// Routes the request, runs the application's middleware in order, then the route's group's, then the handler. A
+    /// path with no route is 404; a path with routes but none for the method is 405 with `Allow`, or 204 with `Allow`
+    /// for OPTIONS (RFC 9110 §9.3.7, §15.5.6). `OPTIONS *` is 204.
+    async fn handle(
+        borrow this,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+        connection: borrow ConnectionContext,
+    ) -> Result<void, HandlerError> {
+        var params = Params.empty();
+        let path = request.path();
+        let found = this.routes.find(request.method(), path.bytes(), mut params);
+        var ctx = Context<S>.create(this.appState, connection, this.routes, path, params);
+        let everywhere = borrow this.groups[0].chain;
+        for (i in 0..everywhere.length) {
+            match (await this.enter(everywhere[i], mut ctx, request, exchange)?) {
+                Flow.Continue => {}
+                Flow.Responded => { return Ok(); }
+            }
+        }
+        match (found) {
+            RouteMatch.Found(index) => {
+                let group = this.routes.group(index);
+                if (group != 0) {
+                    // a group's chain starts with nothing of the application's: those ran above
+                    let chain = borrow this.groups[group as usize].chain;
+                    for (i in 0..chain.length) {
+                        match (await this.enter(chain[i], mut ctx, request, exchange)?) {
+                            Flow.Continue => {}
+                            Flow.Responded => { return Ok(); }
+                        }
+                    }
+                }
+                return await this.routes.handler(index).handle(mut ctx, request, exchange);
+            }
+            RouteMatch.MethodNotAllowed(mask) => {
+                let options = Methods.same(request.method(), Method.Options);
+                var text = [0u8; 96];
+                let n = allowText(mask | (1u32 << Methods.index(Method.Options)), mut text);
+                exchange.header("allow", text[0..n])?;
+                let status = if (options) Status.noContent() else Status.methodNotAllowed();
+                return await exchange.send(status, "".bytes());
+            }
+            RouteMatch.NotFound => {
+                let options = Methods.same(request.method(), Method.Options);
+                let asterisk = Ascii.equals(path.bytes(), "*");
+                let status = if (options && asterisk) Status.noContent() else Status.notFound();
+                return await exchange.send(status, "".bytes());
+            }
+        }
+    }
+
+    /// The application's middleware's `after`, in reverse order.
+    async fn beforeHead(
+        borrow this,
+        request: borrow Request,
+        head: borrow mut ResponseHead,
+    ) -> Result<void, HandlerError> {
+        let everywhere = borrow this.groups[0].chain;
+        var i = everywhere.length;
+        while (i > 0) {
+            i -= 1;
+            let entry = everywhere[i];
+            if ((entry & FILTER) != 0) {
+                await this.filters[(entry & 0x7FFFFFFF) as usize].after(request, head)?;
+            } else {
+                await this.hooks[entry as usize].after(request, head)?;
+            }
+        }
+        match (this.http3Port) {
+            Some(port) => {
+                let overTcp = match (request.version()) {
+                    Version.Http3 => false,
+                    _ => true,
+                };
+                if (overTcp && !head.has("alt-svc")) {
+                    var text = [0u8; 32];
+                    let n = altSvc(port, mut text);
+                    match (head.add("alt-svc", text[0..n])) {
+                        Ok() => {}
+                        Err(_) => { return Err(HandlerError.Internal); }
+                    }
+                }
+            }
+            null => {}
+        }
+        return Ok();
+    }
+}
+
+/// `h3=":<port>"; ma=86400` in `out`; its length.
+fn altSvc(port: u16, out: borrow mut [u8; 32]) -> usize {
+    let head = "h3=\":".bytes();
+    let tail = "\"; ma=86400".bytes();
+    var n: usize = 0;
+    for (b in head) {
+        out[n] = b;
+        n += 1;
+    }
+    var digits = [0u8; 5];
+    var k: usize = 5;
+    var v = port;
+    loop {
+        k -= 1;
+        digits[k] = 48 + truncate<u8>(v % 10);
+        v /= 10;
+        if (v == 0) {
+            break;
+        }
+    }
+    for (j in k..5) {
+        out[n] = digits[j];
+        n += 1;
+    }
+    for (b in tail) {
+        out[n] = b;
+        n += 1;
+    }
+    return n;
+}
+
+/// The methods in `mask` (over `Methods.index`), as an `Allow` value ("GET, HEAD, OPTIONS") in `out`; its length.
+fn allowText(mask: u32, out: borrow mut [u8; 96]) -> usize {
+    var n: usize = 0;
+    for (i in 0..9u32) {
+        if ((mask & (1u32 << i)) == 0) {
+            continue;
+        }
+        let name = Methods.text(methodAt(i)).bytes();
+        if (n > 0) {
+            out[n] = 44;
+            out[n + 1] = 32;
+            n += 2;
+        }
+        for (b in name) {
+            out[n] = b;
+            n += 1;
+        }
+    }
+    return n;
+}
+
+/// The method at `Methods.index` value `i` (0 to 8).
+fn methodAt(i: u32) -> Method => match (i) {
+    0 => Method.Get,
+    1 => Method.Head,
+    2 => Method.Post,
+    3 => Method.Put,
+    4 => Method.Delete,
+    5 => Method.Connect,
+    6 => Method.Options,
+    7 => Method.Trace,
+    _ => Method.Patch,
+};

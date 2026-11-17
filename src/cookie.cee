@@ -1,0 +1,183 @@
+// Cookies (RFC 6265): reading the request's, and setting one on the response.
+import web_http;
+
+/// The request's cookies.
+public struct Cookies {
+    /// The value of the cookie `name` as sent, or null. A value in double quotes is given without them.
+    public fn get<region r>(request: borrow Request<r>, name: StringView) -> Slice<r, u8>? {
+        let header = request.headers().get(HeaderName.Cookie) ?? { return null; };
+        let wanted = name.bytes();
+        var at: usize = 0;
+        while (at < header.length) {
+            // one `name=value` up to the next `;`
+            var end = at;
+            while (end < header.length && header[end] != 59) {
+                end += 1;
+            }
+            var start = at;
+            while (start < end && header[start] == 32) {
+                start += 1;
+            }
+            var eq = start;
+            while (eq < end && header[eq] != 61) {
+                eq += 1;
+            }
+            if (eq < end && eq - start == wanted.length) {
+                var same = true;
+                for (i in 0..wanted.length) {
+                    if (header[start + i] != wanted[i]) {
+                        same = false;
+                        break;
+                    }
+                }
+                if (same) {
+                    var from = eq + 1;
+                    var to = end;
+                    while (to > from && header[to - 1] == 32) {
+                        to -= 1;
+                    }
+                    if (to - from >= 2 && header[from] == 34 && header[to - 1] == 34) {
+                        from += 1;
+                        to -= 1;
+                    }
+                    return Some(header[from..to]);
+                }
+            }
+            at = end + 1;
+        }
+        return null;
+    }
+}
+
+/// A cookie's `SameSite` attribute.
+public enum SameSite {
+    /// Sent with same-site requests and top-level navigations from other sites: the browsers' default.
+    Lax,
+    /// Sent with same-site requests only.
+    Strict,
+    /// Sent with every request; browsers require `Secure` with it.
+    None,
+}
+
+/// A cookie to set: `SetCookie.create("sid", value)`, its attributes, then `write(exchange)`.
+public struct SetCookie<region r> {
+    private name: StringView<r>;
+    private value: Slice<r, u8>;
+    private path: StringView<r>;
+    private domain: StringView<r>;
+    /// Seconds; negative: a session cookie (no `Max-Age`).
+    private maxAge: i64;
+    private secure: bool;
+    private httpOnly: bool;
+    private sameSite: SameSite;
+
+    /// A cookie for the whole site (`Path=/`), `HttpOnly`, `SameSite=Lax`, kept until the browser closes.
+    public fn create(name: StringView<r>, value: Slice<r, u8>) -> SetCookie<r> => SetCookie {
+        name: name,
+        value: value,
+        path: "/",
+        domain: "",
+        maxAge: -1,
+        secure: false,
+        httpOnly: true,
+        sameSite: SameSite.Lax,
+    };
+
+    /// The paths the cookie is sent for.
+    public fn withPath(this, path: StringView<r>) -> SetCookie<r> {
+        var c = this;
+        c.path = path;
+        return c;
+    }
+
+    /// The domain the cookie is sent to, subdomains included; without one, only the host that set it.
+    public fn withDomain(this, domain: StringView<r>) -> SetCookie<r> {
+        var c = this;
+        c.domain = domain;
+        return c;
+    }
+
+    /// How long the browser keeps the cookie; 0 removes it now.
+    public fn withMaxAge(this, seconds: u32) -> SetCookie<r> {
+        var c = this;
+        c.maxAge = seconds as i64;
+        return c;
+    }
+
+    /// Sent over HTTPS only.
+    public fn withSecure(this) -> SetCookie<r> {
+        var c = this;
+        c.secure = true;
+        return c;
+    }
+
+    /// Readable by the page's scripts.
+    public fn withScriptAccess(this) -> SetCookie<r> {
+        var c = this;
+        c.httpOnly = false;
+        return c;
+    }
+
+    public fn withSameSite(this, sameSite: SameSite) -> SetCookie<r> {
+        var c = this;
+        c.sameSite = sameSite;
+        return c;
+    }
+
+    /// Adds the `Set-Cookie` field to the response. `Err(HandlerError.Internal)` if the name is not a token or the
+    /// value, path or domain holds a byte a cookie cannot carry (a control, a space, `"`, `,`, `;`, `\`): encode such
+    /// a value first (base64url, percent-encoding).
+    public fn write(borrow this, exchange: borrow mut Exchange) -> Result<void, HandlerError> {
+        if (this.name.length == 0 || !Ascii.isToken(this.name.bytes()) || !cookieBytes(this.value, false)) {
+            return Err(HandlerError.Internal);
+        }
+        if (!cookieBytes(this.path.bytes(), true) || !cookieBytes(this.domain.bytes(), true)) {
+            return Err(HandlerError.Internal);
+        }
+        var text = Vector<u8>.create();
+        var ok = put(mut text, this.name.bytes()) && put(mut text, "=".bytes()) && put(mut text, this.value);
+        if (this.path.length > 0) {
+            ok = ok && put(mut text, "; Path=".bytes()) && put(mut text, this.path.bytes());
+        }
+        if (this.domain.length > 0) {
+            ok = ok && put(mut text, "; Domain=".bytes()) && put(mut text, this.domain.bytes());
+        }
+        if (this.maxAge >= 0) {
+            ok = ok && put(mut text, "; Max-Age=".bytes()) && putDecimal(mut text, truncate<u64>(this.maxAge));
+        }
+        let none = match (this.sameSite) {
+            SameSite.None => true,
+            _ => false,
+        };
+        if (this.secure || none) {
+            ok = ok && put(mut text, "; Secure".bytes());
+        }
+        if (this.httpOnly) {
+            ok = ok && put(mut text, "; HttpOnly".bytes());
+        }
+        let site = match (this.sameSite) {
+            SameSite.Lax => "; SameSite=Lax",
+            SameSite.Strict => "; SameSite=Strict",
+            SameSite.None => "; SameSite=None",
+        };
+        ok = ok && put(mut text, site.bytes());
+        if (!ok) {
+            return Err(HandlerError.Internal);
+        }
+        return exchange.header("set-cookie", text.view());
+    }
+}
+
+/// Whether every byte of `bytes` may be in a cookie's value (RFC 6265 §4.1.1's cookie-octet), or, with `attribute`,
+/// in an attribute's value (anything but a control or `;`).
+fn cookieBytes(bytes: Slice<u8>, attribute: bool) -> bool {
+    for (b in bytes) {
+        if (b < 32 || b == 127 || b == 59) {
+            return false;
+        }
+        if (!attribute && (b == 32 || b == 34 || b == 44 || b == 92 || b > 126)) {
+            return false;
+        }
+    }
+    return true;
+}

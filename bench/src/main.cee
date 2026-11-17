@@ -1,0 +1,465 @@
+// The benchmark server: the routes of CeeSafe.Web's comparison contract (its benchmarks/servers/README.md), so that
+// its conform.py checks this server and the same load compares it with the others, on 127.0.0.1:CW_PORT (8090 by
+// default), HTTP/1.1 and h2c.
+//
+//   GET  /small          "hello, world\n"
+//   GET  /4k, /64k       that many bytes of the alphabet
+//   GET  /stream         1 MiB in 64 writes, with no declared length
+//   GET  /json           {"message":"Hello, World!"}, serialised for each request
+//   POST /echo           the request body back (at most 1 MiB)
+//   GET  /users/{id:int} the id back: a route with a parameter, in a group (`/api/users/{id:int}` is behind CW_HOOKS
+//                        more middleware)
+//   POST /stop           starts the drain
+//   GET  /worker         which worker process answered
+//   GET  /crash          traps (an index out of bounds), which ends the process
+//   GET  /spin           computes without end, which stops the event loop
+//   GET  /bloat          allocates until an allocation fails, then answers how many MiB it got
+//
+// CW_PROCS=n runs n worker processes under the supervisor (src/supervisor.cee), which starts a worker again when it
+// ends and kills one whose loop has stopped; CW_MEMORY_MB limits each worker's address space; CW_INHERIT=1 has the
+// workers accept from one socket the supervisor bound, instead of each binding the shared port.
+//
+// CW_HOOKS=n adds n middleware that do nothing to the application, to measure what one costs. CW_STOCK=1 adds the
+// stock filters a public API would run: security headers, CORS for any origin, and a rate limit nobody reaches.
+import web_core;
+import web_transport;
+import web_http;
+import httpserver;
+import json.JsonWriter;
+
+struct St {
+    /// Which worker process this is.
+    worker: u32;
+}
+
+struct Fixed {
+    body: Vector<u8>;
+}
+
+impl Handler<St> for Fixed {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut Context<St>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> =>
+        await exchange.send(Status.ok(), this.body.view());
+}
+
+struct Stream {
+    piece: Vector<u8>;
+}
+
+impl Handler<St> for Stream {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut Context<St>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        exchange.setStatus(Status.ok());
+        for (i in 0..64) {
+            await exchange.write(this.piece.view())?;
+        }
+        return Ok();
+    }
+}
+
+struct JsonRoute {}
+
+impl Handler<St> for JsonRoute {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut Context<St>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        var w = JsonWriter.compact();
+        let written = w.beginObject().isOk() && w.key("message").isOk() && w.string("Hello, World!").isOk() &&
+            w.endObject().isOk();
+        if (!written) {
+            return Err(HandlerError.Internal);
+        }
+        let body = match (w.finish()) {
+            Ok(b) => b,
+            Err(_) => { return Err(HandlerError.Internal); },
+        };
+        return await Reply.json(exchange, Status.ok(), body.view());
+    }
+}
+
+struct Echo {}
+
+impl Handler<St> for Echo {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut Context<St>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        let size = match (exchange.remaining()) {
+            Some(n) => if (n > 0 && n <= 1048576) n as usize else 1048576,
+            null => 1048576,
+        };
+        var body = match (OwnedBuffer.create(size)) {
+            Ok(b) => b,
+            Err(_) => { return Err(HandlerError.Internal); },
+        };
+        await exchange.readToEnd(mut body)?;
+        return await exchange.send(Status.ok(), body.readable());
+    }
+}
+
+/// Answers the route's `id`.
+struct User {}
+
+impl Handler<St> for User {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut Context<St>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        let id = ctx.param("id") ?? { return Err(HandlerError.Internal); };
+        return await exchange.send(Status.ok(), id.bytes());
+    }
+}
+
+struct Stop {}
+
+impl Handler<St> for Stop {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut Context<St>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        ctx.connection().drain().start();
+        return await exchange.send(Status.ok(), "stopping".bytes());
+    }
+}
+
+/// Answers the worker's index.
+struct Which {}
+
+impl Handler<St> for Which {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut Context<St>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        var digit = [0u8; 1];
+        digit[0] = truncate<u8>(48 + ctx.state().worker % 10);
+        return await exchange.send(Status.ok(), digit[..]);
+    }
+}
+
+/// Reads past the end of an array: a trap.
+struct Crash {}
+
+impl Handler<St> for Crash {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut Context<St>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        let few = [1u8, 2u8, 3u8];
+        let at = request.path().length + 100;
+        var one = [0u8; 1];
+        one[0] = few[at];
+        return await exchange.send(Status.ok(), one[..]);
+    }
+}
+
+/// Never awaits and never ends.
+struct Spin {}
+
+impl Handler<St> for Spin {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut Context<St>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        var n: u64 = request.path().length as u64;
+        while (n != 0) {
+            n = n.wrappingMul(6364136223846793005).wrappingAdd(1442695040888963407) | 1;
+        }
+        return await exchange.send(Status.ok(), "".bytes());
+    }
+}
+
+/// Takes memory a MiB at a time until an allocation fails (at most 64 GiB), frees it, and answers how many it got.
+struct Bloat {}
+
+impl Handler<St> for Bloat {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut Context<St>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        var blocks = Vector<OwnedBuffer>.create();
+        var got: u64 = 0;
+        while (got < 65536) {
+            var block = match (OwnedBuffer.create(1048576)) {
+                Ok(b) => b,
+                Err(_) => { break; },
+            };
+            // touched, so that the memory is the process's and not only promised
+            var page: usize = 0;
+            let room = block.spare();
+            while (page < room.length) {
+                room[page] = 1;
+                page += 4096;
+            }
+            match (blocks.push(block)) {
+                Ok() => {}
+                Err(_) => { break; }
+            }
+            got += 1;
+        }
+        var text = [0u8; 24];
+        var w = TextWriter.create(mut text[..]);
+        w.decimal(got);
+        return await exchange.send(Status.ok(), w.written());
+    }
+}
+
+/// A middleware that does nothing.
+struct Idle {}
+
+impl Middleware<St> for Idle {
+    async fn before(
+        borrow this,
+        ctx: borrow mut Context<St>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<Flow, HandlerError> =>
+        Ok(Flow.Continue);
+
+    async fn after(borrow this, request: borrow Request, head: borrow mut ResponseHead) -> Result<void, HandlerError> =>
+        Ok();
+}
+
+fn handler<H: Handler<St> + Send + Share>(
+    b: Result<Box<H>, AllocError>,
+) -> Result<Box<dyn Handler<St> + Send + Share>, RouteError> {
+    match (b) {
+        Ok(h) => {
+            let d: Box<dyn Handler<St> + Send + Share> = h;
+            return Ok(d);
+        }
+        Err(_) => { return Err(RouteError.OutOfMemory); }
+    }
+}
+
+fn idle() -> Result<Box<dyn Middleware<St> + Send + Share>, RouteError> {
+    match (Box.create(Idle {})) {
+        Ok(m) => {
+            let d: Box<dyn Middleware<St> + Send + Share> = m;
+            return Ok(d);
+        }
+        Err(_) => { return Err(RouteError.OutOfMemory); }
+    }
+}
+
+/// A boxed filter, or `OutOfMemory`.
+fn stock<F: Filter + Send + Share>(f: Result<F, AllocError>) -> Result<Box<dyn Filter + Send + Share>, RouteError> {
+    let filter = match (f) {
+        Ok(v) => v,
+        Err(_) => { return Err(RouteError.OutOfMemory); },
+    };
+    match (Box.create(filter)) {
+        Ok(b) => {
+            let d: Box<dyn Filter + Send + Share> = b;
+            return Ok(d);
+        }
+        Err(_) => { return Err(RouteError.OutOfMemory); }
+    }
+}
+
+fn corsForAll() -> Result<Cors, AllocError> => Ok(Cors.create(CorsOptions.any()?));
+
+/// `count` bytes of the alphabet.
+fn filled(count: usize) -> Result<Vector<u8>, RouteError> {
+    var v = Vector<u8>.create();
+    for (i in 0..count) {
+        match (v.push(97 + truncate<u8>(i % 26))) {
+            Ok() => {}
+            Err(_) => { return Err(RouteError.OutOfMemory); }
+        }
+    }
+    return Ok(v);
+}
+
+fn setting(name: StringView, otherwise: u64) -> u64 {
+    let text = match (Environment.variable(name)) {
+        Some(t) => t,
+        null => { return otherwise; },
+    };
+    return match (Ascii.parseDecimal(text.bytes())) {
+        Some(v) => v,
+        null => otherwise,
+    };
+}
+
+fn application(worker: u32) -> Result<App<St>, RouteError> {
+    var limits = Limits.defaults();
+    limits.maxBodyBytes = 1048576;
+    var app = App<St>.create(St { worker: worker }, limits)?;
+    for (i in 0..setting("CW_HOOKS", 0)) {
+        app.use(idle()?)?;
+    }
+    if (setting("CW_STOCK", 0) == 1) {
+        app.filter(stock(SecurityHeaders.defaults())?)?;
+        app.filter(stock(corsForAll())?)?;
+        app.filter(stock(RateLimit.create(0xFFFFFFFF, 60000, 4096))?)?;
+    }
+    var small = Vector<u8>.create();
+    for (b in "hello, world\n".bytes()) {
+        match (small.push(b)) {
+            Ok() => {}
+            Err(_) => { return Err(RouteError.OutOfMemory); }
+        }
+    }
+    app.get("/small", handler(Box.create(Fixed { body: small }))?)?;
+    app.get("/4k", handler(Box.create(Fixed { body: filled(4096)? }))?)?;
+    app.get("/64k", handler(Box.create(Fixed { body: filled(65536)? }))?)?;
+    app.get("/stream", handler(Box.create(Stream { piece: filled(16384)? }))?)?;
+    app.get("/json", handler(Box.create(JsonRoute {}))?)?;
+    app.post("/echo", handler(Box.create(Echo {}))?)?;
+    app.post("/stop", handler(Box.create(Stop {}))?)?;
+    app.get("/worker", handler(Box.create(Which {}))?)?;
+    app.get("/crash", handler(Box.create(Crash {}))?)?;
+    app.get("/spin", handler(Box.create(Spin {}))?)?;
+    app.get("/bloat", handler(Box.create(Bloat {}))?)?;
+    app.get("/users/{id:int}", handler(Box.create(User {}))?)?;
+    let api = app.group("/api")?;
+    for (i in 0..setting("CW_HOOKS", 0)) {
+        app.useIn(api, idle()?)?;
+    }
+    app.routeIn(api, Method.Get, "/users/{id:int}", handler(Box.create(User {}))?)?;
+    return Ok(app);
+}
+
+async fn say(text: StringView) -> Result<void, NetError> {
+    match (await AsyncConsole.writeLine(text)) {
+        Ok() => { return Ok(); }
+        Err(e) => { return Err(NetErrors.fromAsync(e)); }
+    }
+}
+
+/// The listener for `CW_PORT`; `shared`: other processes may bind the same port (SO_REUSEPORT).
+fn listening(shared: bool) -> Result<Listener, NetError> {
+    let p = setting("CW_PORT", 8090);
+    let port = if (p > 0 && p < 65536) truncate<u16>(p) else 8090;
+    let options = ListenOptions { backlog: 0, reuseAddress: true, reusePort: shared, v6Only: false };
+    return Listener.bindWith(SocketAddresses.v4Loopback(port), options);
+}
+
+async fn serve(app: App<St>, worker: Worker, listener: borrow Listener) -> Result<ServerReport, NetError> {
+    let drain = Drain.create()?;
+    var limits = ConnectionLimits.defaults();
+    limits.graceMs = 1000;
+    limits.workers = truncate<u32>(setting("CW_WORKERS", 256));
+    if (!worker.supervised()) {
+        await say("bench: listening")?;
+    }
+    // The server owns the application, so its child moves it; the rest is lent to both.
+    let bounds = borrow limits;
+    let draining = borrow drain;
+    let r: Result<Raced<ServerReport>, NetError> = await Async.race(
+        async move () => await app.run(listener, PlainAcceptor {}, bounds, draining),
+        async move () => await tend<ServerReport>(worker, draining, 100),
+    );
+    return match (r) {
+        Ok(raced) => Ok(raced.value),
+        Err(e) => Err(e),
+    };
+}
+
+/// One process's server on `listener`; the status it exits with.
+fn serveOn(worker: Worker, listener: borrow Listener) -> i32 {
+    let app = match (application(worker.index())) {
+        Ok(a) => a,
+        Err(_) => {
+            Console.writeLine("bench: could not build the routes");
+            return 1;
+        },
+    };
+    match (Async.run(serve(app, worker, listener))) {
+        Ok(_) => { return 0; }
+        Err(e) => {
+            Console.writeLine(NetErrors.describe(e));
+            return 1;
+        }
+    }
+}
+
+/// The workers' server. With a listener, every worker accepts from the one socket the supervisor bound, so a
+/// connection waiting to be accepted outlives a worker that ends; without, each binds its own to the shared port, and
+/// the kernel gives each connection to one of them (Linux), which spreads the load evenly.
+struct Bench {
+    listener: Listener?;
+}
+
+impl WorkerMain for Bench {
+    fn run(borrow this, worker: Worker) -> i32 {
+        match (borrow this.listener) {
+            Some(l) => { return serveOn(worker, l); }
+            null => {}
+        }
+        match (listening(true)) {
+            Ok(mine) => { return serveOn(worker, mine); }
+            Err(e) => {
+                Console.writeLine(NetErrors.describe(e));
+                return 1;
+            }
+        }
+    }
+}
+
+fn main() {
+    let procs = setting("CW_PROCS", 0);
+    if (procs == 0) {
+        match (listening(setting("CW_REUSEPORT", 0) == 1)) {
+            Ok(mine) => { Process.exit(serveOn(Worker.alone(), mine)); }
+            Err(e) => {
+                Console.writeLine(NetErrors.describe(e));
+                Process.exit(1);
+            }
+        }
+    }
+    var options = SupervisorOptions.defaults(truncate<u32>(procs));
+    options.stallMs = setting("CW_STALL_MS", 2000);
+    options.graceMs = 3000;
+    options.memoryBytes = setting("CW_MEMORY_MB", 0) * 1048576;
+    Console.writeLine("bench: supervising");
+    // CW_INHERIT=1: the supervisor binds the port and the workers inherit the socket.
+    var bench = Bench { listener: null };
+    if (setting("CW_INHERIT", 0) == 1) {
+        match (listening(false)) {
+            Ok(l) => { bench.listener = Some(l); }
+            Err(e) => {
+                Console.writeLine(NetErrors.describe(e));
+                Process.exit(1);
+            }
+        }
+    }
+    match (supervise(bench, options)) {
+        Ok(report) => {
+            Console.writeLine("bench: started, crashed, stalled, killed");
+            Console.writeLine(report.started);
+            Console.writeLine(report.crashed);
+            Console.writeLine(report.stalled);
+            Console.writeLine(report.killed);
+        }
+        Err(_) => {
+            Console.writeLine("bench: the supervisor could not run");
+            Process.exit(1);
+        }
+    }
+}

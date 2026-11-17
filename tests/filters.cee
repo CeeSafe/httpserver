@@ -1,0 +1,212 @@
+// The stock filters over HTTP/1.1's driver on mock connections: CORS, fixed and security headers, the HTTPS
+// redirect, cookies, the rate limit, the health answer, and what a filter leaves for the handler. Expected responses
+// are written out by hand: fields set in `before` come first in the order set, then those `after` adds, then the
+// length.
+import web_core;
+import web_http;
+
+fn filtered<F: Filter + Send + Share>(f: F) -> Result<Box<dyn Filter + Send + Share>, TestFailure> {
+    let b: Box<dyn Filter + Send + Share> = alloc(Box.create(f))?;
+    return Ok(b);
+}
+
+@test
+async fn corsForAnyOrigin() -> Result<void, TestFailure> {
+    var a = routed(App<St>.create(state(), quiet()))?;
+    routed(a.filter(filtered(Cors.create(alloc(CorsOptions.any())?))?))?;
+    routed(a.get("/users", named(1)?))?;
+    // No `Origin`: not a cross-origin request.
+    await body(a, "GET /users HTTP/1.1\r\nhost: a\r\n\r\n", "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nh1")?;
+    await body(
+        a,
+        "GET /users HTTP/1.1\r\nhost: a\r\norigin: https://a.example\r\n\r\n",
+        "HTTP/1.1 200 OK\r\naccess-control-allow-origin: *\r\ncontent-length: 2\r\n\r\nh1",
+    )?;
+    // A preflight is answered by the filter; the headers it asks for are allowed.
+    await body(
+        a,
+        "OPTIONS /users HTTP/1.1\r\nhost: a\r\norigin: https://a.example\r\naccess-control-request-method: PUT\r\naccess-control-request-headers: x-a\r\n\r\n",
+        "HTTP/1.1 204 No Content\r\naccess-control-allow-origin: *\r\naccess-control-allow-methods: GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS\r\naccess-control-allow-headers: x-a\r\naccess-control-max-age: 600\r\n\r\n",
+    )?;
+    // OPTIONS without `Access-Control-Request-Method` is not a preflight: the router answers it.
+    await body(
+        a,
+        "OPTIONS /users HTTP/1.1\r\nhost: a\r\norigin: https://a.example\r\n\r\n",
+        "HTTP/1.1 204 No Content\r\naccess-control-allow-origin: *\r\nallow: GET, HEAD, OPTIONS\r\n\r\n",
+    )?;
+    return Ok();
+}
+
+@test
+async fn corsForListedOriginsWithCredentials() -> Result<void, TestFailure> {
+    var options = alloc(CorsOptions.any())?;
+    alloc(options.allowOrigin("https://app.example"))?;
+    alloc(options.allowMethods("GET, POST"))?;
+    alloc(options.allowHeaders("content-type"))?;
+    alloc(options.exposeHeaders("x-total"))?;
+    alloc(options.maxAgeSeconds(60))?;
+    options.allowCredentials();
+    var a = routed(App<St>.create(state(), quiet()))?;
+    routed(a.filter(filtered(Cors.create(options))?))?;
+    routed(a.get("/users", named(1)?))?;
+    await body(
+        a,
+        "GET /users HTTP/1.1\r\nhost: a\r\norigin: https://app.example\r\n\r\n",
+        "HTTP/1.1 200 OK\r\naccess-control-allow-origin: https://app.example\r\nvary: origin\r\naccess-control-allow-credentials: true\r\naccess-control-expose-headers: x-total\r\ncontent-length: 2\r\n\r\nh1",
+    )?;
+    // Another origin gets the response without the fields: its browser keeps it from the page.
+    await body(
+        a,
+        "GET /users HTTP/1.1\r\nhost: a\r\norigin: https://evil.example\r\n\r\n",
+        "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nh1",
+    )?;
+    await body(
+        a,
+        "OPTIONS /users HTTP/1.1\r\nhost: a\r\norigin: https://app.example\r\naccess-control-request-method: POST\r\n\r\n",
+        "HTTP/1.1 204 No Content\r\naccess-control-allow-origin: https://app.example\r\nvary: origin\r\naccess-control-allow-credentials: true\r\naccess-control-allow-methods: GET, POST\r\naccess-control-allow-headers: content-type\r\naccess-control-max-age: 60\r\n\r\n",
+    )?;
+    return Ok();
+}
+
+/// Sets its own `x-frame-options`, reads the cookie `sid`, sets the cookie `seen`, and answers the cookie's value
+/// and what a filter left as `user`.
+struct Cookied {}
+
+impl Handler<St> for Cookied {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut Context<St>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        exchange.header("x-frame-options", "SAMEORIGIN".bytes())?;
+        SetCookie.create("seen", "1".bytes()).withMaxAge(3600).withSecure().withSameSite(SameSite.Strict).write(exchange)?;
+        let sid = Cookies.get(request, "sid") ?? "-".bytes();
+        let user = ctx.value("user") ?? "-".bytes();
+        exchange.setContentLength((sid.length + 1 + user.length) as u64);
+        await exchange.write(sid)?;
+        await exchange.write("|".bytes())?;
+        await exchange.write(user)?;
+        return Ok();
+    }
+}
+
+/// Leaves the request's `x-user` for the handler as `user`.
+struct Knows {}
+
+impl Filter for Knows {
+    async fn before(
+        borrow this,
+        scope: borrow mut Scope,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<Flow, HandlerError> {
+        match (request.headers().getNamed("x-user")) {
+            Some(v) => {
+                if (!scope.put("user", v)) {
+                    return Err(HandlerError.Internal);
+                }
+            }
+            null => {}
+        }
+        return Ok(Flow.Continue);
+    }
+
+    async fn after(borrow this, request: borrow Request, head: borrow mut ResponseHead) -> Result<void, HandlerError> =>
+        Ok();
+}
+
+@test
+async fn headersCookiesAndWhatAFilterLeaves() -> Result<void, TestFailure> {
+    var headers = alloc(SecurityHeaders.defaults())?;
+    alloc(SecurityHeaders.hsts(mut headers, 31536000, true))?;
+    alloc(headers.set("content-security-policy", "default-src 'self'"))?;
+    var a = routed(App<St>.create(state(), quiet()))?;
+    routed(a.filter(filtered(headers)?))?;
+    routed(a.filter(filtered(Knows {})?))?;
+    let h: Box<dyn Handler<St> + Send + Share> = alloc(Box.create(Cookied {}))?;
+    routed(a.get("/c", h))?;
+    routed(a.get("/plain", named(1)?))?;
+    await body(
+        a,
+        "GET /plain HTTP/1.1\r\nhost: a\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nx-content-type-options: nosniff\r\nx-frame-options: DENY\r\nreferrer-policy: strict-origin-when-cross-origin\r\ncross-origin-opener-policy: same-origin\r\nstrict-transport-security: max-age=31536000; includeSubDomains\r\ncontent-security-policy: default-src 'self'\r\ncontent-length: 2\r\n\r\nh1",
+    )?;
+    // The handler's own `x-frame-options` stands; the cookie among several is found, without its quotes.
+    await body(
+        a,
+        "GET /c HTTP/1.1\r\nhost: a\r\ncookie: a=1; sid=\"abc\"; b=2\r\nx-user: kim\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nx-frame-options: SAMEORIGIN\r\nset-cookie: seen=1; Path=/; Max-Age=3600; Secure; HttpOnly; SameSite=Strict\r\nx-content-type-options: nosniff\r\nreferrer-policy: strict-origin-when-cross-origin\r\ncross-origin-opener-policy: same-origin\r\nstrict-transport-security: max-age=31536000; includeSubDomains\r\ncontent-security-policy: default-src 'self'\r\ncontent-length: 7\r\n\r\nabc|kim",
+    )?;
+    await body(
+        a,
+        "GET /c HTTP/1.1\r\nhost: a\r\ncookie: sidx=1\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nx-frame-options: SAMEORIGIN\r\nset-cookie: seen=1; Path=/; Max-Age=3600; Secure; HttpOnly; SameSite=Strict\r\nx-content-type-options: nosniff\r\nreferrer-policy: strict-origin-when-cross-origin\r\ncross-origin-opener-policy: same-origin\r\nstrict-transport-security: max-age=31536000; includeSubDomains\r\ncontent-security-policy: default-src 'self'\r\ncontent-length: 3\r\n\r\n-|-",
+    )?;
+    return Ok();
+}
+
+@test
+async fn redirectToHttps() -> Result<void, TestFailure> {
+    var a = routed(App<St>.create(state(), quiet()))?;
+    routed(a.filter(filtered(HttpsRedirect.create(443))?))?;
+    await body(
+        a,
+        "POST /a/b?c=1 HTTP/1.1\r\nhost: shop.example:8080\r\ncontent-length: 0\r\n\r\n",
+        "HTTP/1.1 308 Permanent Redirect\r\nlocation: https://shop.example/a/b?c=1\r\ncontent-length: 0\r\n\r\n",
+    )?;
+    var b = routed(App<St>.create(state(), quiet()))?;
+    routed(b.filter(filtered(HttpsRedirect.create(8443))?))?;
+    await body(
+        b,
+        "GET / HTTP/1.1\r\nhost: [::1]:8080\r\n\r\n",
+        "HTTP/1.1 308 Permanent Redirect\r\nlocation: https://[::1]:8443/\r\ncontent-length: 0\r\n\r\n",
+    )?;
+    return Ok();
+}
+
+/// Answers `Health.answer`.
+struct Alive {}
+
+impl Handler<St> for Alive {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut Context<St>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> =>
+        await Health.answer(ctx.connection(), exchange);
+}
+
+@test
+async fn theRateLimitAndHealth() -> Result<void, TestFailure> {
+    var a = routed(App<St>.create(state(), quiet()))?;
+    let api = routed(a.group("/api"))?;
+    routed(a.filterIn(api, filtered(alloc(RateLimit.create(2, 60000, 16))?)?))?;
+    routed(a.routeIn(api, Method.Get, "/x", named(1)?))?;
+    let h: Box<dyn Handler<St> + Send + Share> = alloc(Box.create(Alive {}))?;
+    routed(a.get("/health", h))?;
+    await body(
+        a,
+        "GET /api/x HTTP/1.1\r\nhost: a\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nratelimit-limit: 2\r\nratelimit-remaining: 1\r\ncontent-length: 2\r\n\r\nh1",
+    )?;
+    await body(
+        a,
+        "GET /api/x HTTP/1.1\r\nhost: a\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nratelimit-limit: 2\r\nratelimit-remaining: 0\r\ncontent-length: 2\r\n\r\nh1",
+    )?;
+    // The third in the window is refused, and told when to come back.
+    await body(
+        a,
+        "GET /api/x HTTP/1.1\r\nhost: a\r\n\r\n",
+        "HTTP/1.1 429 Too Many Requests\r\nratelimit-limit: 2\r\nratelimit-remaining: 0\r\nretry-after: 60\r\ncontent-type: application/problem+json\r\ncontent-length: 120\r\n\r\n{\"type\":\"about:blank\",\"title\":\"Too Many Requests\",\"status\":429,\"detail\":\"the request limit for this address is reached\"}",
+    )?;
+    // Outside the group nothing is counted.
+    await body(
+        a,
+        "GET /health HTTP/1.1\r\nhost: a\r\n\r\n",
+        "HTTP/1.1 200 OK\r\ncache-control: no-store\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: 2\r\n\r\nok",
+    )?;
+    return Ok();
+}

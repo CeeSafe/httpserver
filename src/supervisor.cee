@@ -1,0 +1,340 @@
+// The supervisor: a parent process that keeps a number of worker processes running, each serving the same port.
+//
+// A CeeSafe trap (an index out of bounds, an overflow, a failed assertion) ends its process: there is no unwinding
+// (panic = abort). So what a request must not be able to take down is put in a process of its own. Each worker is a
+// process with its own memory, one event loop and one core; the parent does nothing but watch them:
+//
+// - a worker that ends, however it ends, is started again (after a growing pause if it keeps ending at once);
+// - a worker that stops beating (its event loop is stuck in a computation) is killed and started again;
+// - a worker may be given a memory limit, so that one that grows without bound fails its own allocations;
+// - SIGTERM or SIGINT to the parent is passed to the workers, which drain and end; those that have not after the
+//   grace are killed.
+//
+// The workers share a page of memory with the parent, where each writes its beat. The parent never starts a thread
+// or the async runtime, so `fork` is safe in it at any time. POSIX only.
+import web_core;
+
+@header("signal.h", "sys/mman.h", "sys/wait.h", "sys/resource.h", "unistd.h")
+extern "C" {
+    const MAP_SHARED: i32;
+    const MAP_ANON: i32;
+    const PROT_READ: i32;
+    const PROT_WRITE: i32;
+    const SIGTERM: i32;
+    const SIGINT: i32;
+    const SIGKILL: i32;
+    const WNOHANG: i32;
+    const RLIMIT_AS: i32;
+
+    struct rlimit {
+        rlim_cur: u64;
+        rlim_max: u64;
+    }
+
+    @effects()
+    fn fork() -> i32;
+    @effects()
+    fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
+    @effects()
+    fn kill(pid: i32, signal: i32) -> i32;
+    @effects()
+    fn usleep(micros: u32) -> i32;
+    @effects()
+    fn mmap(address: *mut void, length: usize, protection: i32, flags: i32, fd: i32, offset: i64) -> *mut void;
+    @effects()
+    fn signal(number: i32, handler: extern "C" fn(i32)) -> extern "C" fn(i32);
+    @effects()
+    fn setrlimit(resource: i32, limit: *rlimit) -> i32;
+}
+
+/// Set by the parent's signal handler: the supervisor was asked to stop.
+static STOPPING: AtomicU32 = AtomicU32.constant(0);
+
+@callback
+fn stopAsked(number: i32) {
+    STOPPING.store(1);
+}
+
+/// The most workers a supervisor runs: what fits the shared page.
+public fn maxWorkers() -> u32 => 256;
+
+/// What a supervisor is told.
+public struct SupervisorOptions {
+    /// How many worker processes (1 to `maxWorkers()`): as a rule, one a core.
+    public workers: u32;
+    /// A worker that has not beaten for this long is killed and started again; 0 for no such watch. It must be
+    /// several times what the worker's `tend` beats at.
+    public stallMs: u64;
+    /// After a request to stop, how long the workers have to drain before they are killed.
+    public graceMs: u64;
+    /// Each worker's address-space limit in bytes (`RLIMIT_AS`), so that a worker that grows fails its own
+    /// allocations and not the machine's; 0 for none. Linux enforces it; macOS does not.
+    public memoryBytes: u64;
+    /// Whether to say on standard output when a worker starts, ends or is killed.
+    public log: bool;
+
+    /// `workers` workers, a 5 s watch, a 10 s grace, no memory limit, and the log.
+    public fn defaults(workers: u32) -> SupervisorOptions =>
+        SupervisorOptions { workers: workers, stallMs: 5000, graceMs: 10000, memoryBytes: 0, log: true };
+}
+
+/// What happened while the supervisor ran.
+public struct SupervisorReport {
+    /// Workers started, the first of each place included.
+    public started: u64;
+    /// Workers that ended with a status other than 0, or by a signal that was not the supervisor's.
+    public crashed: u64;
+    /// Workers killed because they stopped beating.
+    public stalled: u64;
+    /// Workers killed because they outlived the grace.
+    public killed: u64;
+}
+
+/// Why a supervisor could not run.
+public enum SupervisorError {
+    /// `workers` is 0 or more than `maxWorkers()`.
+    BadOptions,
+    /// The shared page could not be mapped.
+    NoSharedMemory,
+    /// The first worker could not be started (`fork` failed).
+    CannotFork,
+}
+
+/// A worker's place: which of the workers it is, and where it beats.
+public struct Worker {
+    private place: u32;
+    private slot: *mut u64;
+
+    /// A worker without a supervisor: the whole server in one process. Its beat goes nowhere.
+    public fn alone() -> Worker => Worker { place: 0, slot: 0 as *mut u64 };
+
+    /// Which worker this is: 0 to the count less one.
+    public fn index(borrow this) -> u32 => this.place;
+
+    /// Whether a supervisor watches this worker.
+    public fn supervised(borrow this) -> bool => this.slot != 0 as *mut u64;
+
+    /// Tells the supervisor this worker's event loop is turning.
+    /// Safety: the slot is this worker's word of the page the supervisor mapped before it forked, which stays
+    /// mapped for the life of the process; only this worker writes it.
+    public fn beat(borrow this) {
+        if (this.slot != 0 as *mut u64) {
+            unsafe { this.slot.write(this.slot.read() + 1); }
+        }
+    }
+}
+
+/// What a worker process does: the program's server.
+public interface WorkerMain {
+    /// Runs the worker (`Async.run` of its server) and returns the status the process exits with. It should end
+    /// when asked to (`tend` starts the drain on SIGTERM).
+    fn run(borrow this, worker: Worker) -> i32;
+}
+
+/// A worker's process as the parent sees it.
+struct Place {
+    /// 0: no process.
+    pid: i32;
+    startedMs: u64;
+    /// The beat last seen, and when it last changed.
+    beat: u64;
+    beatMs: u64;
+    /// When to start it again; 0: not waiting.
+    restartMs: u64;
+    /// How many times in a row it ended within a second of starting.
+    quick: u32;
+}
+
+fn nowMs() -> u64 => Clock.monotonicNanos() / 1000000;
+
+/// One line on standard output: `supervisor: worker <index> (pid <pid>) <what> <number>`.
+fn say(options: borrow SupervisorOptions, index: usize, pid: i32, what: StringView, number: u64, numbered: bool) {
+    if (!options.log) {
+        return;
+    }
+    var buffer = [0u8; 160];
+    var w = TextWriter.create(mut buffer[..]);
+    w.text("supervisor: worker ");
+    w.decimal(index as u64);
+    w.text(" (pid ");
+    w.decimal(truncate<u64>(pid as i64));
+    w.text(") ");
+    w.text(what);
+    if (numbered) {
+        w.text(" ");
+        w.decimal(number);
+    }
+    match (StringView.fromUtf8(w.written())) {
+        Some(line) => { Console.writeLine(line); }
+        null => {}
+    }
+}
+
+/// Runs `options.workers` worker processes of `main` until the supervisor is asked to stop (SIGTERM or SIGINT) and
+/// the workers have ended. In a worker process this never returns: the process exits with `main.run`'s status.
+/// Safety: `mmap` gives a page that both sides keep for the life of their process, a word of it per worker; `fork`
+/// is called from a process with one thread; `waitpid` writes one `i32`; `kill` is given only the process ids of
+/// children not yet waited for; `setrlimit` reads two `u64`, which is `struct rlimit` on LP64.
+public fn supervise<M: WorkerMain>(
+    main: borrow M,
+    options: SupervisorOptions,
+) -> Result<SupervisorReport, SupervisorError> {
+    if (options.workers == 0 || options.workers > maxWorkers()) {
+        return Err(SupervisorError.BadOptions);
+    }
+    let page = unsafe { mmap(0 as *mut void, 4096, PROT_READ + PROT_WRITE, MAP_SHARED + MAP_ANON, -1, 0) };
+    if (page == 0 as *mut void || page as usize == 0xFFFFFFFFFFFFFFFF) {
+        return Err(SupervisorError.NoSharedMemory);
+    }
+    let beats = page as *mut u64;
+    unsafe {
+        signal(SIGTERM, stopAsked);
+        signal(SIGINT, stopAsked);
+    }
+    var report = SupervisorReport { started: 0, crashed: 0, stalled: 0, killed: 0 };
+    var places = [Place { pid: 0, startedMs: 0, beat: 0, beatMs: 0, restartMs: 0, quick: 0 }; 256];
+    let count = options.workers as usize;
+    for (i in 0..count) {
+        places[i].restartMs = 1; // due at once
+    }
+    var stopSentMs: u64 = 0;
+    var killSent = false;
+    loop {
+        let now = nowMs();
+        let stopping = STOPPING.load() != 0;
+        // Workers that ended.
+        loop {
+            var status: i32 = 0;
+            let pid = unsafe { waitpid(-1, borrow mut status as *mut i32, WNOHANG) };
+            if (pid <= 0) {
+                break;
+            }
+            for (i in 0..count) {
+                if (places[i].pid != pid) {
+                    continue;
+                }
+                let bits = truncate<u32>(status);
+                let signalled = (bits & 127) != 0;
+                let code = if (signalled) (bits & 127) as u64 else ((bits >> 8) & 255) as u64;
+                let asked = stopping || places[i].restartMs != 0; // restartMs is set when the supervisor killed it
+                if (!asked && (signalled || code != 0)) {
+                    report.crashed += 1;
+                }
+                say(options, i, pid, if (signalled) "ended by signal" else "exited with status", code, true);
+                let lived = now - places[i].startedMs;
+                places[i].pid = 0;
+                if (lived < 1000) {
+                    places[i].quick += 1;
+                } else {
+                    places[i].quick = 0;
+                }
+                // 0, 100 ms, 200 ms, ... 3.2 s, then 5 s: a worker that cannot start does not spin the machine.
+                let step =
+                    if (places[i].quick > 6) 5000u64
+                        else (if (places[i].quick == 0) 0u64 else 50u64 << places[i].quick);
+                places[i].restartMs = now + step + 1;
+            }
+        }
+        if (stopping) {
+            var alive: usize = 0;
+            for (i in 0..count) {
+                if (places[i].pid != 0) {
+                    alive += 1;
+                }
+            }
+            if (alive == 0) {
+                return Ok(report);
+            }
+            if (stopSentMs == 0) {
+                stopSentMs = now;
+                for (i in 0..count) {
+                    if (places[i].pid != 0) {
+                        unsafe { kill(places[i].pid, SIGTERM); }
+                    }
+                }
+            } else if (!killSent && now - stopSentMs > options.graceMs) {
+                killSent = true;
+                for (i in 0..count) {
+                    if (places[i].pid != 0) {
+                        report.killed += 1;
+                        say(options, i, places[i].pid, "outlived the grace: killed", 0, false);
+                        unsafe { kill(places[i].pid, SIGKILL); }
+                    }
+                }
+            }
+        } else {
+            for (i in 0..count) {
+                if (places[i].pid == 0) {
+                    if (places[i].restartMs != 0 && now >= places[i].restartMs) {
+                        Console.flush(); // or the worker would write the parent's buffered lines again
+                        let pid = unsafe { fork() };
+                        if (pid == 0) {
+                            // The worker. Its beat starts from what the page holds; the parent compares, not counts.
+                            if (options.memoryBytes != 0) {
+                                var limit = [options.memoryBytes; 2];
+                                unsafe { setrlimit(RLIMIT_AS, borrow limit[0] as *u64 as *rlimit); }
+                            }
+                            let slot = unsafe { beats.add(i) };
+                            Process.exit(main.run(Worker { place: truncate<u32>(i), slot: slot }));
+                        }
+                        if (pid < 0) {
+                            if (report.started == 0) {
+                                return Err(SupervisorError.CannotFork);
+                            }
+                            places[i].restartMs = now + 1000; // the machine is out of processes: try again later
+                            continue;
+                        }
+                        report.started += 1;
+                        places[i].pid = pid;
+                        places[i].startedMs = now;
+                        places[i].beat = unsafe { beats.add(i).read() };
+                        places[i].beatMs = now;
+                        places[i].restartMs = 0;
+                        say(options, i, pid, "started", 0, false);
+                    }
+                    continue;
+                }
+                if (options.stallMs == 0 || places[i].restartMs != 0) {
+                    continue;
+                }
+                let beat = unsafe { beats.add(i).read() };
+                if (beat != places[i].beat) {
+                    places[i].beat = beat;
+                    places[i].beatMs = now;
+                } else if (now - places[i].beatMs > options.stallMs) {
+                    report.stalled += 1;
+                    say(options, i, places[i].pid, "has not beaten: killed after ms", now - places[i].beatMs, true);
+                    unsafe { kill(places[i].pid, SIGKILL); }
+                    places[i].restartMs = now; // marks it as killed here; the wait above starts it again
+                }
+            }
+        }
+        unsafe { usleep(20000); }
+    }
+}
+
+/// A worker's housekeeping, to race against its server (`Async.race(server, tend<ServerReport>(…))`): beats every
+/// `everyMs`, and starts `drain` when the process is asked to stop (SIGTERM or SIGINT), so the server finishes what
+/// is in flight and returns. It returns only an error.
+public async fn tend<T>(worker: Worker, drain: borrow Drain, everyMs: u64) -> Result<T, NetError> {
+    // A subscription that fails (another holds it) leaves the signals to their holder.
+    let signals = match (ProcessSignals.subscribe()) {
+        Ok(s) => Some(s),
+        Err(_) => null,
+    };
+    loop {
+        worker.beat();
+        match (borrow signals) {
+            Some(s) => {
+                if (s.poll().isSome()) {
+                    drain.start();
+                }
+            }
+            null => {}
+        }
+        match (await Timer.sleep(everyMs)) {
+            Ok() => {}
+            Err(e) => { return Err(NetErrors.fromAsync(e)); }
+        }
+    }
+}

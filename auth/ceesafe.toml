@@ -1,0 +1,18 @@
+[package]
+name = "httpserver_auth"
+version = "0.1.0"
+kind = "library"
+sources = ["src"]
+tests = ["tests"]
+ceesafec = ">=0.62.2"
+
+[dependencies]
+httpserver = { path = ".." }
+web_core = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "4bb64c6712d9c876a78d33d0214ea8b875f222ff", dir = "packages/web_core" }
+web_transport = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "4bb64c6712d9c876a78d33d0214ea8b875f222ff", dir = "packages/web_transport" }   # the tests' mock connection
+web_http = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "4bb64c6712d9c876a78d33d0214ea8b875f222ff", dir = "packages/web_http" }
+web_http1 = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "4bb64c6712d9c876a78d33d0214ea8b875f222ff", dir = "packages/web_http1" }
+# HMAC-SHA-256 for HS256, base64url for the token's parts, JSON for its header and claims.
+sha256 = { git = "https://github.com/CeeSafe/CeeSafeLibs.git", rev = "ca0a13fec248bbe192f0b61b930c8b8259175eed", dir = "sha256" }
+encoding = { git = "https://github.com/CeeSafe/CeeSafeLibs.git", rev = "ca0a13fec248bbe192f0b61b930c8b8259175eed", dir = "encoding" }
+json = { git = "https://github.com/CeeSafe/CeeSafeLibs.git", rev = "ca0a13fec248bbe192f0b61b930c8b8259175eed", dir = "json" }

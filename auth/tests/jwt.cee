@@ -1,0 +1,201 @@
+// HS256 tokens against RFC 7515's own example (appendix A.1) and tokens made with Python's hmac and hashlib, and the
+// bearer filter through an application on a mock connection.
+import web_core;
+import web_transport;
+import web_http;
+import web_http1;
+import httpserver;
+import encoding;
+
+fn alloc<T>(r: Result<T, AllocError>) -> Result<T, TestFailure> {
+    match (r) {
+        Ok(v) => { return Ok(v); }
+        Err(_) => { return Err(TestFailure.create("out of memory")); }
+    }
+}
+
+fn routed<T>(r: Result<T, RouteError>) -> Result<T, TestFailure> {
+    match (r) {
+        Ok(v) => { return Ok(v); }
+        Err(_) => { return Err(TestFailure.create("a route error")); }
+    }
+}
+
+/// A number for each outcome, so a test can compare: 0 accepted.
+fn outcome(v: borrow JwtVerifier, token: StringView, now: i64) -> u32 => match (v.verify(token.bytes(), now)) {
+    Ok(_) => 0,
+    Err(JwtError.Malformed) => 1,
+    Err(JwtError.Algorithm) => 2,
+    Err(JwtError.Signature) => 3,
+    Err(JwtError.Expired) => 4,
+    Err(JwtError.NotYet) => 5,
+    Err(JwtError.Issuer) => 6,
+    Err(JwtError.Audience) => 7,
+    Err(JwtError.OutOfMemory) => 8,
+};
+
+/// {"sub":"kim","exp":4102444800}, signed with "secret".
+fn kim() -> StringView =>
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJraW0iLCJleHAiOjQxMDI0NDQ4MDB9.Jwqd4trdB4uaESTcZSy5uu1EtT1cP9iMjXKqtsw31HQ";
+
+@test
+fn rfc7515Example() -> Result<void, TestFailure> {
+    // The key of A.1, as base64url there; the token's `exp` is 1300819380 and its `iss` is "joe".
+    var key = Vector<u8>.create();
+    match (Base64.decodeUrl("AyM1SysPpbyDfgZld3umj1qzKObwVMkoqQ-EstJQLr_T-1qS0gZH75aKtMN3Yj0iPS4hcgUuTwjAzZr1Z9CAow".bytes(), mut key)) {
+        Ok() => {}
+        Err(_) => { return Err(TestFailure.create("the key")); }
+    }
+    let token = "eyJ0eXAiOiJKV1QiLA0KICJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJqb2UiLA0KICJleHAiOjEzMDA4MTkzODAsDQogImh0dHA6Ly9leGFtcGxlLmNvbS9pc19yb290Ijp0cnVlfQ.dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+    var v = alloc(JwtVerifier.hs256(key.view()))?;
+    v.leewaySeconds(0);
+    Check.equalU64(0, outcome(v, token, 1300819379) as u64)?;
+    Check.equalU64(4, outcome(v, token, 1300819380) as u64)?; // at `exp` it has expired (RFC 7519 §4.1.4)
+    v.leewaySeconds(30);
+    Check.equalU64(0, outcome(v, token, 1300819409) as u64)?;
+    Check.equalU64(4, outcome(v, token, 1300819410) as u64)?;
+    alloc(v.requireIssuer("joe"))?;
+    Check.equalU64(0, outcome(v, token, 1300819379) as u64)?;
+    alloc(v.requireIssuer("jane"))?;
+    Check.equalU64(6, outcome(v, token, 1300819379) as u64)?;
+    // Another key.
+    let other = alloc(JwtVerifier.hs256("secret".bytes()))?;
+    Check.equalU64(3, outcome(other, token, 1300819379) as u64)?;
+    return Ok();
+}
+
+@test
+fn tokensThatAreRefused() -> Result<void, TestFailure> {
+    var v = alloc(JwtVerifier.hs256("secret".bytes()))?;
+    Check.equalU64(0, outcome(v, kim(), 1800000000) as u64)?;
+    // The last character of the payload changed: the signature is no longer its.
+    Check.equalU64(
+        3,
+        outcome(
+            v,
+            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJraW0iLCJleHAiOjQxMDI0NDQ4MDF9.Jwqd4trdB4uaESTcZSy5uu1EtT1cP9iMjXKqtsw31HQ",
+            1800000000,
+        ) as u64,
+    )?;
+    // {"alg":"none"} with an empty signature.
+    Check.equalU64(
+        2,
+        outcome(v, "eyJhbGciOiJub25lIn0.eyJzdWIiOiJraW0iLCJleHAiOjQxMDI0NDQ4MDB9.", 1800000000) as u64,
+    )?;
+    Check.equalU64(1, outcome(v, "abc", 1800000000) as u64)?;
+    Check.equalU64(1, outcome(v, "a.b.c.d", 1800000000) as u64)?;
+    Check.equalU64(1, outcome(v, "!!.??.**", 1800000000) as u64)?;
+    // {"sub":"kim"}: no `exp`.
+    let forever = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJraW0ifQ.Ry443dvoqMm_5Vd2WyzUq144o3nTXlj-cOfeo3bMFpM";
+    Check.equalU64(4, outcome(v, forever, 1800000000) as u64)?;
+    v.allowNoExpiry();
+    Check.equalU64(0, outcome(v, forever, 1800000000) as u64)?;
+    // {"sub":"kim","exp":4102444800,"iss":"shop","aud":["web","api"],"nbf":4000000000}
+    let full = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJraW0iLCJleHAiOjQxMDI0NDQ4MDAsImlzcyI6InNob3AiLCJhdWQiOlsid2ViIiwiYXBpIl0sIm5iZiI6NDAwMDAwMDAwMH0.EcXkMMi_C8oVfitJ_k5_wEUObRAW7hTGn5QdUg2gHks";
+    Check.equalU64(5, outcome(v, full, 3999999969) as u64)?; // more than the leeway before `nbf`
+    Check.equalU64(0, outcome(v, full, 3999999970) as u64)?;
+    alloc(v.requireAudience("api"))?;
+    Check.equalU64(0, outcome(v, full, 4000000000) as u64)?;
+    alloc(v.requireAudience("admin"))?;
+    Check.equalU64(7, outcome(v, full, 4000000000) as u64)?;
+    Check.equalU64(7, outcome(v, kim(), 1800000000) as u64)?; // no `aud` at all
+    return Ok();
+}
+
+@test
+fn signing() -> Result<void, TestFailure> {
+    var out = Vector<u8>.create();
+    alloc(Jwt.signHs256("{\"sub\":\"kim\",\"exp\":4102444800}".bytes(), "secret".bytes(), mut out))?;
+    return Check.equalBytes(kim().bytes(), out.view());
+}
+
+struct St {}
+
+/// Answers who the request is from.
+struct Who {}
+
+impl Handler<St> for Who {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut Context<St>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        let user = ctx.value("user") ?? "-".bytes();
+        let claims = ctx.value("claims") ?? "-".bytes();
+        exchange.setContentLength((user.length + 1 + claims.length) as u64);
+        await exchange.write(user)?;
+        await exchange.write("|".bytes())?;
+        await exchange.write(claims)?;
+        return Ok();
+    }
+}
+
+async fn served(app: borrow App<St>, text: Slice<u8>) -> Result<Vector<u8>, TestFailure> {
+    var conn = match (MockTransport.create(text)) {
+        Ok(m) => m,
+        Err(_) => { return Err(TestFailure.create("a mock")); },
+    };
+    let drain = match (Drain.create()) {
+        Ok(d) => d,
+        Err(_) => { return Err(TestFailure.create("a drain")); },
+    };
+    let ctx = ConnectionContext.acceptedNow(1, drain);
+    match (await web_http1.serve(mut conn, ctx, app, app.limits())) {
+        Ok() => {}
+        Err(e) => { return Err(TestFailure.create(NetErrors.describe(e))); }
+    }
+    var out = Vector<u8>.create();
+    for (b in conn.written()) {
+        alloc(out.push(b))?;
+    }
+    return Ok(out);
+}
+
+@test
+async fn theBearerFilter() -> Result<void, TestFailure> {
+    var limits = Limits.defaults();
+    limits.sendDate = false;
+    var a = routed(App<St>.create(St {}, limits))?;
+    let api = routed(a.group("/api"))?;
+    let auth: Box<dyn Filter + Send + Share> =
+        alloc(Box.create(BearerAuth.create(alloc(JwtVerifier.hs256("secret".bytes()))?)))?;
+    routed(a.filterIn(api, auth))?;
+    let who: Box<dyn Handler<St> + Send + Share> = alloc(Box.create(Who {}))?;
+    routed(a.routeIn(api, Method.Get, "/me", who))?;
+    let open: Box<dyn Handler<St> + Send + Share> = alloc(Box.create(Who {}))?;
+    routed(a.get("/open", open))?;
+
+    let none = await served(a, "GET /api/me HTTP/1.1\r\nhost: a\r\n\r\n".bytes())?;
+    Check.equalBytes(
+        "HTTP/1.1 401 Unauthorized\r\nwww-authenticate: Bearer\r\ncontent-type: application/problem+json\r\ncontent-length: 58\r\n\r\n{\"type\":\"about:blank\",\"title\":\"Unauthorized\",\"status\":401}".bytes(),
+        none.view(),
+    )?;
+    let basic = await served(a, "GET /api/me HTTP/1.1\r\nhost: a\r\nauthorization: Basic a2ltOng=\r\n\r\n".bytes())?;
+    Check.equalBytes(none.view(), basic.view())?;
+    let bad = await served(a, "GET /api/me HTTP/1.1\r\nhost: a\r\nauthorization: Bearer a.b.c\r\n\r\n".bytes())?;
+    Check.equalBytes(
+        "HTTP/1.1 401 Unauthorized\r\nwww-authenticate: Bearer error=\"invalid_token\"\r\ncontent-type: application/problem+json\r\ncontent-length: 58\r\n\r\n{\"type\":\"about:blank\",\"title\":\"Unauthorized\",\"status\":401}".bytes(),
+        bad.view(),
+    )?;
+
+    var request = Vector<u8>.create();
+    for (b in "GET /api/me HTTP/1.1\r\nhost: a\r\nAuthorization: bearer ".bytes()) {
+        alloc(request.push(b))?;
+    }
+    for (b in kim().bytes()) {
+        alloc(request.push(b))?;
+    }
+    for (b in "\r\n\r\n".bytes()) {
+        alloc(request.push(b))?;
+    }
+    let good = await served(a, request.view())?;
+    Check.equalBytes(
+        "HTTP/1.1 200 OK\r\ncontent-length: 34\r\n\r\nkim|{\"sub\":\"kim\",\"exp\":4102444800}".bytes(),
+        good.view(),
+    )?;
+    // Outside the group no token is asked for.
+    let free = await served(a, "GET /open HTTP/1.1\r\nhost: a\r\n\r\n".bytes())?;
+    Check.equalBytes("HTTP/1.1 200 OK\r\ncontent-length: 3\r\n\r\n-|-".bytes(), free.view())?;
+    return Ok();
+}

@@ -1,0 +1,125 @@
+// Rate limiting: at most so many requests in a window from one client address.
+//
+// The counters are a table of a fixed size, so the memory is bounded whatever the number of clients: two clients
+// that fall on the same place share a counter until its window ends (a table several times the number of clients
+// active in one window makes that rare). The table is one process's: under the supervisor each worker counts for
+// itself, so with n workers a client may make up to n times the limit.
+import web_core;
+import web_http;
+
+/// One counter: a key's requests in the window that started at `startMs`.
+struct Counter {
+    key: u64;
+    startMs: u64;
+    count: u32;
+}
+
+/// At most `limit` requests in each `windowMs` from one client address; the rest are answered 429 with `Retry-After`.
+/// Every response carries `ratelimit-limit` and `ratelimit-remaining`.
+public struct RateLimit {
+    private limit: u32;
+    private windowMs: u64;
+    private table: Mutex<Vector<Counter>>;
+
+    /// `places` counters (rounded up to a power of two, at least 64).
+    public fn create(limit: u32, windowMs: u64, places: usize) -> Result<RateLimit, AllocError> {
+        var size: usize = 64;
+        while (size < places) {
+            size *= 2;
+        }
+        var counters = Vector<Counter>.create();
+        for (i in 0..size) {
+            counters.push(Counter { key: 0, startMs: 0, count: 0 })?;
+        }
+        return Ok(RateLimit { limit: limit, windowMs: windowMs, table: Mutex<Vector<Counter>>.create(counters)? });
+    }
+
+    /// Counts one request of `key` at `nowMs`; how many the key has made in its window, this one included, and the
+    /// milliseconds until the window ends.
+    fn hit(borrow this, key: u64, nowMs: u64) -> Hit {
+        // One event loop a process: the lock is free. If it is not (another thread of the application), let through.
+        var guard = this.table.tryLock() ?? { return Hit { count: 0, leftMs: 0 }; };
+        let counters = guard.data();
+        let slot = (key as usize) & (counters.length - 1);
+        let c = counters[slot];
+        if (c.key != key || nowMs - c.startMs >= this.windowMs) {
+            counters[slot] = Counter { key: key, startMs: nowMs, count: 1 };
+            return Hit { count: 1, leftMs: this.windowMs };
+        }
+        let count = if (c.count == 0xFFFFFFFF) c.count else c.count + 1;
+        counters[slot] = Counter { key: key, startMs: c.startMs, count: count };
+        return Hit { count: count, leftMs: this.windowMs - (nowMs - c.startMs) };
+    }
+}
+
+struct Hit {
+    count: u32;
+    leftMs: u64;
+}
+
+/// A client address as a number (FNV-1a over its bytes; the port is left out).
+fn addressKey(address: SocketAddress?) -> u64 {
+    var h: u64 = 14695981039346656037;
+    match (address) {
+        Some(SocketAddress.V4(bytes, _)) => {
+            for (b in bytes) {
+                h = (h ^ b as u64).wrappingMul(1099511628211);
+            }
+        }
+        Some(SocketAddress.V6(bytes, _, _)) => {
+            for (b in bytes) {
+                h = (h ^ b as u64).wrappingMul(1099511628211);
+            }
+        }
+        null => {}
+    }
+    return h | 1; // never 0, an empty place
+}
+
+impl Filter for RateLimit {
+    async fn before(
+        borrow this,
+        scope: borrow mut Scope,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<Flow, HandlerError> {
+        let hit = this.hit(addressKey(scope.connection().peerAddress()), Clock.monotonicNanos() / 1000000);
+        var text = [0u8; 20];
+        var w = TextWriter.create(mut text[..]);
+        w.decimal(this.limit as u64);
+        exchange.header("ratelimit-limit", w.written())?;
+        var left = [0u8; 20];
+        var l = TextWriter.create(mut left[..]);
+        l.decimal(if (hit.count >= this.limit) 0u64 else (this.limit - hit.count) as u64);
+        exchange.header("ratelimit-remaining", l.written())?;
+        if (hit.count <= this.limit) {
+            return Ok(Flow.Continue);
+        }
+        var wait = [0u8; 20];
+        var r = TextWriter.create(mut wait[..]);
+        r.decimal((hit.leftMs + 999) / 1000);
+        exchange.header("retry-after", r.written())?;
+        let status = StatusCode.of(429) ?? { return Err(HandlerError.Internal); };
+        await Reply.problem(exchange, status, "", "the request limit for this address is reached")?;
+        return Ok(Flow.Responded);
+    }
+
+    async fn after(borrow this, request: borrow Request, head: borrow mut ResponseHead) -> Result<void, HandlerError> =>
+        Ok();
+}
+
+/// The answer of a health endpoint, for a handler to give: `return await Health.answer(ctx.connection(), exchange);`.
+public struct Health {
+    /// 200 `ok` while the server serves, 503 `draining` once it has been asked to stop, so a load balancer takes it
+    /// out before its connections close. Never cached.
+    public async fn answer(
+        connection: borrow ConnectionContext,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        exchange.header("cache-control", "no-store".bytes())?;
+        if (connection.isDraining()) {
+            return await Reply.text(exchange, Status.serviceUnavailable(), "draining");
+        }
+        return await Reply.text(exchange, Status.ok(), "ok");
+    }
+}
