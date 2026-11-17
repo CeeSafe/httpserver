@@ -75,6 +75,35 @@ public struct Hub {
     public fn to(borrow this, id: u64, binary: bool, bytes: Slice<u8>) -> bool =>
         this.deliver(binary, bytes, "", id) == 1;
 
+    /// A broadcast (`group` empty) or a group's message as bytes another process's hub can deliver
+    /// (`deliverEncoded`), appended to `out`: what an application publishes on a bus between worker processes so
+    /// that a message reaches the sessions of all of them. False if the group's name is longer than 255 bytes, or
+    /// out of memory.
+    public fn encode(group: StringView, binary: bool, bytes: Slice<u8>, out: borrow mut Vector<u8>) -> bool {
+        if (group.length > 255 || out.reserve(2 + group.length + bytes.length).isErr()) {
+            return false;
+        }
+        var ok = out.push(if (binary) 1u8 else 0u8).isOk() && out.push(truncate<u8>(group.length)).isOk();
+        for (b in group.bytes()) {
+            ok = ok && out.push(b).isOk();
+        }
+        for (b in bytes) {
+            ok = ok && out.push(b).isOk();
+        }
+        return ok;
+    }
+
+    /// Queues what `encode` made, in another process, for this hub's members; how many it was queued for (0 also
+    /// if the bytes are not an encoded message).
+    public fn deliverEncoded(borrow this, message: Slice<u8>) -> usize {
+        if (message.length < 2 || message[0] > 1 || message.length < 2 + message[1] as usize) {
+            return 0;
+        }
+        let end = 2 + message[1] as usize;
+        let group = StringView.fromUtf8(message[2..end]) ?? { return 0; };
+        return this.deliver(message[0] == 1, message[end..], group, 0);
+    }
+
     /// Queues a Close with `code` for every member (1001, "going away", before a shutdown); how many.
     public fn closeAll(borrow this, code: u16) -> usize {
         var guard = this.members.tryLock() ?? { return 0; };

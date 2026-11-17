@@ -134,3 +134,39 @@ async fn aMemberThatDoesNotRead() -> Result<void, TestFailure> {
     Check.equalBytes([0x81u8, 1u8, 49u8, 0x81u8, 1u8, 50u8][..], slow.written.view())?;
     return Ok();
 }
+
+@test
+async fn messagesFromAnotherProcessesHub() -> Result<void, TestFailure> {
+    // What one worker's application publishes for the others: the kind, the group's length, the group, the bytes.
+    var all = Vector<u8>.create();
+    Check.isTrue(Hub.encode("", false, "hi".bytes(), mut all), "encoding")?;
+    Check.equalBytes([0u8, 0u8, 104u8, 105u8][..], all.view())?;
+    var room = Vector<u8>.create();
+    let two = [1u8, 2u8];
+    Check.isTrue(Hub.encode("room", true, two[..], mut room), "encoding")?;
+    Check.equalBytes([1u8, 4u8, 114u8, 111u8, 111u8, 109u8, 1u8, 2u8][..], room.view())?;
+
+    let hub = alloc(Hub.create())?;
+    let o = options(8);
+    var a = Quiet { written: Vector<u8>.create() };
+    var b = Quiet { written: Vector<u8>.create() };
+    {
+        var wa = handled(open(mut a, Role.Server, o, null, null))?;
+        var wb = handled(open(mut b, Role.Server, o, null, null))?;
+        let ma = hub.join(wa.sender()) ?? { return Err(TestFailure.create("joining")); };
+        let mb = hub.join(wb.sender()) ?? { return Err(TestFailure.create("joining")); };
+        Check.isTrue(ma.enter("room"), "entering a group")?;
+        Check.equalU64(2, hub.deliverEncoded(all.view()) as u64)?;
+        Check.equalU64(1, hub.deliverEncoded(room.view()) as u64)?;
+        // Not encoded messages: too short, a kind not known, a group longer than the bytes.
+        Check.equalU64(0, hub.deliverEncoded(all.view()[0..1]) as u64)?;
+        Check.equalU64(0, hub.deliverEncoded([2u8, 0u8, 104u8][..]) as u64)?;
+        Check.equalU64(0, hub.deliverEncoded([0u8, 9u8, 104u8][..]) as u64)?;
+        Check.equalU64(mb.id(), mb.id())?;
+        await drained(mut wa)?;
+        await drained(mut wb)?;
+    }
+    Check.equalBytes([0x81u8, 2u8, 104u8, 105u8, 0x82u8, 2u8, 1u8, 2u8][..], a.written.view())?;
+    Check.equalBytes([0x81u8, 2u8, 104u8, 105u8][..], b.written.view())?;
+    return Ok();
+}

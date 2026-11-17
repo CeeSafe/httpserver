@@ -16,7 +16,8 @@
 //   GET  /kept/{n:int}   the same text through the output cache, kept for a minute
 //   GET  /gz/{n:int}     n bytes of JSON-like text through `Compression`: gzip for a client that accepts it
 //   GET  /z/{n:int}      the same text through `Codings`: zstd or Brotli, or gzip for a client that takes neither
-//   GET  /chat           a WebSocket: every message a session sends goes to all the sessions of this process
+//   GET  /chat           a WebSocket: every message a session sends goes to all the sessions of this process, and with
+//                         CW_BUS=1 to those of every worker
 //   GET  /bloat          allocates until an allocation fails, then answers how many MiB it got
 //
 // CW_PROCS=n runs n worker processes under the supervisor (src/supervisor.cee), which starts a worker again when it
@@ -51,12 +52,16 @@ struct Wiring {
     heard: Arc<AtomicU64>;
     /// The cache of `/kept`.
     cache: Arc<OutputCache>;
+    /// The sessions of `/chat`.
+    hub: Arc<Hub>;
 }
 
-/// What a worker does with the other workers' messages: topic 1 is a number said, topic 2 a target to forget.
+/// What a worker does with the other workers' messages: topic 1 is a number said, topic 2 a target to forget,
+/// topic 3 a message for the sessions of `/chat`.
 struct Ears {
     heard: Arc<AtomicU64>;
     cache: Arc<OutputCache>;
+    hub: Arc<Hub>;
 }
 
 impl BusSink for Ears {
@@ -72,6 +77,8 @@ impl BusSink for Ears {
                 Some(target) => { this.cache.get().forget(target); }
                 null => {}
             }
+        } else if (topic == 3) {
+            let _ = this.hub.get().deliverEncoded(payload);
         }
     }
 }
@@ -129,8 +136,6 @@ impl Handler<St> for OnBus {
 struct St {
     /// Which worker process this is.
     worker: u32;
-    /// The sessions of `/chat`.
-    hub: Hub;
     sockets: WebSocketOptions;
     wiring: Wiring;
 }
@@ -432,7 +437,8 @@ impl Handler<St> for Chat {
             Some(w) => w,
             null => { return Ok(); }, // refused: the response is sent
         };
-        let member = state.hub.join(ws.sender()) ?? { return Err(HandlerError.Internal); };
+        let hub = state.wiring.hub.get();
+        let member = hub.join(ws.sender()) ?? { return Err(HandlerError.Internal); };
         var message = Vector<u8>.create();
         loop {
             match (await ws.receive(mut message)?) {
@@ -441,7 +447,17 @@ impl Handler<St> for Chat {
                         MessageKind.Binary => true,
                         MessageKind.Text => false,
                     };
-                    let _ = state.hub.broadcast(binary, message.view());
+                    let _ = hub.broadcast(binary, message.view());
+                    // And to the sessions of the other workers, if there is a bus.
+                    match (state.wiring.sender) {
+                        Some(s) => {
+                            var encoded = Vector<u8>.create();
+                            if (Hub.encode("", binary, message.view(), mut encoded)) {
+                                let _ = s.publish(3, encoded.view());
+                            }
+                        }
+                        null => {}
+                    }
                 }
                 Received.Closed(_) => { return Ok(); }
             }
@@ -549,12 +565,8 @@ fn application(worker: u32, wiring: Wiring) -> Result<App<St>, RouteError> {
     let cache = wiring.cache.clone();
     var limits = Limits.defaults();
     limits.maxBodyBytes = 1048576;
-    let hub = match (Hub.create()) {
-        Ok(h) => h,
-        Err(_) => { return Err(RouteError.OutOfMemory); },
-    };
     var app = App<St>.create(
-        St { worker: worker, hub: hub, sockets: WebSocketOptions.defaults(), wiring: wiring },
+        St { worker: worker, sockets: WebSocketOptions.defaults(), wiring: wiring },
         limits,
     )?;
     for (i in 0..setting("CW_HOOKS", 0)) {
@@ -727,6 +739,13 @@ fn wired(worker: Worker, words: SharedWords?, bus: Bus?) -> Parts? {
         },
         Err(_) => { return null; },
     };
+    let hub = match (Hub.create()) {
+        Ok(h) => match (Arc<Hub>.create(h)) {
+            Ok(a) => a,
+            Err(_) => { return null; },
+        },
+        Err(_) => { return null; },
+    };
     var port: BusPort? = null;
     var sender: BusSender? = null;
     match (bus) {
@@ -741,7 +760,9 @@ fn wired(worker: Worker, words: SharedWords?, bus: Bus?) -> Parts? {
         }
         null => {}
     }
-    return Some(Parts { wiring: Wiring { words: words, sender: sender, heard: heard, cache: cache }, port: port });
+    return Some(
+        Parts { wiring: Wiring { words: words, sender: sender, heard: heard, cache: cache, hub: hub }, port: port },
+    );
 }
 
 /// One process's server on `listener`; the status it exits with.
@@ -751,7 +772,11 @@ fn serveOn(worker: Worker, listener: borrow Listener, words: SharedWords?, bus: 
         Console.writeLine("bench: no memory");
         return 1;
     };
-    let ears = Ears { heard: parts.wiring.heard.clone(), cache: parts.wiring.cache.clone() };
+    let ears = Ears {
+        heard: parts.wiring.heard.clone(),
+        cache: parts.wiring.cache.clone(),
+        hub: parts.wiring.hub.clone(),
+    };
     let app = match (application(worker.index(), parts.wiring)) {
         Ok(a) => a,
         Err(_) => {

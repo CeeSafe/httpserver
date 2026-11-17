@@ -139,7 +139,8 @@ For events there is `Bus`: each worker publishes into a ring of its own in share
 a timer (`carry`, raced against the server as `tend` is), so a message reaches them within that interval (5 ms in
 the benchmark server). Nothing blocks: a reader that falls a whole ring behind skips to the newest and counts it
 (`missed`). An application gives each topic a number and a `BusSink` that acts on it, such as
-`OutputCache.forget` for a target another worker changed. The bus is one machine's; across machines a broker is
+`OutputCache.forget` for a target another worker changed, or `Hub.deliverEncoded` for a WebSocket message that
+another worker's session sent (`Hub.encode` makes it). The bus is one machine's; across machines a broker is
 needed.
 
 `python3 tools/supervisor_check.py [--inherit] [--memory-mb 512]` checks all of this against the benchmark server:
@@ -225,6 +226,7 @@ python3 tools/gzip_check.py       # compressed responses, against Python's gzip
 python3 tools/ratelimit_check.py  # one rate limit for four workers (add --inherit on macOS)
 python3 tools/bus_check.py        # the bus between four workers (add --inherit on macOS)
 python3 tools/ws_check.py         # the hub, with WebSocket clients written from RFC 6455
+python3 tools/ws_check.py --workers 4   # the same over four workers and the bus (add --inherit on macOS)
 ```
 
 The compiler: ceesafec 0.62.2 or later. The supervisor is POSIX only.

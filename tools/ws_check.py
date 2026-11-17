@@ -2,14 +2,25 @@
 """Checks the hub end to end: WebSocket clients written here from RFC 6455 (the handshake and masked frames) join
 the benchmark server's /chat, and a message from one must reach all of them.
 
-usage: python3 tools/ws_check.py [--port 18492]   (after `ceesafec build` in bench/)
+With --workers n the server runs n worker processes with a bus between them, the sessions fall on different
+workers, and a message must still reach all of them.
+
+usage: python3 tools/ws_check.py [--port 18492] [--workers 4] [--inherit]   (after `ceesafec build` in bench/)
 """
-import argparse, base64, hashlib, os, pathlib, socket, struct, subprocess, sys, time
+import argparse, base64, hashlib, http.client, os, pathlib, socket, struct, subprocess, sys, time
 
 HERE = pathlib.Path(__file__).resolve().parent.parent
 args = argparse.ArgumentParser()
 args.add_argument("--port", type=int, default=18492)
+args.add_argument("--workers", type=int, default=0)
+args.add_argument("--inherit", action="store_true", help="the workers accept from one socket (needed on macOS)")
 a = args.parse_args()
+env = dict(os.environ, CW_PORT=str(a.port))
+if a.workers:
+    env.update(CW_PROCS=str(a.workers), CW_BUS="1")
+if a.inherit:
+    env["CW_INHERIT"] = "1"
+COUNT = 12 if a.workers else 5
 
 class Client:
     def __init__(self):
@@ -46,31 +57,38 @@ class Client:
             n = struct.unpack(">H", self.exactly(2))[0]
         return b0 & 15, self.exactly(n)
 
-proc = subprocess.Popen([str(HERE / "bench" / "out" / "bench")], env=dict(os.environ, CW_PORT=str(a.port)),
-                        stdout=subprocess.DEVNULL)
+proc = subprocess.Popen([str(HERE / "bench" / "out" / "bench")], env=env, stdout=subprocess.DEVNULL)
 problems = []
 def expect(what, ok):
     print(("ok   " if ok else "FAIL ") + what, flush=True)
     if not ok:
         problems.append(what)
 try:
-    time.sleep(1.0)
-    clients = [Client() for _ in range(5)]
-    expect("five sessions are accepted", all(c.ok for c in clients))
+    time.sleep(1.5)
+    clients = [Client() for _ in range(COUNT)]
+    expect(f"{COUNT} sessions are accepted", all(c.ok for c in clients))
+    if a.workers:
+        seen = set()
+        for _ in range(200):
+            c = http.client.HTTPConnection("127.0.0.1", a.port, timeout=5)
+            c.request("GET", "/worker")
+            seen.add(c.getresponse().read())
+            c.close()
+        expect(f"connections fall on several workers ({len(seen)})", len(seen) > 1)
     clients[0].send(1, b"hello, room")
-    expect("a text message reaches all five", all(c.receive() == (1, b"hello, room") for c in clients))
+    expect("a text message reaches all", all(c.receive() == (1, b"hello, room") for c in clients))
     big = bytes(range(256)) * 20
     clients[3].send(2, big)
-    expect("a 5120-byte binary message reaches all five", all(c.receive() == (2, big) for c in clients))
+    expect("a 5120-byte binary message reaches all", all(c.receive() == (2, big) for c in clients))
     clients[4].send(8, struct.pack(">H", 1000))
     expect("a session that closes gets its Close back", clients[4].receive() == (8, struct.pack(">H", 1000)))
     time.sleep(0.2)
     clients[1].send(1, b"still here")
-    expect("the other four go on", all(c.receive() == (1, b"still here") for c in clients[:4]))
+    expect("the others go on", all(c.receive() == (1, b"still here") for c in clients[:4] + clients[5:]))
     clients[2].s.close()   # gone without a Close
     time.sleep(0.2)
     clients[0].send(1, b"three left")
-    expect("a session that vanished is left out", all(c.receive() == (1, b"three left") for c in (clients[0], clients[1], clients[3])))
+    expect("a session that vanished is left out", all(c.receive() == (1, b"three left") for c in [clients[0], clients[1], clients[3]] + clients[5:]))
 finally:
     proc.terminate()
     proc.wait(10)
