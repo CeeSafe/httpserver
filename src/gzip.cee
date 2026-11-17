@@ -1,0 +1,154 @@
+// Compressed responses: gzip (RFC 1952) for the clients that accept it.
+//
+// A response's body cannot be changed after the handler has sent it, so this is not a middleware: the handler
+// answers through `Compression.send`, which compresses when it is worth it.
+import web_http;
+
+/// Sends bodies as gzip when the request accepts it, the body is not small, and the result is smaller.
+public struct Compression {
+    private deflater: Mutex<Deflater>;
+    /// CRC-32's tables, for slicing by four.
+    private crc: [u32; 1024];
+    private minBytes: usize;
+
+    /// Bodies of `minBytes` or more are compressed (1024 is a good floor: below it the saving is a packet at most).
+    public fn create(minBytes: usize) -> Result<Compression, AllocError> {
+        var table = [0u32; 1024];
+        for (n in 0..256) {
+            var c = truncate<u32>(n);
+            for (k in 0..8) {
+                // Not an `if` on the low bit: gcc 15.2 at -O2 compiles that loop, as ceesafec writes it in C, to
+                // nothing (httpclient's CEESAFE_FINDINGS.md, F14).
+                c = (c >> 1) ^ ((c & 1) * 0xEDB88320);
+            }
+            table[n] = c;
+        }
+        for (n in 0..256) {
+            var c = table[n];
+            for (k in 1..4) {
+                c = table[(c & 255) as usize] ^ (c >> 8);
+                table[k * 256 + n] = c;
+            }
+        }
+        return Ok(
+            Compression { deflater: Mutex<Deflater>.create(Deflater.create()?)?, crc: table, minBytes: minBytes },
+        );
+    }
+
+    /// The CRC-32 (ISO 3309, as gzip uses it) of `bytes`.
+    fn crc32(borrow this, bytes: Slice<u8>) -> u32 {
+        var c: u32 = 0xFFFFFFFF;
+        var at: usize = 0;
+        while (at + 4 <= bytes.length) {
+            c ^= bytes.readLE<u32>(at);
+            c = this.crc[768 + (c & 255) as usize] ^ this.crc[512 + ((c >> 8) & 255) as usize] ^
+                this.crc[256 + ((c >> 16) & 255) as usize] ^ this.crc[(c >> 24) as usize];
+            at += 4;
+        }
+        while (at < bytes.length) {
+            c = this.crc[((c ^ bytes[at] as u32) & 255) as usize] ^ (c >> 8);
+            at += 1;
+        }
+        return c ^ 0xFFFFFFFF;
+    }
+
+    /// Appends `data` as one gzip member to `out`. False, with `out` as it was, if the compressor is in use by
+    /// another thread; one event loop never finds it so.
+    public fn gzip(borrow this, data: Slice<u8>, out: borrow mut Vector<u8>) -> Result<bool, AllocError> {
+        var guard = this.deflater.tryLock() ?? { return Ok(false); };
+        // The header: the magic, deflate, no flags, no time, no extra flags, an unknown system.
+        var header = [0x1Fu8, 0x8Bu8, 8u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 255u8];
+        out.extend(header[..])?;
+        // The encoder writes a block that is not the last and an empty stored block without its `00 00 ff ff`
+        // (permessage-deflate's form). Those four bytes complete it; an empty stored block marked last ends the
+        // stream.
+        guard.data().message(data, out)?;
+        var ending = [0u8, 0u8, 0xFFu8, 0xFFu8, 1u8, 0u8, 0u8, 0xFFu8, 0xFFu8];
+        out.extend(ending[..])?;
+        var trailer = [0u8; 8];
+        trailer.writeLE(0, this.crc32(data));
+        trailer.writeLE(4, truncate<u32>(data.length));
+        out.extend(trailer[..])?;
+        return Ok(true);
+    }
+
+    /// Answers `status` with `body` as `contentType`, compressed if the request's `Accept-Encoding` takes gzip, the
+    /// body has `minBytes` or more, and gzip makes it smaller. A body that could have been compressed is marked
+    /// `vary: accept-encoding` either way, so a cache keeps the two forms apart.
+    public async fn send(
+        borrow this,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+        status: StatusCode,
+        contentType: StringView,
+        body: Slice<u8>,
+    ) -> Result<void, HandlerError> {
+        exchange.header("content-type", contentType.bytes())?;
+        if (body.length < this.minBytes) {
+            return await exchange.send(status, body);
+        }
+        exchange.header("vary", "accept-encoding".bytes())?;
+        let accepted = match (request.headers().get(HeaderName.AcceptEncoding)) {
+            Some(list) => acceptsGzip(list),
+            null => false,
+        };
+        if (!accepted) {
+            return await exchange.send(status, body);
+        }
+        var packed = Vector<u8>.create();
+        let done = match (this.gzip(body, mut packed)) {
+            Ok(d) => d,
+            Err(_) => false, // no memory to compress with: the body goes as it is
+        };
+        if (!done || packed.length >= body.length) {
+            return await exchange.send(status, body);
+        }
+        exchange.header("content-encoding", "gzip".bytes())?;
+        return await exchange.send(status, packed.view());
+    }
+}
+
+/// Whether the `Accept-Encoding` value `list` takes gzip: `gzip`, `x-gzip` or `*`, not with a quality of 0
+/// (RFC 9110 §12.5.3).
+fn acceptsGzip(list: Slice<u8>) -> bool {
+    var at: usize = 0;
+    var star = false;
+    while (at < list.length) {
+        var end = at;
+        while (end < list.length && list[end] != 44) {
+            end += 1;
+        }
+        let item = trimWhitespace(list[at..end]);
+        var semi = item.length;
+        for (i in 0..item.length) {
+            if (item[i] == 59) {
+                semi = i;
+                break;
+            }
+        }
+        let coding = trimWhitespace(item[0..semi]);
+        let refused = semi < item.length && zeroQuality(item[semi + 1..]);
+        if (Ascii.equalsIgnoringCase(coding, "gzip") || Ascii.equalsIgnoringCase(coding, "x-gzip")) {
+            return !refused;
+        }
+        if (Ascii.equals(coding, "*") && !refused) {
+            star = true;
+        }
+        at = end + 1;
+    }
+    return star;
+}
+
+/// Whether the parameters `text` (after a coding's `;`) give it the quality 0: `q=0`, `q=0.0`, …
+fn zeroQuality(text: Slice<u8>) -> bool {
+    let p = trimWhitespace(text);
+    if (p.length < 3 || Ascii.lower(p[0]) != 113 || p[1] != 61) {
+        return false;
+    }
+    for (i in 2..p.length) {
+        if (p[i] != 48 && p[i] != 46) {
+            return false;
+        }
+    }
+    return true;
+}

@@ -1,0 +1,89 @@
+// `Compression.send` over HTTP/1.1's driver on mock connections. What a gzip member must begin and end with is
+// written out from RFC 1952 (the CRC-32 and length of the test's body are Python's zlib's); that the bytes between
+// inflate to the body is checked outside, by tools/gzip_check.py with Python's gzip.
+import web_core;
+import web_http;
+
+/// Answers `count` times "hello, " through a `Compression` that starts at 1024 bytes.
+struct Zipped {
+    compression: Compression;
+    count: usize;
+}
+
+impl Handler<St> for Zipped {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut Context<St>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        var body = Vector<u8>.create();
+        for (i in 0..this.count) {
+            for (b in "hello, ".bytes()) {
+                match (body.push(b)) {
+                    Ok() => {}
+                    Err(_) => { return Err(HandlerError.Internal); }
+                }
+            }
+        }
+        return await this.compression.send(request, exchange, Status.ok(), "text/plain", body.view());
+    }
+}
+
+fn zipped(count: usize) -> Result<Box<dyn Handler<St> + Send + Share>, TestFailure> {
+    let h: Box<dyn Handler<St> + Send + Share> =
+        alloc(Box.create(Zipped { compression: alloc(Compression.create(1024))?, count: count }))?;
+    return Ok(h);
+}
+
+/// Whether `text` starts with `prefix`.
+fn startsWith(text: Slice<u8>, prefix: StringView) -> bool {
+    let p = prefix.bytes();
+    if (text.length < p.length) {
+        return false;
+    }
+    for (i in 0..p.length) {
+        if (text[i] != p[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+@test
+async fn gzipWhenItIsAcceptedAndWorthIt() -> Result<void, TestFailure> {
+    var a = routed(App<St>.create(state(), quiet()))?;
+    routed(a.get("/big", zipped(300)?))?;
+    routed(a.get("/small", zipped(2)?))?;
+    // 2100 bytes, not asked for compressed: sent whole, and marked as varying.
+    let plain = await served(a, "GET /big HTTP/1.1\r\nhost: a\r\n\r\n")?;
+    Check.isTrue(
+        startsWith(plain.view(), "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\nvary: accept-encoding\r\ncontent-length: 2100\r\n\r\nhello, hello, "),
+        "the whole body",
+    )?;
+    let refused = await served(a, "GET /big HTTP/1.1\r\nhost: a\r\naccept-encoding: br, gzip;q=0\r\n\r\n")?;
+    Check.equalBytes(plain.view(), refused.view())?;
+    // Asked for: a gzip member, smaller than the body.
+    let packed = await served(a, "GET /big HTTP/1.1\r\nhost: a\r\naccept-encoding: br;q=1.0, gzip;q=0.8\r\n\r\n")?;
+    let head = "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\nvary: accept-encoding\r\ncontent-encoding: gzip\r\ncontent-length: ";
+    Check.isTrue(startsWith(packed.view(), head), "a gzip response")?;
+    Check.isTrue(packed.length < 400, "much smaller than 2100 bytes")?;
+    var at = head.length;
+    while (at + 4 <= packed.length && !startsWith(packed.view()[at..], "\r\n\r\n")) {
+        at += 1;
+    }
+    let member = packed.view()[at + 4..];
+    // RFC 1952 §2.3: ID1, ID2, CM = 8 (deflate), no flags, no time, XFL 0, OS 255.
+    Check.equalBytes([0x1Fu8, 0x8Bu8, 8u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 255u8][..], member[0..10])?;
+    // The CRC-32 and the length of the 2100 bytes, little-endian (zlib.crc32 gives 0x126B793E).
+    Check.equalBytes([0x3Eu8, 0x79u8, 0x6Bu8, 0x12u8, 0x34u8, 0x08u8, 0u8, 0u8][..], member[member.length - 8..])?;
+    let any = await served(a, "GET /big HTTP/1.1\r\nhost: a\r\naccept-encoding: *\r\n\r\n")?;
+    Check.equalBytes(packed.view(), any.view())?;
+    // Under the floor nothing is compressed or marked.
+    let small = await served(a, "GET /small HTTP/1.1\r\nhost: a\r\naccept-encoding: gzip\r\n\r\n")?;
+    Check.equalBytes(
+        "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: 14\r\n\r\nhello, hello, ".bytes(),
+        small.view(),
+    )?;
+    return Ok();
+}

@@ -1,0 +1,242 @@
+// DEFLATE compression (RFC 1951), for the responses `Compression` sends as gzip. The encoder is httpclient's
+// (its src/deflate.cee, written there for permessage-deflate): matches are found through hash chains over the last
+// 32 KiB and coded with the fixed Huffman codes (§3.2.6), so no code tables are built or sent. That is fast and
+// suits JSON and HTML of some kilobytes; it gives up some ratio against a compressor that builds its codes.
+// A `Deflater` allocates its two tables once; compressing a body then allocates only what the output needs.
+
+const WINDOW: usize = 32768;
+const WINDOW_MASK: usize = 32767;
+const MIN_MATCH: usize = 3;
+const MAX_MATCH: usize = 258;
+/// How many earlier places with the same hash are tried, and the length at which a match is good enough.
+const MAX_CHAIN: u32 = 24;
+const NICE_MATCH: usize = 96;
+/// Positions are kept as 32 bits: longer inputs are compressed a piece at a time.
+const MAX_PIECE: usize = 0x20000000;
+
+/// `code`'s low `bits` bits in the opposite order: Huffman codes go out from their most significant bit (§3.1.1).
+fn reversed(code: u32, bits: u32) -> u32 {
+    var r: u32 = 0;
+    for (i in 0..bits) {
+        r = (r << 1) | ((code >> i) & 1);
+    }
+    return r;
+}
+
+/// Compresses messages, each on its own (nothing of a message is referred to by the next).
+public struct Deflater {
+    /// For each hash of three bytes, the last place it was seen; for each place in the window, the one before it
+    /// with the same hash. A place is kept as `base` + its index + 1, so that what earlier messages left reads as
+    /// nothing without the tables being cleared.
+    private head: Vector<u32>;
+    private prev: Vector<u32>;
+    private base: u32;
+    /// A literal's code, already reversed; 8 bits up to 143 and 9 from 144.
+    private literal: [u16; 256];
+    /// A length's code and extra bits as they go out (index: the length less 3), and how many bits that is.
+    private lengthBits: [u16; 256];
+    private lengthCount: [u8; 256];
+    /// The distance code of a distance less 1 (below 256 by itself, above by its bits from the seventh), then each
+    /// code's base, extra bits and reversed 5-bit code.
+    private distanceCode: [u8; 512];
+    private distanceBase: [u16; 30];
+    private distanceExtra: [u8; 30];
+    private distanceBits: [u8; 30];
+
+    public fn create() -> Result<Deflater, AllocError> {
+        var head = Vector<u32>.create();
+        head.resize(WINDOW, 0)?;
+        var prev = Vector<u32>.create();
+        prev.resize(WINDOW, 0)?;
+        var literal = [0u16; 256];
+        for (i in 0..256) {
+            let symbol = truncate<u32>(i);
+            literal[i] = truncate<u16>(
+                if (i < 144) reversed(0x30 + symbol, 8) else reversed(0x190 + (symbol - 144), 9),
+            );
+        }
+        // Lengths (§3.2.5): codes 257 to 284 cover 3 to 257 with 0 to 5 extra bits, and 285 is 258.
+        var lengthBits = [0u16; 256];
+        var lengthCount = [0u8; 256];
+        var from: usize = 3;
+        for (code in 0..28) {
+            let extra: u32 = if (code < 8) 0 else truncate<u32>(code - 4) >> 2;
+            let span: usize = 1usize << extra;
+            let symbol = truncate<u32>(code) + 257;
+            let bits: u32 = if (symbol < 280) 7 else 8;
+            let coded = if (symbol < 280) reversed(symbol - 256, 7) else reversed(0xC0 + (symbol - 280), 8);
+            for (k in 0..span) {
+                if (from + k < MAX_MATCH) {
+                    lengthBits[from + k - 3] = truncate<u16>(coded | (truncate<u32>(k) << bits));
+                    lengthCount[from + k - 3] = truncate<u8>(bits + extra);
+                }
+            }
+            from += span;
+        }
+        lengthBits[MAX_MATCH - 3] = truncate<u16>(reversed(0xC0 + 5, 8));
+        lengthCount[MAX_MATCH - 3] = 8;
+        // Distances: 30 codes of 5 bits, with 0 to 13 extra bits.
+        var distanceCode = [0u8; 512];
+        var distanceBase = [0u16; 30];
+        var distanceExtra = [0u8; 30];
+        var distanceBits = [0u8; 30];
+        var low: usize = 0; // the code's first distance, less 1
+        for (code in 0..30) {
+            let extra: u32 = if (code < 4) 0 else truncate<u32>((code - 2) >> 1);
+            let span: usize = 1usize << extra;
+            distanceBase[code] = truncate<u16>(low + 1);
+            distanceExtra[code] = truncate<u8>(extra);
+            distanceBits[code] = truncate<u8>(reversed(truncate<u32>(code), 5));
+            if (low < 256) {
+                for (d in low..low + span) {
+                    distanceCode[d] = truncate<u8>(code);
+                }
+            } else {
+                for (d in (low >> 7)..((low + span) >> 7)) {
+                    distanceCode[256 + d] = truncate<u8>(code);
+                }
+            }
+            low += span;
+        }
+        return Ok(Deflater {
+            head: head,
+            prev: prev,
+            base: 0,
+            literal: literal,
+            lengthBits: lengthBits,
+            lengthCount: lengthCount,
+            distanceCode: distanceCode,
+            distanceBase: distanceBase,
+            distanceExtra: distanceExtra,
+            distanceBits: distanceBits,
+        });
+    }
+
+    /// Appends `input` compressed to `out` as permessage-deflate sends a message (RFC 7692 §7.2.1): a block that is
+    /// not the last, then an empty stored block without its last four bytes (`00 00 ff ff`), which the reader puts
+    /// back. The result ends on a byte.
+    public fn message(borrow mut this, input: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+        // At most 9 bits for a byte, and a little for the ends.
+        out.reserve(input.length + input.length / 8 + 16)?;
+        var acc: u64 = 2; // not the last block, fixed codes: bits 0, then 1 and 0
+        var used: u32 = 3;
+        var at: usize = 0;
+        while (at < input.length) {
+            var n = input.length - at;
+            if (n > MAX_PIECE) {
+                n = MAX_PIECE;
+            }
+            this.piece(input[at..at + n], mut out, mut acc, mut used)?;
+            at += n;
+        }
+        // The end of the block (seven zero bits), the stored block's three, and zeros up to a byte.
+        used += 10;
+        while (used > 0) {
+            out.push(truncate<u8>(acc))?;
+            acc >>= 8;
+            used = if (used > 8) used - 8 else 0;
+        }
+        return Ok();
+    }
+
+    /// The literals and matches of `input` onto the bits in `acc`.
+    fn piece(
+        borrow mut this,
+        input: Slice<u8>,
+        out: borrow mut Vector<u8>,
+        acc: borrow mut u64,
+        used: borrow mut u32,
+    ) -> Result<void, AllocError> {
+        let n = input.length;
+        // The places of earlier inputs are at or below `base`; when the numbers run out the tables start again.
+        if (this.base as u64 + n as u64 + 1 > 0xFFFFFFFF) {
+            for (i in 0..this.head.length) {
+                this.head[i] = 0;
+            }
+            this.base = 0;
+        }
+        let base = this.base;
+        var i: usize = 0;
+        while (i < n) {
+            var best: usize = 0;
+            var distance: usize = 0;
+            if (i + MIN_MATCH <= n) {
+                let h = hash(input, i);
+                let limit = if (n - i < MAX_MATCH) n - i else MAX_MATCH;
+                var candidate = this.head[h];
+                var chain = MAX_CHAIN;
+                while (candidate > base && chain > 0) {
+                    let p = (candidate - base - 1) as usize;
+                    if (i - p > WINDOW) {
+                        break;
+                    }
+                    // A longer match must agree at the place where the best one so far ended.
+                    if (input[p + best] == input[i + best]) {
+                        var length: usize = 0;
+                        while (length < limit && input[p + length] == input[i + length]) {
+                            length += 1;
+                        }
+                        if (length > best) {
+                            best = length;
+                            distance = i - p;
+                            if (length >= limit || length >= NICE_MATCH) {
+                                break;
+                            }
+                        }
+                    }
+                    let next = this.prev[p & WINDOW_MASK];
+                    if (next >= candidate) {
+                        break; // the chain's end: what is there was written for a later place
+                    }
+                    candidate = next;
+                    chain -= 1;
+                }
+                this.prev[i & WINDOW_MASK] = this.head[h];
+                this.head[h] = base + truncate<u32>(i) + 1;
+            }
+            if (best >= MIN_MATCH) {
+                let d = distance - 1;
+                let code = (if (d < 256) this.distanceCode[d] else this.distanceCode[256 + (d >> 7)]) as usize;
+                var count = this.lengthCount[best - MIN_MATCH] as u32;
+                *acc |= (this.lengthBits[best - MIN_MATCH] as u64) << *used;
+                *used += count;
+                *acc |= (this.distanceBits[code] as u64) << *used;
+                *used += 5;
+                count = this.distanceExtra[code] as u32;
+                *acc |= ((distance - this.distanceBase[code] as usize) as u64) << *used;
+                *used += count;
+                // The places the match covers are remembered too, for the matches after it.
+                var j = i + 1;
+                let end = i + best;
+                while (j < end && j + MIN_MATCH <= n) {
+                    let h = hash(input, j);
+                    this.prev[j & WINDOW_MASK] = this.head[h];
+                    this.head[h] = base + truncate<u32>(j) + 1;
+                    j += 1;
+                }
+                i = end;
+            } else {
+                let b = input[i];
+                *acc |= (this.literal[b as usize] as u64) << *used;
+                *used += if (b < 144) 8 else 9;
+                i += 1;
+            }
+            // At most 31 bits were added to at most 31.
+            if (*used >= 32) {
+                var four = [0u8; 4];
+                four.writeLE(0, truncate<u32>(*acc));
+                out.extend(four[..])?;
+                *acc >>= 32;
+                *used -= 32;
+            }
+        }
+        this.base = base + truncate<u32>(n);
+        return Ok();
+    }
+}
+
+/// The hash of the three bytes at `input[at]`: 15 bits.
+fn hash(input: Slice<u8>, at: usize) -> usize {
+    let v = (input[at] as u64) | ((input[at + 1] as u64) << 8) | ((input[at + 2] as u64) << 16);
+    return truncate<usize>(((v * 2654435761) >> 17) & 32767);
+}

@@ -1,0 +1,220 @@
+// Sessions kept in a signed cookie, and protection against cross-site request forgery.
+//
+// Both rest on one thing: a value the server signed with HMAC-SHA-256 and a secret only it knows, which the browser
+// brings back and cannot alter. Nothing is stored on the server, so there is no table to fill or to share between
+// worker processes, and no session id for an attacker to choose.
+import web_core;
+import web_http;
+import httpserver;
+import sha256;
+import encoding;
+
+/// `payload` sealed with `secret`, appended to `out`: its base64url, a dot, and the base64url of the HMAC of that
+/// text.
+fn seal(secret: Slice<u8>, payload: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    let start = out.length;
+    Base64.encodeUrl(payload, out)?;
+    let mac = HmacSha256.mac(secret, out.view()[start..]);
+    out.push(46)?;
+    return Base64.encodeUrl(mac[..], out);
+}
+
+/// The payload of `value` if `secret` sealed it, appended to `out`; false if it is not such a value.
+fn unseal(secret: Slice<u8>, value: Slice<u8>, out: borrow mut Vector<u8>) -> bool {
+    var dot = value.length;
+    for (i in 0..value.length) {
+        if (value[i] == 46) {
+            dot = i;
+            break;
+        }
+    }
+    if (dot == value.length) {
+        return false;
+    }
+    var mac = Vector<u8>.create();
+    if (Base64.decodeUrl(value[dot + 1..], mut mac).isErr()) {
+        return false;
+    }
+    let expected = HmacSha256.mac(secret, value[0..dot]);
+    if (!constantTimeEqual(expected[..], mac.view())) {
+        return false;
+    }
+    return Base64.decodeUrl(value[0..dot], out).isOk();
+}
+
+/// A session: some bytes of the application's (a user id, a small JSON object) kept in a cookie the server signed.
+/// The browser can read them (they are not encrypted) but cannot change them. A handler reads with `read` and
+/// writes with `write`; a session ends when its time is up or with `clear`.
+public struct Sessions {
+    private secret: Vector<u8>;
+    private name: String;
+    private maxAge: u32;
+    private secure: bool;
+
+    /// Sessions signed with `secret` (32 random bytes or more, the same for every worker and every restart) in the
+    /// cookie `name`, that last `maxAgeSeconds` from each `write`. With `secure`, the cookie is sent over HTTPS only.
+    public fn create(
+        secret: Slice<u8>,
+        name: StringView,
+        maxAgeSeconds: u32,
+        secure: bool,
+    ) -> Result<Sessions, AllocError> {
+        var s = Sessions { secret: Vector<u8>.create(), name: String.create(), maxAge: maxAgeSeconds, secure: secure };
+        copied(mut s.secret, secret)?;
+        s.name.append(name)?;
+        return Ok(s);
+    }
+
+    /// The most bytes a session may hold: what leaves the cookie under the 4096 bytes browsers keep.
+    public fn maxBytes() -> usize => 2048;
+
+    /// The request's session into `out` (cleared first), if it has one that this server signed and whose time is
+    /// not up at `nowSeconds` (Unix time: `Clock.now().seconds`).
+    public fn read(borrow this, request: borrow Request, nowSeconds: i64, out: borrow mut Vector<u8>) -> bool {
+        out.clear();
+        let value = Cookies.get(request, this.name.view()) ?? { return false; };
+        var payload = Vector<u8>.create();
+        if (!unseal(this.secret.view(), value, mut payload) || payload.length < 8) {
+            return false;
+        }
+        var expiry: u64 = 0;
+        for (i in 0..8usize) {
+            expiry = (expiry << 8) | payload[i] as u64;
+        }
+        if (nowSeconds < 0 || truncate<u64>(nowSeconds) >= expiry) {
+            return false;
+        }
+        for (i in 8..payload.length) {
+            match (out.push(payload[i])) {
+                Ok() => {}
+                Err(_) => {
+                    out.clear();
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    /// Sets the session to `data`, good for the session's time from `nowSeconds`. `Err(HandlerError.Internal)` if
+    /// `data` is longer than `maxBytes()`.
+    public fn write(
+        borrow this,
+        exchange: borrow mut Exchange,
+        data: Slice<u8>,
+        nowSeconds: i64,
+    ) -> Result<void, HandlerError> {
+        if (data.length > Sessions.maxBytes() || nowSeconds < 0) {
+            return Err(HandlerError.Internal);
+        }
+        let expiry = truncate<u64>(nowSeconds) + this.maxAge as u64;
+        var payload = Vector<u8>.create();
+        var value = Vector<u8>.create();
+        var ok = true;
+        for (i in 0..8u64) {
+            ok = ok && payload.push(truncate<u8>(expiry >> (56 - i * 8))).isOk();
+        }
+        ok = ok && copied(mut payload, data).isOk() && seal(this.secret.view(), payload.view(), mut value).isOk();
+        if (!ok) {
+            return Err(HandlerError.Internal);
+        }
+        var cookie = SetCookie.create(this.name.view(), value.view()).withMaxAge(this.maxAge);
+        if (this.secure) {
+            cookie = cookie.withSecure();
+        }
+        return cookie.write(exchange);
+    }
+
+    /// Ends the session: the browser drops the cookie.
+    public fn clear(borrow this, exchange: borrow mut Exchange) -> Result<void, HandlerError> {
+        var cookie = SetCookie.create(this.name.view(), "".bytes()).withMaxAge(0);
+        if (this.secure) {
+            cookie = cookie.withSecure();
+        }
+        return cookie.write(exchange);
+    }
+}
+
+/// Protection against cross-site request forgery, by a token the page must send twice (the signed double-submit
+/// cookie). A request that only reads (GET, HEAD, OPTIONS) gets the token in the cookie `csrf` if it has none; every
+/// other request must carry the same token in the header `x-csrf-token`, or is answered 403. Another site can make
+/// the browser send the cookie, but cannot read it to fill the header, and cannot make a token this server would
+/// have signed. For what runs after, the token is left as `"csrf"`, for a page to put in its forms' scripts.
+public struct Csrf {
+    private secret: Vector<u8>;
+    private secure: bool;
+
+    /// Tokens signed with `secret`; with `secure`, the cookie is sent over HTTPS only.
+    public fn create(secret: Slice<u8>, secure: bool) -> Result<Csrf, AllocError> {
+        var c = Csrf { secret: Vector<u8>.create(), secure: secure };
+        copied(mut c.secret, secret)?;
+        return Ok(c);
+    }
+
+    /// Whether this server made `token`.
+    fn made(borrow this, token: Slice<u8>) -> bool {
+        var nonce = Vector<u8>.create();
+        return unseal(this.secret.view(), token, mut nonce) && nonce.length == 16;
+    }
+}
+
+impl Filter for Csrf {
+    async fn before(
+        borrow this,
+        scope: borrow mut Scope,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<Flow, HandlerError> {
+        let cookie = Cookies.get(request, "csrf");
+        let known = match (cookie) {
+            Some(c) => this.made(c),
+            null => false,
+        };
+        let reads = match (request.method()) {
+            Method.Get => true,
+            Method.Head => true,
+            Method.Options => true,
+            _ => false,
+        };
+        if (reads) {
+            if (known) {
+                let token = cookie ?? "".bytes();
+                if (!scope.put("csrf", token)) {
+                    return Err(HandlerError.Internal);
+                }
+                return Ok(Flow.Continue);
+            }
+            var nonce = [0u8; 16];
+            match (Random.fill(mut nonce[..])) {
+                Ok() => {}
+                Err(_) => { return Err(HandlerError.Internal); }
+            }
+            var token = Vector<u8>.create();
+            match (seal(this.secret.view(), nonce[..], mut token)) {
+                Ok() => {}
+                Err(_) => { return Err(HandlerError.Internal); }
+            }
+            // The page's script reads the cookie to fill the header, so it is not HttpOnly.
+            var set = SetCookie.create("csrf", token.view()).withScriptAccess().withSameSite(SameSite.Strict);
+            if (this.secure) {
+                set = set.withSecure();
+            }
+            set.write(exchange)?;
+            if (!scope.put("csrf", token.view())) {
+                return Err(HandlerError.Internal);
+            }
+            return Ok(Flow.Continue);
+        }
+        let sent = request.headers().getNamed("x-csrf-token") ?? "".bytes();
+        let held = cookie ?? "".bytes();
+        if (known && constantTimeEqual(sent, held)) {
+            return Ok(Flow.Continue);
+        }
+        let status = StatusCode.of(403) ?? { return Err(HandlerError.Internal); };
+        await Reply.problem(exchange, status, "", "the request carries no valid CSRF token")?;
+        return Ok(Flow.Responded);
+    }
+
+    async fn after(borrow this, request: borrow Request, head: borrow mut ResponseHead) -> Result<void, HandlerError> =>
+        Ok();
+}

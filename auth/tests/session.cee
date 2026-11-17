@@ -1,0 +1,182 @@
+// Sessions in a signed cookie and the CSRF filter, through an application on mock connections. The sealed values
+// expected here were made with Python's hmac, hashlib and base64, not with this package.
+import web_core;
+import web_transport;
+import web_http;
+import httpserver;
+
+fn secret() -> StringView => "0123456789abcdef0123456789abcdef";
+
+/// `/login` starts a session for "kim" at second 1000; anything else answers who the session is for at `now`.
+struct Sess {
+    sessions: Sessions;
+    now: i64;
+}
+
+impl Handler<St> for Sess {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut Context<St>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        if (request.path() == "/login") {
+            this.sessions.write(exchange, "kim".bytes(), 1000)?;
+            return await exchange.send(Status.ok(), "in".bytes());
+        }
+        if (request.path() == "/logout") {
+            this.sessions.clear(exchange)?;
+            return await exchange.send(Status.ok(), "out".bytes());
+        }
+        var who = Vector<u8>.create();
+        if (!this.sessions.read(request, this.now, mut who)) {
+            return await exchange.send(Status.ok(), "-".bytes());
+        }
+        return await exchange.send(Status.ok(), who.view());
+    }
+}
+
+fn sess(now: i64) -> Result<Box<dyn Handler<St> + Send + Share>, TestFailure> {
+    let h: Box<dyn Handler<St> + Send + Share> =
+        alloc(Box.create(Sess { sessions: alloc(Sessions.create(secret().bytes(), "sid", 3600, true))?, now: now }))?;
+    return Ok(h);
+}
+
+fn quietApp() -> Result<App<St>, TestFailure> {
+    var limits = Limits.defaults();
+    limits.sendDate = false;
+    return routed(App<St>.create(St {}, limits));
+}
+
+async fn answer(a: borrow App<St>, request: StringView, expected: StringView) -> Result<void, TestFailure> {
+    let got = await served(a, request.bytes())?;
+    return Check.equalBytes(expected.bytes(), got.view());
+}
+
+@test
+async fn sessionsInASignedCookie() -> Result<void, TestFailure> {
+    var a = quietApp()?;
+    routed(a.post("/login", sess(0)?))?;
+    routed(a.post("/logout", sess(0)?))?;
+    routed(a.get("/soon", sess(4599)?))?;
+    routed(a.get("/late", sess(4600)?))?;
+    // The cookie holds the expiry (1000 + 3600, eight bytes) and "kim", and their HMAC.
+    await answer(
+        a,
+        "POST /login HTTP/1.1\r\nhost: a\r\ncontent-length: 0\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nset-cookie: sid=AAAAAAAAEfhraW0._fayMSrJt8S4cQtZzF3SVsRpM3bWzUcGisha9v5CqwY; Path=/; Max-Age=3600; Secure; HttpOnly; SameSite=Lax\r\ncontent-length: 2\r\n\r\nin",
+    )?;
+    await answer(
+        a,
+        "GET /soon HTTP/1.1\r\nhost: a\r\ncookie: sid=AAAAAAAAEfhraW0._fayMSrJt8S4cQtZzF3SVsRpM3bWzUcGisha9v5CqwY\r\n\r\n",
+        "HTTP/1.1 200 OK\r\ncontent-length: 3\r\n\r\nkim",
+    )?;
+    // Its time is up at the expiry.
+    await answer(
+        a,
+        "GET /late HTTP/1.1\r\nhost: a\r\ncookie: sid=AAAAAAAAEfhraW0._fayMSrJt8S4cQtZzF3SVsRpM3bWzUcGisha9v5CqwY\r\n\r\n",
+        "HTTP/1.1 200 OK\r\ncontent-length: 1\r\n\r\n-",
+    )?;
+    // The payload changed to "kin" (the last character), the signature kept: not this server's.
+    await answer(
+        a,
+        "GET /soon HTTP/1.1\r\nhost: a\r\ncookie: sid=AAAAAAAAEfhraW4._fayMSrJt8S4cQtZzF3SVsRpM3bWzUcGisha9v5CqwY\r\n\r\n",
+        "HTTP/1.1 200 OK\r\ncontent-length: 1\r\n\r\n-",
+    )?;
+    await answer(a, "GET /soon HTTP/1.1\r\nhost: a\r\ncookie: sid=abc\r\n\r\n", "HTTP/1.1 200 OK\r\ncontent-length: 1\r\n\r\n-")?;
+    await answer(a, "GET /soon HTTP/1.1\r\nhost: a\r\n\r\n", "HTTP/1.1 200 OK\r\ncontent-length: 1\r\n\r\n-")?;
+    await answer(
+        a,
+        "POST /logout HTTP/1.1\r\nhost: a\r\ncontent-length: 0\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nset-cookie: sid=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Lax\r\ncontent-length: 3\r\n\r\nout",
+    )?;
+    return Ok();
+}
+
+/// Answers the token the filter left.
+struct Form {}
+
+impl Handler<St> for Form {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut Context<St>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        let token = ctx.value("csrf") ?? "-".bytes();
+        return await exchange.send(Status.ok(), token);
+    }
+}
+
+/// `text` with every `$` replaced by `token`.
+fn with(text: StringView, token: Slice<u8>) -> Result<Vector<u8>, TestFailure> {
+    var out = Vector<u8>.create();
+    for (b in text.bytes()) {
+        if (b == 36) {
+            for (t in token) {
+                alloc(out.push(t))?;
+            }
+        } else {
+            alloc(out.push(b))?;
+        }
+    }
+    return Ok(out);
+}
+
+@test
+async fn theCsrfFilter() -> Result<void, TestFailure> {
+    var a = quietApp()?;
+    let csrf: Box<dyn Filter + Send + Share> = alloc(Box.create(alloc(Csrf.create(secret().bytes(), false))?))?;
+    routed(a.filter(csrf))?;
+    let get: Box<dyn Handler<St> + Send + Share> = alloc(Box.create(Form {}))?;
+    routed(a.get("/form", get))?;
+    let post: Box<dyn Handler<St> + Send + Share> = alloc(Box.create(Form {}))?;
+    routed(a.post("/form", post))?;
+
+    // A first visit gets a token: 16 random bytes and their HMAC, which is 22 + 1 + 43 characters.
+    let first = await served(a, "GET /form HTTP/1.1\r\nhost: a\r\n\r\n".bytes())?;
+    let head = "HTTP/1.1 200 OK\r\nset-cookie: csrf=".bytes();
+    Check.isTrue(first.length > head.length + 66, "a response with a token")?;
+    Check.equalBytes(head, first.view()[0..head.length])?;
+    let token = first.view()[head.length..head.length + 66];
+    let rest = with("; Path=/; SameSite=Strict\r\ncontent-length: 66\r\n\r\n$", token)?;
+    Check.equalBytes(rest.view(), first.view()[head.length + 66..])?;
+    Check.isTrue(token[22] == 46, "the dot between the two parts")?;
+
+    // With the token the browser holds, a visit sets nothing and a POST that repeats it in the header goes through.
+    let again = await served(a, with("GET /form HTTP/1.1\r\nhost: a\r\ncookie: csrf=$\r\n\r\n", token)?.view())?;
+    Check.equalBytes(with("HTTP/1.1 200 OK\r\ncontent-length: 66\r\n\r\n$", token)?.view(), again.view())?;
+    let posted = await served(
+        a,
+        with("POST /form HTTP/1.1\r\nhost: a\r\ncookie: csrf=$\r\nx-csrf-token: $\r\ncontent-length: 0\r\n\r\n", token)?.view(),
+    )?;
+    Check.equalBytes("HTTP/1.1 200 OK\r\ncontent-length: 1\r\n\r\n-".bytes(), posted.view())?;
+
+    // What another site can do: make the browser send the cookie, without the header.
+    let refusal = "HTTP/1.1 403 Forbidden\r\ncontent-type: application/problem+json\r\ncontent-length: 106\r\n\r\n{\"type\":\"about:blank\",\"title\":\"Forbidden\",\"status\":403,\"detail\":\"the request carries no valid CSRF token\"}";
+    let forged = await served(
+        a,
+        with("POST /form HTTP/1.1\r\nhost: a\r\ncookie: csrf=$\r\ncontent-length: 0\r\n\r\n", token)?.view(),
+    )?;
+    Check.equalBytes(refusal.bytes(), forged.view())?;
+    // Nothing at all, and a header that is not the cookie.
+    await answer(a, "POST /form HTTP/1.1\r\nhost: a\r\ncontent-length: 0\r\n\r\n", refusal)?;
+    let other = await served(
+        a,
+        with("POST /form HTTP/1.1\r\nhost: a\r\ncookie: csrf=$\r\nx-csrf-token: abc\r\ncontent-length: 0\r\n\r\n", token)?.view(),
+    )?;
+    Check.equalBytes(refusal.bytes(), other.view())?;
+    // A token sealed with another secret, the same in the cookie and the header: not this server's.
+    await answer(
+        a,
+        "POST /form HTTP/1.1\r\nhost: a\r\ncookie: csrf=AAAAAAAAAAAAAAAAAAAAAA.ByZVFWJHKH53yYhCH0eKKdEJEldtgY6-0qjHg_dP-F4\r\nx-csrf-token: AAAAAAAAAAAAAAAAAAAAAA.ByZVFWJHKH53yYhCH0eKKdEJEldtgY6-0qjHg_dP-F4\r\ncontent-length: 0\r\n\r\n",
+        refusal,
+    )?;
+    // The same nonce sealed with this server's secret is.
+    await answer(
+        a,
+        "POST /form HTTP/1.1\r\nhost: a\r\ncookie: csrf=AAAAAAAAAAAAAAAAAAAAAA.qINTmXDVf-vQrBTLenbfEi7qNPxIdWl1OWKgj8ZNcc0\r\nx-csrf-token: AAAAAAAAAAAAAAAAAAAAAA.qINTmXDVf-vQrBTLenbfEi7qNPxIdWl1OWKgj8ZNcc0\r\ncontent-length: 0\r\n\r\n",
+        "HTTP/1.1 200 OK\r\ncontent-length: 1\r\n\r\n-",
+    )?;
+    return Ok();
+}

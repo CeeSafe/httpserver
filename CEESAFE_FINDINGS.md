@@ -14,6 +14,7 @@ Bugs and gaps in CeeSafe and CeeSafe.Web met while writing httpserver, with cees
 | S7 | A struct without type parameters cannot implement a generic interface for every argument (`impl<S> Middleware<S> for Cors`) | ceesafec (N0267) | a second interface without the parameter (`Filter`) |
 | S8 | A connection does not say whether it came over TLS | CeeSafe.Web | `HttpsRedirect` redirects everything; the application on the plain port uses it |
 | S9 | `Application.beforeHead` gets the request and the head, not the handler's context | CeeSafe.Web | a group's middleware has no `after`; a response cannot be timed from one hook |
+| S10 | Nothing can change a response's body after the handler sends it | CeeSafe.Web | compression is a call the handler makes (`Compression.send`), not a middleware |
 
 ## S1: a nested `if` expression's literals are `i32`
 
@@ -112,3 +113,10 @@ matched route, its group, what middleware left in the context, or when the reque
 the application's only (a group's would need the route looked up again), and an access log cannot give a
 request's duration from `before` and `after` alone. Wanted: the `Exchange` (or a slot in it the application owns)
 passed to `beforeHead`.
+
+## S10: no hook on the response body
+
+`Exchange.send` and `write` go to the connection; `beforeHead` can add fields, not replace the body. Compression,
+an output cache and a response logger are therefore not middleware in httpserver: a handler that wants its body
+compressed answers through `Compression.send`. Wanted: a body filter an application can put between the handler's
+writes and the connection.

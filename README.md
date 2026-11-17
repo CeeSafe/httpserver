@@ -60,6 +60,13 @@ impl Handler<Shop> for Item {
 - **Tokens** (`auth/`, the package `httpserver_auth`, on CeeSafeLibs' sha256, encoding and json): `JwtVerifier` for
   HS256 tokens (`exp`, `nbf`, issuer, audience, leeway; `alg: none` and every other algorithm refused), `Jwt.signHs256`,
   and `BearerAuth`, which answers 401 with `WWW-Authenticate` or leaves the token's `sub` and claims for the handler.
+- **Sessions and CSRF** (`auth/`): `Sessions` keeps a session's bytes in a cookie the server signed (HMAC-SHA-256),
+  so nothing is stored, nothing is shared between workers, and there is no session id to fix; `Csrf` is the signed
+  double-submit token: a cookie on the first visit, and 403 for a request that changes something without the same
+  token in `x-csrf-token`.
+- **Compression.** `Compression.send` answers with gzip when the request accepts it, the body is not small and gzip
+  makes it smaller, and marks such responses `vary: accept-encoding`. The encoder uses fixed Huffman codes: JSON-like
+  text comes out at about a sixth of its size. `tools/gzip_check.py` checks it against Python's gzip.
 - **Replies.** `Reply.text`, `html`, `json`, `bytes`, `empty`, `redirect` and `problem` (RFC 9457).
 - **The query.** `Query.raw`, `Query.value` (decoded) and `Query.number`.
 - **HTTP/1.1 and HTTP/2** on one port: `h2` by ALPN over TLS (`web_tls`'s acceptor), or by its preface in clear.
@@ -97,8 +104,7 @@ still answering.
 
 ## What is not here yet
 
-Of CosmoApiServer: request timeouts, logging and tracing, compression, response and output caching, sessions, CSRF,
-tokens signed with RSA or Ed25519 and authorisation policies, multipart forms, static files, WebSocket hubs, the
+Of CosmoApiServer: request timeouts, logging and tracing, Brotli, response and output caching, tokens signed with RSA or Ed25519 and authorisation policies, multipart forms, static files, WebSocket hubs, the
 scheduler. The rate limit counts in one process: under the supervisor, each worker has its own counters. Not planned: reflection controllers and
 dependency injection (handlers are structs), Razor and Blazor, the front-end development helpers, SignalR's wire
 protocol; gRPC and OpenAPI unless asked for.
@@ -151,6 +157,7 @@ ceesafec test --cflag -fsanitize=address,undefined
 (cd auth && ceesafec test)
 (cd bench && ceesafec build)      # then: python3 <CeeSafe.Web>/benchmarks/servers/conform.py --port 8090
 python3 tools/supervisor_check.py # the supervisor, against bench/out/bench
+python3 tools/gzip_check.py       # compressed responses, against Python's gzip
 ```
 
 The compiler: ceesafec 0.62.2 or later. The supervisor is POSIX only.

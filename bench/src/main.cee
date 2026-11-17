@@ -13,6 +13,7 @@
 //   GET  /worker         which worker process answered
 //   GET  /crash          traps (an index out of bounds), which ends the process
 //   GET  /spin           computes without end, which stops the event loop
+//   GET  /gz/{n:int}     n bytes of JSON-like text through `Compression`: gzip for a client that accepts it
 //   GET  /bloat          allocates until an allocation fails, then answers how many MiB it got
 //
 // CW_PROCS=n runs n worker processes under the supervisor (src/supervisor.cee), which starts a worker again when it
@@ -228,6 +229,48 @@ impl Handler<St> for Bloat {
     }
 }
 
+/// `n` bytes of text that reads like JSON: a few words in an order a generator gives, the same for the same `n`.
+struct Packed {
+    compression: Compression;
+}
+
+fn word(k: u32) -> StringView => match (k) {
+    0 => "\"status\":",
+    1 => "\"ok\",",
+    2 => "\"id\":",
+    3 => "\"name\":",
+    4 => "\"value\":",
+    5 => "true,",
+    6 => "false,",
+    _ => "null,",
+};
+
+impl Handler<St> for Packed {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut Context<St>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        let wanted = ctx.paramInt("n") ?? 0;
+        let n = if (wanted < 0 || wanted > 16777216) 0usize else truncate<usize>(wanted);
+        var body = Vector<u8>.create();
+        var x: u32 = 12345;
+        while (body.length < n) {
+            x = x.wrappingMul(1103515245).wrappingAdd(12345);
+            for (b in word((x >> 16) % 8).bytes()) {
+                if (body.length < n) {
+                    match (body.push(b)) {
+                        Ok() => {}
+                        Err(_) => { return Err(HandlerError.Internal); }
+                    }
+                }
+            }
+        }
+        return await this.compression.send(request, exchange, Status.ok(), "application/json", body.view());
+    }
+}
+
 /// A middleware that does nothing.
 struct Idle {}
 
@@ -336,6 +379,11 @@ fn application(worker: u32) -> Result<App<St>, RouteError> {
     app.get("/crash", handler(Box.create(Crash {}))?)?;
     app.get("/spin", handler(Box.create(Spin {}))?)?;
     app.get("/bloat", handler(Box.create(Bloat {}))?)?;
+    let compression = match (Compression.create(1024)) {
+        Ok(c) => c,
+        Err(_) => { return Err(RouteError.OutOfMemory); },
+    };
+    app.get("/gz/{n:int}", handler(Box.create(Packed { compression: compression }))?)?;
     app.get("/users/{id:int}", handler(Box.create(User {}))?)?;
     let api = app.group("/api")?;
     for (i in 0..setting("CW_HOOKS", 0)) {
