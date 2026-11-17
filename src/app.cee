@@ -23,9 +23,10 @@ struct Group {
 
 /// What an application tells of each request it has answered: `App.logTo`.
 public interface AccessLog {
-    /// One request. `status` is the response's, 0 if the connection failed before one was sent; `micros` is the
+    /// One request. `scope` has its connection and what the filters left (`"trace"`, `"user"`). `status` is the
+    /// response's, 0 if the connection failed before one was sent; `micros` is the
     /// time from the request's head to the handler's return, body included when the handler sent it whole.
-    async fn record(borrow this, request: borrow Request, connection: borrow ConnectionContext, status: u16, micros: u64);
+    async fn record(borrow this, request: borrow Request, scope: borrow Scope, status: u16, micros: u64);
 }
 
 /// An HTTP application whose state is `S`.
@@ -96,7 +97,7 @@ public struct App<S: Send + Share> {
     }
 
     /// Runs the application's middleware, then what `found` says: the route's group's middleware and its handler, or
-    /// the answer for a path without one.
+    /// the answer for a path without one; and tells the access log, setting `logged`.
     async fn dispatch(
         borrow this,
         found: RouteMatch,
@@ -104,14 +105,48 @@ public struct App<S: Send + Share> {
         request: borrow Request,
         exchange: borrow mut Exchange,
         connection: borrow ConnectionContext,
+        began: u64,
+        logged: borrow mut bool,
     ) -> Result<void, HandlerError> {
-        let path = request.path();
-        var ctx = Context<S>.create(this.appState, connection, this.routes, path, params);
+        var ctx = Context<S>.create(this.appState, connection, this.routes, request.path(), params);
+        let r: Result<void, HandlerError> = match (await this.before(found, mut ctx, request, exchange)) {
+            Err(e) => Err(e),
+            Ok(Flow.Responded) => Ok(),
+            Ok(Flow.Continue) => match (found) {
+                RouteMatch.Found(index) => await this.routes.handler(index).handle(mut ctx, request, exchange),
+                _ => await this.unrouted(found, request, exchange),
+            },
+        };
+        // A request that was cancelled (its time was up) still gets here, with whatever its handler made of the
+        // cancellation: `handle` tells the log of it, with the status the client gets.
+        if (AsyncControl<HandlerError>.checkpoint(HandlerError.Internal).isErr()) {
+            return r;
+        }
+        match (borrow this.log) {
+            Some(log) => {
+                logged = true;
+                let micros = (Clock.monotonicNanos() - began) / 1000;
+                await log.record(request, ctx.scope(), statusOf(exchange, r), micros);
+            }
+            null => {}
+        }
+        return r;
+    }
+
+    /// Runs the application's middleware, then that of the group of the route `found` names; whether one of them
+    /// answered.
+    async fn before(
+        borrow this,
+        found: RouteMatch,
+        ctx: borrow mut Context<S>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<Flow, HandlerError> {
         let everywhere = borrow this.groups[0].chain;
         for (i in 0..everywhere.length) {
             match (await this.enter(everywhere[i], mut ctx, request, exchange)?) {
                 Flow.Continue => {}
-                Flow.Responded => { return Ok(); }
+                Flow.Responded => { return Ok(Flow.Responded); }
             }
         }
         match (found) {
@@ -123,12 +158,24 @@ public struct App<S: Send + Share> {
                     for (i in 0..chain.length) {
                         match (await this.enter(chain[i], mut ctx, request, exchange)?) {
                             Flow.Continue => {}
-                            Flow.Responded => { return Ok(); }
+                            Flow.Responded => { return Ok(Flow.Responded); }
                         }
                     }
                 }
-                return await this.routes.handler(index).handle(mut ctx, request, exchange);
             }
+            _ => {}
+        }
+        return Ok(Flow.Continue);
+    }
+
+    /// The answer for a path without a route for the request's method.
+    async fn unrouted(
+        borrow this,
+        found: RouteMatch,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        match (found) {
             RouteMatch.MethodNotAllowed(mask) => {
                 let options = Methods.same(request.method(), Method.Options);
                 var text = [0u8; 96];
@@ -137,9 +184,9 @@ public struct App<S: Send + Share> {
                 let status = if (options) Status.noContent() else Status.methodNotAllowed();
                 return await exchange.send(status, "".bytes());
             }
-            RouteMatch.NotFound => {
+            _ => {
                 let options = Methods.same(request.method(), Method.Options);
-                let asterisk = Ascii.equals(path.bytes(), "*");
+                let asterisk = Ascii.equals(request.path().bytes(), "*");
                 let status = if (options && asterisk) Status.noContent() else Status.notFound();
                 return await exchange.send(status, "".bytes());
             }
@@ -426,6 +473,21 @@ fn prefixOf(bytes: Slice<u8>, whole: Slice<u8>) -> bool {
     return true;
 }
 
+/// The status an access log is told: the response's, or what the driver will answer for `r` if the handler sent
+/// none; 0 if the connection failed.
+fn statusOf(exchange: borrow Exchange, r: borrow Result<void, HandlerError>) -> u16 {
+    // A handler that returned has set the status, even where the head still waits in the buffer.
+    if (exchange.headSent()) {
+        return exchange.status().code();
+    }
+    return match (r) {
+        Ok() => exchange.status().code(),
+        Err(HandlerError.Status(code)) => code.code(),
+        Err(HandlerError.Internal) => 500,
+        Err(HandlerError.Io(_)) => 0,
+    };
+}
+
 impl<S: Send + Share> Application for App<S> {
     /// Routes the request, runs the application's middleware in order, then the route's group's, then the handler. A
     /// path with no route is 404; a path with routes but none for the method is 405 with `Allow`, or 204 with `Allow`
@@ -444,32 +506,29 @@ impl<S: Send + Share> Application for App<S> {
         };
         let ms = this.timeoutOf(group);
         let began = if (this.log.isSome()) Clock.monotonicNanos() else 0;
+        var logged = false;
         var r: Result<void, HandlerError> = Ok();
         if (ms == 0) {
-            r = await this.dispatch(found, params, request, exchange, connection);
+            r = await this.dispatch(found, params, request, exchange, connection, began, mut logged);
         } else {
             let late = StatusCode.of(504) ?? Status.notFound();
+            let told = borrow mut logged;
             r = await Async.timeout(
                 ms,
                 HandlerError.Status(late),
-                async () => await this.dispatch(found, params, request, exchange, connection),
+                async () => await this.dispatch(found, params, request, exchange, connection, began, told),
             );
         }
-        match (borrow this.log) {
-            Some(log) => {
-                // A handler that returned has set the status, even where the head still waits in the buffer.
-                var status = exchange.status().code();
-                if (!exchange.headSent()) {
-                    match (borrow r) {
-                        Ok() => {}
-                        Err(HandlerError.Status(code)) => { status = code.code(); }
-                        Err(HandlerError.Internal) => { status = 500; }
-                        Err(HandlerError.Io(_)) => { status = 0; }
-                    }
+        if (!logged) {
+            // Cancelled: what the filters had left went with the request.
+            match (borrow this.log) {
+                Some(log) => {
+                    let bare = Scope.bare(connection);
+                    let micros = (Clock.monotonicNanos() - began) / 1000;
+                    await log.record(request, bare, statusOf(exchange, r), micros);
                 }
-                await log.record(request, connection, status, (Clock.monotonicNanos() - began) / 1000);
+                null => {}
             }
-            null => {}
         }
         return r;
     }

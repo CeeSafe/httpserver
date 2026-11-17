@@ -18,6 +18,8 @@ Bugs and gaps in CeeSafe and CeeSafe.Web met while writing httpserver, with cees
 | S11 | `for (x in it)` over an iterator that is Copy walks a copy, and says nothing | ceesafec | `Multipart` is `@noncopy` |
 | S12 | A struct that holds a raw pointer is not Send or Share, and `@threadSafe` is for trusted packages only | ceesafec, by design | the address is kept as a `usize` and cast where it is used |
 | S13 | An array literal of borrows is refused with a message about the borrowed type not being Copy | ceesafec | the two calls are written out |
+| S14 | An async closure that captures a value holding borrows (`Context`) and a `borrow mut` parameter (`exchange`) is refused as if the first flowed into the second (N0272); so is a method that takes the context by `borrow mut` and calls a `dyn Handler` with it | ceesafec | the function that makes the context calls the handler, and the closure captures only the parameters |
+| S15 | A cancelled task's function runs on to its end, and cannot tell without asking (`AsyncControl<E>.checkpoint`) | runtime, by design | the dispatcher asks before it tells the access log |
 
 ## S1: a nested `if` expression's literals are `i32`
 
@@ -155,3 +157,34 @@ for (app in [borrow two, borrow one]) { ... }   // N0259: array elements must be
 
 A `borrow T` is Copy (§5), but the element type reported is the borrowed `App<St>`. Whether arrays of references
 are meant to be refused or not, the message names the wrong type. tests/filters.cee writes the two calls out.
+
+## S14: a closure over a context and the exchange
+
+```ceesafe
+async fn handle(borrow this, request: borrow Request, exchange: borrow mut Exchange, connection: borrow ConnectionContext) -> … {
+    var ctx = Context<S>.create(this.appState, connection, this.routes, request.path(), params);
+    r = await Async.timeout(ms, late, async () => await this.dispatch(found, mut ctx, request, exchange));
+    //  N0272: this stores a value borrowed from 'this' into what 'exchange' refers to, which outlives this call
+    await log.record(request, ctx.scope(), …);   // what the context was wanted for after the call
+}
+```
+
+`ctx` holds borrows of `this`; the closure's environment holds `ctx` and `exchange`, and the checker then reports
+that a borrow of `this` is stored into what `exchange` refers to, though nothing stores anything. With the closure
+in the function, the same call written without a closure a few lines above is reported too. A second form of the
+same refusal: a method `dispatch(borrow this, ctx: borrow mut Context<S>, …)` that calls
+`this.routes.handler(index).handle(mut ctx, request, exchange)` is N0272 ("a value borrowed from a temporary
+value into what 'ctx' refers to"), while the same call in the function that owns `ctx` is accepted. A region
+parameter on the method did not help, and `borrow(r) this` is not accepted in a method's parameters.
+
+So `App.dispatch` makes the context, calls the handler and tells the access log itself; the closure captures only
+`handle`'s parameters. The cost: a request that was cancelled is told to the log by `handle`, which has no context,
+so its log entry lacks what the filters left (the trace id).
+
+## S15: a cancelled task runs to its end
+
+When `Async.timeout`'s time is up the child is cancelled and awaited: its awaits return errors, and its function
+runs on with them. The dispatcher saw the handler return `Err(Internal)` (its `Timer.sleep` had failed) and told
+the access log 500 for a request the client got 504 for. Nothing in the result says "cancelled";
+`AsyncControl<HandlerError>.checkpoint(…)` does, and the dispatcher asks it before logging. (The call needs its
+type argument written: `AsyncControl.checkpoint(e)` is N0265, though `E` is the argument's type.)

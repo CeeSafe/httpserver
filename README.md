@@ -85,8 +85,9 @@ impl Handler<Shop> for Item {
   uploads, shorter for an API): a request whose middleware and handler have not returned is cancelled and answered
   504, or its connection is closed if part of the response had left. The time runs while a handler waits, not
   while it computes: one that never awaits is the supervisor's to stop.
-- **Access log.** `app.logTo(log)` tells an `AccessLog` of every request once it is answered (the request, the
-  connection, the status, the microseconds), a 404 or a timeout included. `ConsoleLog` writes a line a request to
+- **Access log.** `app.logTo(log)` tells an `AccessLog` of every request once it is answered (the request, its
+  scope with the connection and what the filters left, such as the trace id, the status, the microseconds), a 404
+  or a timeout included; a request that timed out comes without what the filters left. `ConsoleLog` writes a line a request to
   standard output; an application's own can count, sample, or write somewhere else.
 - **Trace context.** The filter `Trace` reads the caller's W3C `traceparent` or starts a trace, gives the request
   a span id of its own, and leaves `"trace"`, `"span"`, `"parent"` and `"traceparent"` (the header to send on) for

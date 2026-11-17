@@ -2,16 +2,22 @@
 import web_core;
 import web_http;
 
-/// Writes `GET /users/7 200 153us` for each request, the query left out (it may hold what should not be kept). A
+/// Writes `GET /users/7 200 153us` for each request (with ` trace=…` behind the `Trace` filter), the query left out (it may hold what should not be kept). A
 /// line is one write, so several workers' lines do not mix; each costs a system call, which a server that answers
 /// a hundred thousand requests a second will notice.
 public struct ConsoleLog {}
+
+/// ` trace=<id>` appended to `line`, if the scope has a trace.
+fn traced(line: borrow mut Vector<u8>, scope: borrow Scope) -> bool {
+    let id = scope.value("trace") ?? { return true; };
+    return put(line, " trace=".bytes()) && put(line, id);
+}
 
 impl AccessLog for ConsoleLog {
     async fn record(
         borrow this,
         request: borrow Request,
-        connection: borrow ConnectionContext,
+        scope: borrow Scope,
         status: u16,
         micros: u64,
     ) {
@@ -23,7 +29,8 @@ impl AccessLog for ConsoleLog {
             putDecimal(mut line, status as u64) &&
             put(mut line, " ".bytes()) &&
             putDecimal(mut line, micros) &&
-            put(mut line, "us".bytes());
+            put(mut line, "us".bytes()) &&
+            traced(mut line, scope);
         if (!ok) {
             return;
         }

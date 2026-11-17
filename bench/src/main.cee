@@ -541,7 +541,7 @@ impl AccessLog for Counted {
     async fn record(
         borrow this,
         request: borrow Request,
-        connection: borrow ConnectionContext,
+        scope: borrow Scope,
         status: u16,
         micros: u64,
     ) {

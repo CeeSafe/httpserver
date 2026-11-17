@@ -43,6 +43,10 @@ public struct Scope<region r> {
     private bytes: Vector<u8>;
     private items: Vector<Item>;
 
+    /// A scope with nothing left in it.
+    fn bare(connection: borrow(r) ConnectionContext<r>) -> Scope<r> =>
+        Scope { conn: connection, bytes: Vector<u8>.create(), items: Vector<Item>.create() };
+
     /// The connection: its id, addresses, age, and whether the server is draining.
     public fn connection(borrow this) -> borrow(r) ConnectionContext<r> => this.conn;
 

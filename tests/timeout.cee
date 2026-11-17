@@ -64,18 +64,25 @@ async fn wrote(app: borrow App<St>, text: StringView) -> Result<Vector<u8>, Test
 /// Appends each request's status as three digits to a number.
 struct Seen {
     statuses: Arc<AtomicU64>;
+    /// The lengths of the trace ids seen, added up.
+    traces: Arc<AtomicU64>;
 }
 
 impl AccessLog for Seen {
     async fn record(
         borrow this,
         request: borrow Request,
-        connection: borrow ConnectionContext,
+        scope: borrow Scope,
         status: u16,
         micros: u64,
     ) {
         let s = this.statuses.get();
         s.store(s.load() * 1000 + status as u64);
+        // What a filter left is there for the log, unless the request was cancelled.
+        match (scope.value("trace")) {
+            Some(id) => { this.traces.get().store(this.traces.get().load() + id.length as u64); }
+            null => {}
+        }
     }
 }
 
@@ -91,8 +98,12 @@ async fn requestsThatTakeTooLong() -> Result<void, TestFailure> {
     routed(a.routeIn(uploads, Method.Get, "/slow", slow(60, false, false)?))?;
     routed(a.routeIn(inner, Method.Get, "/slow", slow(60, false, false)?))?;
     let statuses = alloc(Arc<AtomicU64>.create(AtomicU64.create(0)))?;
-    let log: Box<dyn AccessLog + Send + Share> = alloc(Box.create(Seen { statuses: statuses.clone() }))?;
+    let traces = alloc(Arc<AtomicU64>.create(AtomicU64.create(0)))?;
+    let log: Box<dyn AccessLog + Send + Share> =
+        alloc(Box.create(Seen { statuses: statuses.clone(), traces: traces.clone() }))?;
     a.logTo(log);
+    let trace: Box<dyn Filter + Send + Share> = alloc(Box.create(Trace.create(false)))?;
+    routed(a.filter(trace))?;
 
     // No bound: the slow handler answers.
     let unbounded = await wrote(a, "GET /uploads/slow HTTP/1.1\r\nhost: a\r\n\r\n")?;
@@ -122,5 +133,8 @@ async fn requestsThatTakeTooLong() -> Result<void, TestFailure> {
     Check.equalBytes("HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n".bytes(), missing.view())?;
 
     // The response whose start was sent is told as it began: 200.
-    return Check.equalU64(200200504200404, statuses.get().load());
+    Check.equalU64(200200504200404, statuses.get().load())?;
+    // Eight requests in all; the three that were cancelled (the two 504s, and the one whose start was sent) come
+    // without what the filters left.
+    return Check.equalU64(5 * 32, traces.get().load());
 }
