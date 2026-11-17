@@ -1,0 +1,152 @@
+// Cron expressions and the scheduler. The times expected of `next` were worked out by a Python script that expands
+// each field into a set and steps a minute at a time with `datetime`, not by this package.
+import web_core;
+
+/// The next time of `expression` after `after` with `offset` seconds added to UTC; 0 if it is not an expression,
+/// 1 if it is never due.
+fn nextOf(expression: StringView, after: i64, offset: i32) -> u64 {
+    let cron = Cron.parse(expression) ?? { return 0; };
+    let zone = if (offset == 0) Zone.Utc else Zone.Fixed(offset);
+    let t = cron.next(after, zone) ?? { return 1; };
+    return truncate<u64>(t);
+}
+
+@test
+fn whenACronExpressionIsNext() -> Result<void, TestFailure> {
+    // 1700000000 is Tuesday 2023-11-14T22:13:20Z.
+    Check.equalU64(1700000040, nextOf("* * * * *", 1700000000, 0))?;
+    Check.equalU64(1700000100, nextOf("*/15 * * * *", 1700000000, 0))?;
+    Check.equalU64(1700038800, nextOf("0 9 * * mon-fri", 1700000000, 0))?;
+    Check.equalU64(1709173800, nextOf("30 2 29 2 *", 1700000000, 0))?; // the next 29 February
+    // Both days given: the 13th or a Friday, the 1st, the 15th or a Wednesday.
+    Check.equalU64(1700179200, nextOf("0 0 13 * fri", 1700000000, 0))?;
+    Check.equalU64(1700006400, nextOf("0 0 1,15 * 3", 1700000000, 0))?;
+    Check.equalU64(1700035500, nextOf("5/20 8-18/5 * * *", 1700000000, 0))?;
+    Check.equalU64(1700352000, nextOf("0 0 * * 7", 1700000000, 0))?; // 7 is Sunday
+    Check.equalU64(1704067140, nextOf("59 23 31 dec *", 1700000000, 0))?;
+    Check.equalU64(1704067200, nextOf("0 0 1 JAN *", 1700000000, 0))?;
+    Check.equalU64(1709359800, nextOf("10-40/5 6 * mar,sep sat,sun", 1700000000, 0))?;
+    Check.equalU64(1709294400, nextOf("0 12 */10 * *", 1709208000, 0))?; // from 29 February to 1 March
+    Check.equalU64(1710028800, nextOf("0 0 * * 0", 1709424000, 0))?; // from a Sunday's midnight to the next
+    // Nine in the morning at UTC+5:30, a quarter past midnight at UTC-5.
+    Check.equalU64(1700019000, nextOf("0 9 * * *", 1700000000, 19800))?;
+    Check.equalU64(1700025300, nextOf("15 0 * * *", 1700000000, -18000))?;
+    // The names for the common ones, and spaces to spare.
+    Check.equalU64(nextOf("0 * * * *", 1700000000, 0), nextOf("@hourly", 1700000000, 0))?;
+    Check.equalU64(nextOf("0 0 * * *", 1700000000, 0), nextOf("@daily", 1700000000, 0))?;
+    Check.equalU64(nextOf("0 0 * * 0", 1700000000, 0), nextOf("@weekly", 1700000000, 0))?;
+    Check.equalU64(nextOf("0 0 1 * *", 1700000000, 0), nextOf("@monthly", 1700000000, 0))?;
+    Check.equalU64(nextOf("0 0 1 1 *", 1700000000, 0), nextOf(" @yearly ", 1700000000, 0))?;
+    Check.equalU64(1700038800, nextOf("  0\t9   *  * 1-5 ", 1700000000, 0))?;
+    // A day no month has.
+    Check.equalU64(1, nextOf("0 0 31 2 *", 1700000000, 0))?;
+    Check.equalU64(1, nextOf("0 0 * * *", -5, 0))?;
+    return Ok();
+}
+
+@test
+fn whenACronExpressionIsDue() -> Result<void, TestFailure> {
+    let weekdays = Cron.parse("0 9 * * mon-fri") ?? { return Err(TestFailure.create("an expression")); };
+    Check.isTrue(weekdays.due(1700038800, Zone.Utc), "at nine on a Wednesday")?;
+    Check.isTrue(weekdays.due(1700038859, Zone.Utc), "to the end of that minute")?;
+    Check.isTrue(!weekdays.due(1700038860, Zone.Utc), "not the minute after")?;
+    Check.isTrue(!weekdays.due(1700038800 + 3 * 86400, Zone.Utc), "not on a Saturday")?;
+    Check.isTrue(weekdays.due(1700038800 - 19800, Zone.Fixed(19800)), "at nine at UTC+5:30")?;
+    return Ok();
+}
+
+@test
+fn whatIsNotACronExpression() -> Result<void, TestFailure> {
+    Check.equalU64(0, nextOf("", 1700000000, 0))?;
+    Check.equalU64(0, nextOf("* * * *", 1700000000, 0))?; // four fields
+    Check.equalU64(0, nextOf("* * * * * *", 1700000000, 0))?; // six
+    Check.equalU64(0, nextOf("60 * * * *", 1700000000, 0))?;
+    Check.equalU64(0, nextOf("* 24 * * *", 1700000000, 0))?;
+    Check.equalU64(0, nextOf("* * 0 * *", 1700000000, 0))?;
+    Check.equalU64(0, nextOf("* * * 13 *", 1700000000, 0))?;
+    Check.equalU64(0, nextOf("* * * * 8", 1700000000, 0))?;
+    Check.equalU64(0, nextOf("*/0 * * * *", 1700000000, 0))?;
+    Check.equalU64(0, nextOf("30-10 * * * *", 1700000000, 0))?;
+    Check.equalU64(0, nextOf("1,,2 * * * *", 1700000000, 0))?;
+    Check.equalU64(0, nextOf("1- * * * *", 1700000000, 0))?;
+    Check.equalU64(0, nextOf("a * * * *", 1700000000, 0))?;
+    Check.equalU64(0, nextOf("jan * * * *", 1700000000, 0))?; // a month's name where a minute goes
+    Check.equalU64(0, nextOf("* * * mon *", 1700000000, 0))?;
+    Check.equalU64(0, nextOf("* * * * -1", 1700000000, 0))?;
+    Check.equalU64(0, nextOf("@often", 1700000000, 0))?;
+    return Ok();
+}
+
+/// A job that succeeds, or fails, every time.
+struct Does {
+    fails: bool;
+}
+
+impl Job for Does {
+    async fn run(borrow this, at: i64) -> Result<void, JobError> {
+        if (this.fails) {
+            return Err(JobError.Failed);
+        }
+        return Ok();
+    }
+}
+
+fn does(fails: bool) -> Result<Box<dyn Job + Send + Share>, TestFailure> {
+    let j: Box<dyn Job + Send + Share> = alloc(Box.create(Does { fails: fails }))?;
+    return Ok(j);
+}
+
+fn added(r: Result<u32, ScheduleError>) -> Result<u32, TestFailure> {
+    match (r) {
+        Ok(id) => { return Ok(id); }
+        Err(_) => { return Err(TestFailure.create("a job was not added")); }
+    }
+}
+
+/// The runs, failures and last time of job `id`, or a failure.
+fn done(s: borrow Scheduler, id: u32, runs: u64, failures: u64, lastAt: u64) -> Result<void, TestFailure> {
+    let r = s.report(id) ?? { return Err(TestFailure.create("no such job")); };
+    Check.equalU64(runs, r.runs)?;
+    Check.equalU64(failures, r.failures)?;
+    return Check.equalU64(lastAt, truncate<u64>(r.lastAt));
+}
+
+@test
+async fn theSchedulerRunsWhatIsDue() -> Result<void, TestFailure> {
+    var s = Scheduler.create(Zone.Utc);
+    Check.isTrue(s.cron("every minute", does(false)?).isErr(), "not an expression")?;
+    Check.isTrue(s.every(0, does(false)?).isErr(), "no interval")?;
+    let minutely = added(s.cron("* * * * *", does(false)?))?;
+    let quarterly = added(s.cron("*/15 * * * *", does(true)?))?;
+    let tens = added(s.every(10, does(false)?))?;
+    Check.equalU64(3, s.count() as u64)?;
+    Check.isTrue(s.report(3).isNull(), "no fourth job")?;
+
+    // 1700000000 is 22:13:20: nothing is due in the minute the scheduler starts in.
+    Check.equalU64(0, await s.tick(1700000000, 5000) as u64)?;
+    Check.equalU64(0, await s.tick(1700000039, 14999) as u64)?;
+    // 22:14:00, and ten seconds on the monotonic clock.
+    Check.equalU64(2, await s.tick(1700000040, 15000) as u64)?;
+    done(s, minutely, 1, 0, 1700000040)?;
+    done(s, tens, 1, 0, 1700000040)?;
+    Check.equalU64(0, await s.tick(1700000041, 15001) as u64)?;
+    // 22:15:00: both cron jobs; the interval's next is at 25000.
+    Check.equalU64(2, await s.tick(1700000100, 24999) as u64)?;
+    done(s, minutely, 2, 0, 1700000100)?;
+    done(s, quarterly, 1, 1, 1700000100)?;
+    // Three minutes and many intervals missed (a long job, a suspended machine): each runs once, for the first
+    // time it missed, and then waits for its next.
+    Check.equalU64(2, await s.tick(1700000290, 90000) as u64)?;
+    done(s, minutely, 3, 0, 1700000160)?;
+    done(s, tens, 2, 0, 1700000290)?;
+    Check.equalU64(0, await s.tick(1700000291, 99999) as u64)?;
+    Check.equalU64(1, await s.tick(1700000299, 100000) as u64)?;
+    Check.equalU64(1, await s.tick(1700000340, 100001) as u64)?;
+    done(s, minutely, 4, 0, 1700000340)?;
+    // The system's clock set back an hour: the next minute is taken from the new time.
+    Check.equalU64(0, await s.tick(1699996740, 100002) as u64)?;
+    Check.equalU64(1, await s.tick(1699996800, 100003) as u64)?;
+    done(s, minutely, 5, 0, 1699996800)?;
+    done(s, quarterly, 1, 1, 1700000100)?;
+    return Ok();
+}

@@ -77,6 +77,12 @@ impl Handler<Shop> for Item {
   checks it against Python's gzip.
 - **Replies.** `Reply.text`, `html`, `json`, `bytes`, `empty`, `redirect` and `problem` (RFC 9457).
 - **The query.** `Query.raw`, `Query.value` (decoded) and `Query.number`.
+- **Scheduled jobs.** `Scheduler` runs a `Job` by a cron expression (`0 9 * * mon-fri`, `*/15 * * * *`, `@daily`;
+  on UTC, the system's time zone with its daylight saving, or a fixed offset) or every so many seconds. An
+  expression is parsed once into bit sets and asked for its next time, so an idle scheduler does one comparison a
+  job each second. Jobs run one at a time on the server's event loop; one that is late runs once, not once for each
+  time it missed. `jobs.run` is raced against the server as `tend` is, and stops running jobs when the drain
+  starts. Under the supervisor, start it in one worker (`worker.index() == 0`).
 - **HTTP/1.1 and HTTP/2** on one port: `h2` by ALPN over TLS (`web_tls`'s acceptor), or by its preface in clear.
   `applicationOf(app)` gives the same application to `web_http3`'s server.
 
@@ -112,7 +118,7 @@ still answering.
 
 ## What is not here yet
 
-Of CosmoApiServer: request timeouts, logging and tracing, response and output caching, the scheduler. The rate limit counts in one process: under the supervisor, each worker has its own counters. Not planned: reflection controllers and
+Of CosmoApiServer: request timeouts, logging and tracing, response and output caching. The rate limit counts in one process: under the supervisor, each worker has its own counters. Not planned: reflection controllers and
 dependency injection (handlers are structs), Razor and Blazor, the front-end development helpers, SignalR's wire
 protocol; gRPC and OpenAPI unless asked for.
 

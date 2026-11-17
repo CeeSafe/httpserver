@@ -1,0 +1,497 @@
+// Jobs that run on a schedule, beside the server and on its event loop.
+//
+// A job is due by a cron expression (five fields, the minute the smallest) or every so many seconds. A cron
+// expression is parsed once into bit sets, and the scheduler asks it for the next time it is due instead of testing
+// every job every second. Jobs run one at a time, in the order they were added: a job that is still running when it
+// is due again runs once more when it returns, not once for each time it missed.
+//
+// The event loop is the server's: a job that computes for long or blocks holds every connection of the process
+// meanwhile (the supervisor's heartbeat sees it). Under the supervisor every worker runs the program, so start the
+// scheduler in one of them (`worker.index() == 0`) unless a job is each worker's own housekeeping.
+import web_core;
+
+/// Whose clock a cron expression's fields are read on.
+public enum Zone {
+    /// UTC.
+    Utc,
+    /// The system's time zone, daylight saving included. A local time that a change of the clocks skips does not
+    /// come that day; one it repeats comes twice.
+    Local,
+    /// UTC plus so many seconds, the year round.
+    Fixed(i32),
+}
+
+/// The seconds to add to UTC at `t` in `zone`.
+fn offsetAt(zone: Zone, t: i64) -> i64 => match (zone) {
+    Zone.Utc => 0,
+    Zone.Local => Clock.localOffset(UnixTime { seconds: t, nanoseconds: 0 }) as i64,
+    Zone.Fixed(seconds) => seconds as i64,
+};
+
+/// The parts of a time that a cron expression reads.
+struct Civil {
+    month: u32;
+    day: u32;
+    weekday: u32;
+    hour: u32;
+    minute: u32;
+}
+
+/// The civil time `local` seconds after 1970-01-01T00:00 (not negative), in the proleptic Gregorian calendar.
+fn civil(local: i64) -> Civil {
+    let days = local / 86400;
+    let second = local % 86400;
+    // Days since 0000-03-01, in 400-year eras that start on a 1 March (Howard Hinnant's days-to-civil).
+    let z = days + 719468;
+    let era = z / 146097;
+    let dayOfEra = z - era * 146097;
+    let yearOfEra = (dayOfEra - dayOfEra / 1460 + dayOfEra / 36524 - dayOfEra / 146096) / 365;
+    let dayOfYear = dayOfEra - (365 * yearOfEra + yearOfEra / 4 - yearOfEra / 100);
+    let marchMonth = (5 * dayOfYear + 2) / 153;
+    let day = dayOfYear - (153 * marchMonth + 2) / 5 + 1;
+    let month = if (marchMonth < 10) marchMonth + 3 else marchMonth - 9;
+    return Civil {
+        month: truncate<u32>(month),
+        day: truncate<u32>(day),
+        weekday: truncate<u32>((days + 4) % 7), // 1970-01-01 was a Thursday
+        hour: truncate<u32>(second / 3600),
+        minute: truncate<u32>(second % 3600 / 60),
+    };
+}
+
+/// `text` without the spaces and tabs at its ends.
+fn trimmed(text: Slice<u8>) -> Slice<u8> {
+    var from: usize = 0;
+    var to = text.length;
+    while (from < to && (text[from] == 32 || text[from] == 9)) {
+        from += 1;
+    }
+    while (to > from && (text[to - 1] == 32 || text[to - 1] == 9)) {
+        to -= 1;
+    }
+    return text[from..to];
+}
+
+/// The number `text` is: decimal digits, or with `names` the first three letters of a month (1 to 12) or of a day
+/// of the week (Sunday 0), in either case.
+fn cronValue(text: Slice<u8>, names: StringView) -> u32? {
+    if (text.length == 0 || text.length > 3) {
+        return null;
+    }
+    var value: u32 = 0;
+    var digits = true;
+    for (b in text) {
+        if (b < 48 || b > 57) {
+            digits = false;
+            break;
+        }
+        value = value * 10 + (b - 48) as u32;
+    }
+    if (digits) {
+        return Some(value);
+    }
+    let known = names.bytes();
+    if (text.length != 3 || known.length == 0) {
+        return null;
+    }
+    let first: u32 = if (known.length == 36) 1 else 0;
+    var at: usize = 0;
+    while (at + 3 <= known.length) {
+        var same = true;
+        for (i in 0..3usize) {
+            same = same && (text[i] | 32) == known[at + i];
+        }
+        if (same) {
+            return Some(truncate<u32>(at / 3) + first);
+        }
+        at += 3;
+    }
+    return null;
+}
+
+/// The values one field allows, as a bit each: a list of `*`, `n`, `a-b`, each with an optional `/step` (`n/step`
+/// runs from n to the field's last value). Null if the field is not that or names a value outside `min..=max`.
+fn cronField(text: Slice<u8>, min: u32, max: u32, names: StringView) -> u64? {
+    var set: u64 = 0;
+    var from: usize = 0;
+    if (text.length == 0) {
+        return null;
+    }
+    loop {
+        var to = from;
+        while (to < text.length && text[to] != 44) {
+            to += 1;
+        }
+        let item = text[from..to];
+        var slash = item.length;
+        var dash = item.length;
+        for (i in 0..item.length) {
+            if (item[i] == 47 && slash == item.length) {
+                slash = i;
+            }
+            if (item[i] == 45 && dash == item.length) {
+                dash = i;
+            }
+        }
+        var step: u32 = 1;
+        if (slash < item.length) {
+            step = cronValue(item[slash + 1..], "") ?? { return null; };
+            if (step == 0) {
+                return null;
+            }
+        }
+        let base = item[0..slash];
+        var low = min;
+        var high = max;
+        if (base.length == 1 && base[0] == 42) {
+            // The whole field.
+        } else if (dash < base.length) {
+            low = cronValue(base[0..dash], names) ?? { return null; };
+            high = cronValue(base[dash + 1..], names) ?? { return null; };
+        } else {
+            low = cronValue(base, names) ?? { return null; };
+            if (slash == item.length) {
+                high = low;
+            }
+        }
+        if (low < min || high > max || low > high) {
+            return null;
+        }
+        var v = low;
+        while (v <= high) {
+            set = set | (1u64 << (v as u64));
+            v += step;
+        }
+        if (to == text.length) {
+            return Some(set);
+        }
+        from = to + 1;
+    }
+}
+
+/// Whether `set` has the bit `value`.
+fn allows(set: u64, value: u32) -> bool => (set >> (value as u64)) & 1u64 != 0;
+
+/// A cron expression: the minutes at which something is due.
+///
+/// Five fields separated by spaces: minute (0 to 59), hour (0 to 23), day of the month (1 to 31), month (1 to 12 or
+/// `jan` to `dec`), day of the week (0 to 7 or `sun` to `sat`; 0 and 7 are Sunday). A field is `*`, a value, a
+/// range `a-b`, any of them with a step (`*/15`, `10-40/5`, `5/20`), or a list of those with commas. As in cron,
+/// when the day of the month and the day of the week are both given (neither starts with `*`), a day that fits
+/// either is due. `@hourly`, `@daily` (`@midnight`), `@weekly`, `@monthly` and `@yearly` (`@annually`) are also
+/// read.
+public struct Cron {
+    private minutes: u64;
+    private hours: u64;
+    private days: u64;
+    private months: u64;
+    private weekdays: u64;
+    /// Whether the day of the month, or the day of the week, was left open: then both must fit.
+    private openDay: bool;
+
+    /// The expression `text` is, or null if it is not one.
+    public fn parse(text: StringView) -> Cron? {
+        let all = trimmed(text.bytes());
+        if (all.length > 0 && all[0] == 64) {
+            if (sameBytes(all, "@hourly".bytes())) {
+                return Cron.parse("0 * * * *");
+            }
+            if (sameBytes(all, "@daily".bytes()) || sameBytes(all, "@midnight".bytes())) {
+                return Cron.parse("0 0 * * *");
+            }
+            if (sameBytes(all, "@weekly".bytes())) {
+                return Cron.parse("0 0 * * 0");
+            }
+            if (sameBytes(all, "@monthly".bytes())) {
+                return Cron.parse("0 0 1 * *");
+            }
+            if (sameBytes(all, "@yearly".bytes()) || sameBytes(all, "@annually".bytes())) {
+                return Cron.parse("0 0 1 1 *");
+            }
+            return null;
+        }
+        var sets = [0u64; 5];
+        var open = [false; 5];
+        var at: usize = 0;
+        for (n in 0..5usize) {
+            while (at < all.length && (all[at] == 32 || all[at] == 9)) {
+                at += 1;
+            }
+            var end = at;
+            while (end < all.length && all[end] != 32 && all[end] != 9) {
+                end += 1;
+            }
+            let field = all[at..end];
+            let set = match (n) {
+                0 => cronField(field, 0, 59, ""),
+                1 => cronField(field, 0, 23, ""),
+                2 => cronField(field, 1, 31, ""),
+                3 => cronField(field, 1, 12, "janfebmaraprmayjunjulaugsepoctnovdec"),
+                _ => cronField(field, 0, 7, "sunmontuewedthufrisat"),
+            };
+            sets[n] = set ?? { return null; };
+            open[n] = field[0] == 42;
+            at = end;
+        }
+        if (at != all.length) {
+            return null; // a sixth field
+        }
+        // Sunday is 0, and 7.
+        if (allows(sets[4], 7)) {
+            sets[4] = (sets[4] | 1u64) & 0x7Fu64;
+        }
+        return Some(Cron {
+            minutes: sets[0],
+            hours: sets[1],
+            days: sets[2],
+            months: sets[3],
+            weekdays: sets[4],
+            openDay: open[2] || open[4],
+        });
+    }
+
+    /// An expression that is never due.
+    fn never() -> Cron => Cron { minutes: 0, hours: 0, days: 0, months: 0, weekdays: 0, openDay: true };
+
+    /// Whether the day of `c` fits.
+    fn onDay(borrow this, c: borrow Civil) -> bool {
+        if (!allows(this.months, c.month)) {
+            return false;
+        }
+        let day = allows(this.days, c.day);
+        let weekday = allows(this.weekdays, c.weekday);
+        return if (this.openDay) day && weekday else day || weekday;
+    }
+
+    /// Whether the expression is due in the minute of `at` (Unix seconds, not negative) on `zone`'s clock.
+    public fn due(borrow this, at: i64, zone: Zone) -> bool {
+        let local = at + offsetAt(zone, at);
+        if (local < 0) {
+            return false;
+        }
+        let c = civil(local);
+        return this.onDay(c) && allows(this.hours, c.hour) && allows(this.minutes, c.minute);
+    }
+
+    /// The start of the first minute after `after` (Unix seconds) in which the expression is due on `zone`'s clock.
+    /// Null if there is none in the eight years that follow (`0 0 31 2 *`).
+    public fn next(borrow this, after: i64, zone: Zone) -> i64? {
+        if (after < 0) {
+            return null;
+        }
+        let last = after + 8 * 366 * 86400;
+        var t = (after / 60 + 1) * 60;
+        while (t <= last) {
+            let local = t + offsetAt(zone, t);
+            if (local < 0) {
+                return null;
+            }
+            let c = civil(local);
+            let second = local % 86400;
+            if (!this.onDay(c)) {
+                // To the day's last hour, then hour by hour: a day the clocks change is not 24 hours long, so a
+                // jump of what is left of 24 could pass the first hour of the next day.
+                t += if (second < 82800) 82800 - second else 3600 - second % 3600;
+            } else if (!allows(this.hours, c.hour)) {
+                t += 3600 - second % 3600;
+            } else if (!allows(this.minutes, c.minute)) {
+                t += 60 - second % 60;
+            } else {
+                return Some(t - second % 60);
+            }
+        }
+        return null;
+    }
+}
+
+/// Why a job's run failed.
+public enum JobError {
+    /// The job says so.
+    Failed,
+    /// An allocation failed.
+    OutOfMemory,
+}
+
+/// Something to run on a schedule.
+public interface Job {
+    /// One run. `at` is the time it was due (Unix seconds): the minute's start for a cron job, the time of the run
+    /// for an interval's.
+    async fn run(borrow this, at: i64) -> Result<void, JobError>;
+}
+
+/// What a job has done so far.
+public struct JobReport {
+    /// Runs, failed ones included.
+    public runs: u64;
+    /// Runs that returned an error.
+    public failures: u64;
+    /// When the last run was due (Unix seconds); 0 before the first.
+    public lastAt: i64;
+    /// How long the last run took.
+    public lastMs: u64;
+}
+
+/// Why a job was not added.
+public enum ScheduleError {
+    /// The text is not a cron expression.
+    BadCron,
+    /// An interval of no seconds.
+    BadInterval,
+    /// An allocation failed.
+    OutOfMemory,
+}
+
+/// A cron job's next time when it has not been worked out, and when there is none.
+fn unknownTime() -> i64 => -1;
+fn noTime() -> i64 => 0x7FFFFFFFFFFFFFFF;
+
+/// One job and when it runs next.
+struct Entry {
+    job: Box<dyn Job + Send + Share>;
+    cron: Cron;
+    /// The interval of a job that has one; 0 for a cron job.
+    everyMs: u64;
+    /// A cron job's next time (Unix seconds).
+    nextAt: i64;
+    /// An interval job's next time on the monotonic clock, once `started`.
+    nextMs: u64;
+    started: bool;
+    report: JobReport;
+}
+
+/// Jobs and their schedules. Add the jobs, then race `run` against the server, as `tend` is:
+/// `Async.race(server, async move () => await jobs.run<ServerReport>(draining))`.
+public struct Scheduler {
+    private jobs: Vector<Entry>;
+    private zone: Zone;
+    private last: i64;
+
+    /// A scheduler whose cron expressions are read on `zone`'s clock.
+    public fn create(zone: Zone) -> Scheduler => Scheduler { jobs: Vector<Entry>.create(), zone: zone, last: 0 };
+
+    fn add(borrow mut this, job: Box<dyn Job + Send + Share>, cron: Cron, everyMs: u64) -> Result<u32, ScheduleError> {
+        let id = truncate<u32>(this.jobs.length);
+        let entry = Entry {
+            job: job,
+            cron: cron,
+            everyMs: everyMs,
+            nextAt: unknownTime(),
+            nextMs: 0,
+            started: false,
+            report: JobReport { runs: 0, failures: 0, lastAt: 0, lastMs: 0 },
+        };
+        match (this.jobs.push(entry)) {
+            Ok() => { return Ok(id); }
+            Err(_) => { return Err(ScheduleError.OutOfMemory); }
+        }
+    }
+
+    /// Adds `job`, due by the cron expression `expression`, from the first minute that begins after `run` starts.
+    /// The job's number, for `report`.
+    public fn cron(
+        borrow mut this,
+        expression: StringView,
+        job: Box<dyn Job + Send + Share>,
+    ) -> Result<u32, ScheduleError> {
+        let parsed = Cron.parse(expression) ?? { return Err(ScheduleError.BadCron); };
+        return this.add(job, parsed, 0);
+    }
+
+    /// Adds `job`, due every `seconds` from when `run` starts (the first run is one interval in). The interval is
+    /// measured on the monotonic clock, so setting the system's clock does not move it.
+    public fn every(borrow mut this, seconds: u32, job: Box<dyn Job + Send + Share>) -> Result<u32, ScheduleError> {
+        if (seconds == 0) {
+            return Err(ScheduleError.BadInterval);
+        }
+        return this.add(job, Cron.never(), seconds as u64 * 1000);
+    }
+
+    /// How many jobs there are.
+    public fn count(borrow this) -> usize => this.jobs.length;
+
+    /// What job `id` has done.
+    public fn report(borrow this, id: u32) -> JobReport? {
+        if (id as usize >= this.jobs.length) {
+            return null;
+        }
+        return Some(this.jobs[id as usize].report);
+    }
+
+    /// Runs the jobs that are due at `now` (Unix seconds) and `monoMs` (the monotonic clock), one after the other;
+    /// how many ran. `run` calls this about once a second; a test calls it with times of its own.
+    public async fn tick(borrow mut this, now: i64, monoMs: u64) -> u32 {
+        // The system's clock went back: what was worked out from the later time would come late.
+        if (now < this.last) {
+            for (i in 0..this.jobs.length) {
+                this.jobs[i].nextAt = unknownTime();
+            }
+        }
+        this.last = now;
+        var ran: u32 = 0;
+        for (i in 0..this.jobs.length) {
+            var due = false;
+            var at = now;
+            if (this.jobs[i].everyMs != 0) {
+                let every = this.jobs[i].everyMs;
+                if (!this.jobs[i].started) {
+                    this.jobs[i].started = true;
+                    this.jobs[i].nextMs = monoMs + every;
+                } else if (monoMs >= this.jobs[i].nextMs) {
+                    due = true;
+                    // The cadence is kept, unless whole intervals were missed.
+                    let kept = this.jobs[i].nextMs + every;
+                    this.jobs[i].nextMs = if (kept > monoMs) kept else monoMs + every;
+                }
+            } else {
+                if (this.jobs[i].nextAt == unknownTime()) {
+                    this.jobs[i].nextAt = this.jobs[i].cron.next(now, this.zone) ?? noTime();
+                }
+                if (now >= this.jobs[i].nextAt) {
+                    due = true;
+                    at = this.jobs[i].nextAt;
+                    this.jobs[i].nextAt = this.jobs[i].cron.next(now, this.zone) ?? noTime();
+                }
+            }
+            if (!due) {
+                continue;
+            }
+            let began = nowMs();
+            let failed = (await this.jobs[i].job.run(at)).isErr();
+            this.jobs[i].report.runs += 1;
+            if (failed) {
+                this.jobs[i].report.failures += 1;
+            }
+            this.jobs[i].report.lastAt = at;
+            this.jobs[i].report.lastMs = nowMs() - began;
+            ran += 1;
+        }
+        return ran;
+    }
+
+    /// Runs the jobs as they come due, until `drain` starts; then runs none, and waits. It returns only an error,
+    /// so that racing it against the server leaves the server to finish. It wakes once a second, and when an interval ends.
+    public async fn run<T>(borrow mut this, drain: borrow Drain) -> Result<T, NetError> {
+        loop {
+            if (!drain.isDraining()) {
+                let _ = await this.tick(Clock.now().seconds, nowMs());
+            }
+            // To the next second of the system's clock, so a cron job starts as its minute does.
+            let ms = Clock.unixMillis();
+            var wait: u64 = if (ms < 0) 1000 else 1000 - truncate<u64>(ms % 1000);
+            // Or to the first interval that ends sooner.
+            let mono = nowMs();
+            for (i in 0..this.jobs.length) {
+                if (this.jobs[i].everyMs != 0 && this.jobs[i].started) {
+                    let left = if (this.jobs[i].nextMs > mono) this.jobs[i].nextMs - mono else 1;
+                    if (left < wait) {
+                        wait = left;
+                    }
+                }
+            }
+            match (await Timer.sleep(wait)) {
+                Ok() => {}
+                Err(e) => { return Err(NetErrors.fromAsync(e)); }
+            }
+        }
+    }
+}
