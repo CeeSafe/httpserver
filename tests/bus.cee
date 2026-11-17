@@ -1,0 +1,94 @@
+// The bus between workers, with three ends in one process.
+import web_core;
+
+/// The next message at `port` as `<from>:<topic>:<bytes>`, or `-` if there is none.
+fn heard(port: borrow mut BusPort) -> Result<Vector<u8>, TestFailure> {
+    var payload = Vector<u8>.create();
+    var out = Vector<u8>.create();
+    match (port.poll(mut payload)) {
+        Some(m) => {
+            let ok = putDecimal(mut out, m.from as u64)
+                && put(mut out, ":".bytes())
+                && putDecimal(mut out, m.topic as u64)
+                && put(mut out, ":".bytes())
+                && put(mut out, payload.view());
+            Check.isTrue(ok, "memory")?;
+        }
+        null => { Check.isTrue(put(mut out, "-".bytes()), "memory")?; }
+    }
+    return Ok(out);
+}
+
+fn hears(port: borrow mut BusPort, expected: StringView) -> Result<void, TestFailure> {
+    let got = heard(port)?;
+    return Check.equalBytes(expected.bytes(), got.view());
+}
+
+@test
+fn whatOneWorkerPublishesTheOthersReceive() -> Result<void, TestFailure> {
+    Check.isTrue(Bus.create(0, 4096).isNull(), "no workers")?;
+    let bus = Bus.create(3, 100) ?? { return Err(TestFailure.create("no shared memory")); };
+    Check.equalU64(1024, bus.maxMessage() as u64)?;
+    var zero = alloc(bus.join(0))?;
+    var one = alloc(bus.join(1))?;
+    var two = alloc(bus.join(2))?;
+    hears(mut one, "-")?;
+
+    Check.isTrue(zero.publish(7, "hello".bytes()), "published")?;
+    hears(mut one, "0:7:hello")?;
+    hears(mut one, "-")?;
+    hears(mut two, "0:7:hello")?;
+    hears(mut zero, "-")?; // not its own
+
+    // Each worker's messages arrive in the order it published them.
+    Check.isTrue(zero.publish(1, "a".bytes()) && zero.publish(2, "".bytes()) && zero.publish(3, "c".bytes()), "three")?;
+    Check.isTrue(one.publish(9, "x".bytes()), "one more")?;
+    hears(mut two, "0:1:a")?;
+    hears(mut two, "0:2:")?;
+    hears(mut two, "0:3:c")?;
+    hears(mut two, "1:9:x")?;
+    hears(mut two, "-")?;
+    hears(mut one, "0:1:a")?;
+    hears(mut one, "0:2:")?;
+    hears(mut one, "0:3:c")?;
+    hears(mut zero, "1:9:x")?;
+
+    // Many times round the ring, in lengths from 0 to the longest.
+    var payload = Vector<u8>.create();
+    var got = Vector<u8>.create();
+    for (n in 0..3000usize) {
+        payload.clear();
+        for (i in 0..n * 37 % 1025) {
+            alloc(payload.push(truncate<u8>(n + i * 3)))?;
+        }
+        Check.isTrue(one.publish(truncate<u32>(n), payload.view()), "published")?;
+        let m = two.poll(mut got) ?? { return Err(TestFailure.create("nothing received")); };
+        Check.equalU64(n as u64, m.topic as u64)?;
+        Check.equalU64(1, m.from as u64)?;
+        Check.equalBytes(payload.view(), got.view())?;
+    }
+    Check.equalU64(0, two.missed())?;
+    while (payload.length <= bus.maxMessage()) {
+        alloc(payload.push(0))?;
+    }
+    Check.isTrue(!one.publish(1, payload.view()), "a message too long")?;
+
+    // A reader a ring behind skips to the newest and says so; what comes after arrives whole.
+    Check.equalU64(0, zero.missed())?;
+    Check.isTrue(one.publish(5, "last".bytes()), "published")?;
+    hears(mut zero, "-")?;
+    Check.equalU64(1, zero.missed())?;
+    Check.isTrue(one.publish(6, "next".bytes()), "published")?;
+    hears(mut zero, "1:6:next")?;
+
+    // A worker started in the place of one that ended goes on in its ring, and does not hear what was before.
+    Check.isTrue(one.publish(8, "before".bytes()), "published")?;
+    var again = alloc(bus.join(0))?;
+    hears(mut again, "-")?;
+    Check.isTrue(again.publish(4, "back".bytes()), "published")?;
+    hears(mut two, "1:5:last")?;
+    hears(mut two, "1:6:next")?;
+    hears(mut two, "1:8:before")?;
+    hears(mut two, "0:4:back")?;
+    return Ok();
+}

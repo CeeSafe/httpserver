@@ -23,6 +23,9 @@
 // ends and kills one whose loop has stopped; CW_MEMORY_MB limits each worker's address space; CW_INHERIT=1 has the
 // workers accept from one socket the supervisor bound, instead of each binding the shared port.
 //
+// CW_BUS=1 gives the workers a bus: `/bus/say/{n}` says n to all of them, `/bus/heard` answers the worker and the
+// last number it heard, and `/forget/{n}` has every worker forget `/kept/{n}`.
+//
 // CW_LIMIT=n adds a rate limit of n requests an hour for each client address; with CW_SHARED=1 the supervisor's
 // workers count in shared memory, so the limit is all of theirs together. CW_TRACE=1 adds the trace-context filter. CW_TIMEOUT_MS=n bounds every request (`App.timeout`); CW_LOG=1 adds an access log that only counts, CW_LOG=2 the
 // stock one that writes a line a request to standard output.
@@ -38,12 +41,98 @@ import httpserver_compress;
 import web_ws;
 import json.JsonWriter;
 
+/// What a worker's application and its reading of the bus have in common.
+struct Wiring {
+    /// The counters the workers' rate limit shares (CW_SHARED=1).
+    words: SharedWords?;
+    /// This worker's publishing end of the bus (CW_BUS=1).
+    sender: BusSender?;
+    /// The last number another worker said on the bus, or this one did.
+    heard: Arc<AtomicU64>;
+    /// The cache of `/kept`.
+    cache: Arc<OutputCache>;
+}
+
+/// What a worker does with the other workers' messages: topic 1 is a number said, topic 2 a target to forget.
+struct Ears {
+    heard: Arc<AtomicU64>;
+    cache: Arc<OutputCache>;
+}
+
+impl BusSink for Ears {
+    fn deliver(borrow this, from: u32, topic: u32, payload: Slice<u8>) {
+        if (topic == 1) {
+            var n: u64 = 0;
+            for (b in payload) {
+                n = n * 10 + (b - 48) as u64;
+            }
+            this.heard.get().store(n);
+        } else if (topic == 2) {
+            match (StringView.fromUtf8(payload)) {
+                Some(target) => { this.cache.get().forget(target); }
+                null => {}
+            }
+        }
+    }
+}
+
+/// `/bus/say/{n}` says n to every worker, `/bus/heard` answers `<worker> <last number heard>`, and `/forget/{n}`
+/// has every worker forget `/kept/{n}`.
+struct OnBus {
+    what: u32;
+}
+
+impl Handler<St> for OnBus {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut Context<St>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        let wiring = borrow ctx.state().wiring;
+        var text = [0u8; 40];
+        var w = TextWriter.create(mut text[..]);
+        if (this.what == 0) {
+            w.decimal(ctx.state().worker as u64);
+            w.text(" ");
+            w.decimal(wiring.heard.get().load());
+            return await exchange.send(Status.ok(), w.written());
+        }
+        let n = ctx.paramInt("n") ?? 0;
+        if (n < 0) {
+            return Err(HandlerError.Status(Status.badRequest()));
+        }
+        var published = true;
+        if (this.what == 1) {
+            w.decimal(truncate<u64>(n));
+            wiring.heard.get().store(truncate<u64>(n));
+            match (wiring.sender) {
+                Some(s) => { published = s.publish(1, w.written()); }
+                null => {}
+            }
+        } else {
+            w.text("/kept/");
+            w.decimal(truncate<u64>(n));
+            match (StringView.fromUtf8(w.written())) {
+                Some(target) => { wiring.cache.get().forget(target); }
+                null => {}
+            }
+            match (wiring.sender) {
+                Some(s) => { published = s.publish(2, w.written()); }
+                null => {}
+            }
+        }
+        return await exchange.send(Status.ok(), if (published) "ok".bytes() else "not published".bytes());
+    }
+}
+
 struct St {
     /// Which worker process this is.
     worker: u32;
     /// The sessions of `/chat`.
     hub: Hub;
     sockets: WebSocketOptions;
+    wiring: Wiring;
 }
 
 struct Fixed {
@@ -455,14 +544,19 @@ fn setting(name: StringView, otherwise: u64) -> u64 {
     };
 }
 
-fn application(worker: u32, words: SharedWords?) -> Result<App<St>, RouteError> {
+fn application(worker: u32, wiring: Wiring) -> Result<App<St>, RouteError> {
+    let words = wiring.words;
+    let cache = wiring.cache.clone();
     var limits = Limits.defaults();
     limits.maxBodyBytes = 1048576;
     let hub = match (Hub.create()) {
         Ok(h) => h,
         Err(_) => { return Err(RouteError.OutOfMemory); },
     };
-    var app = App<St>.create(St { worker: worker, hub: hub, sockets: WebSocketOptions.defaults() }, limits)?;
+    var app = App<St>.create(
+        St { worker: worker, hub: hub, sockets: WebSocketOptions.defaults(), wiring: wiring },
+        limits,
+    )?;
     for (i in 0..setting("CW_HOOKS", 0)) {
         app.use(idle()?)?;
     }
@@ -532,13 +626,9 @@ fn application(worker: u32, words: SharedWords?) -> Result<App<St>, RouteError> 
         Err(_) => { return Err(RouteError.OutOfMemory); },
     };
     app.get("/gz/{n:int}", handler(Box.create(Packed { compression: compression }))?)?;
-    let cache = match (OutputCache.create(1024, 1048576)) {
-        Ok(c) => match (Arc<OutputCache>.create(c)) {
-            Ok(a) => a,
-            Err(_) => { return Err(RouteError.OutOfMemory); },
-        },
-        Err(_) => { return Err(RouteError.OutOfMemory); },
-    };
+    app.get("/bus/heard", handler(Box.create(OnBus { what: 0 }))?)?;
+    app.get("/bus/say/{n:int}", handler(Box.create(OnBus { what: 1 }))?)?;
+    app.get("/forget/{n:int}", handler(Box.create(OnBus { what: 2 }))?)?;
     let kept = app.group("/kept")?;
     let answering: Result<Cached, AllocError> = Ok(Cached.create(cache.clone()));
     app.filterIn(kept, stock(answering)?)?;
@@ -567,7 +657,38 @@ fn listening(shared: bool) -> Result<Listener, NetError> {
     return Listener.bindWith(SocketAddresses.v4Loopback(port), options);
 }
 
-async fn serve(app: App<St>, worker: Worker, listener: borrow Listener) -> Result<ServerReport, NetError> {
+/// A worker's housekeeping: `tend`, and with a port the reading of the bus beside it.
+async fn housekeeping(
+    worker: Worker,
+    drain: borrow Drain,
+    port: BusPort?,
+    ears: Ears,
+) -> Result<ServerReport, NetError> {
+    match (port) {
+        null => { return await tend<ServerReport>(worker, drain, 100); }
+        Some(p) => {
+            var mine = p;
+            let reading = borrow mut mine;
+            let sink = borrow ears;
+            let r: Result<Raced<ServerReport>, NetError> = await Async.race(
+                async move () => await tend<ServerReport>(worker, drain, 100),
+                async move () => await carry<ServerReport, Ears>(reading, sink, 5),
+            );
+            return match (r) {
+                Ok(raced) => Ok(raced.value),
+                Err(e) => Err(e),
+            };
+        }
+    }
+}
+
+async fn serve(
+    app: App<St>,
+    worker: Worker,
+    listener: borrow Listener,
+    port: BusPort?,
+    ears: Ears,
+) -> Result<ServerReport, NetError> {
     let drain = Drain.create()?;
     var limits = ConnectionLimits.defaults();
     limits.graceMs = 1000;
@@ -580,7 +701,7 @@ async fn serve(app: App<St>, worker: Worker, listener: borrow Listener) -> Resul
     let draining = borrow drain;
     let r: Result<Raced<ServerReport>, NetError> = await Async.race(
         async move () => await app.run(listener, PlainAcceptor {}, bounds, draining),
-        async move () => await tend<ServerReport>(worker, draining, 100),
+        async move () => await housekeeping(worker, draining, port, ears),
     );
     return match (r) {
         Ok(raced) => Ok(raced.value),
@@ -588,16 +709,57 @@ async fn serve(app: App<St>, worker: Worker, listener: borrow Listener) -> Resul
     };
 }
 
+/// A worker's wiring and its end of the bus.
+struct Parts {
+    wiring: Wiring;
+    port: BusPort?;
+}
+
+fn wired(worker: Worker, words: SharedWords?, bus: Bus?) -> Parts? {
+    let heard = match (Arc<AtomicU64>.create(AtomicU64.create(0))) {
+        Ok(a) => a,
+        Err(_) => { return null; },
+    };
+    let cache = match (OutputCache.create(1024, 1048576)) {
+        Ok(c) => match (Arc<OutputCache>.create(c)) {
+            Ok(a) => a,
+            Err(_) => { return null; },
+        },
+        Err(_) => { return null; },
+    };
+    var port: BusPort? = null;
+    var sender: BusSender? = null;
+    match (bus) {
+        Some(b) => {
+            match (b.join(worker.index())) {
+                Ok(p) => {
+                    sender = Some(p.sender());
+                    port = Some(p);
+                }
+                Err(_) => { return null; }
+            }
+        }
+        null => {}
+    }
+    return Some(Parts { wiring: Wiring { words: words, sender: sender, heard: heard, cache: cache }, port: port });
+}
+
 /// One process's server on `listener`; the status it exits with.
-fn serveOn(worker: Worker, listener: borrow Listener, words: SharedWords?) -> i32 {
-    let app = match (application(worker.index(), words)) {
+fn serveOn(worker: Worker, listener: borrow Listener, words: SharedWords?, bus: Bus?) -> i32 {
+    let made = wired(worker, words, bus);
+    let parts = made ?? {
+        Console.writeLine("bench: no memory");
+        return 1;
+    };
+    let ears = Ears { heard: parts.wiring.heard.clone(), cache: parts.wiring.cache.clone() };
+    let app = match (application(worker.index(), parts.wiring)) {
         Ok(a) => a,
         Err(_) => {
             Console.writeLine("bench: could not build the routes");
             return 1;
         },
     };
-    match (Async.run(serve(app, worker, listener))) {
+    match (Async.run(serve(app, worker, listener, parts.port, ears))) {
         Ok(_) => { return 0; }
         Err(e) => {
             Console.writeLine(NetErrors.describe(e));
@@ -613,16 +775,18 @@ struct Bench {
     listener: Listener?;
     /// The counters the workers' rate limit shares (CW_SHARED=1).
     words: SharedWords?;
+    /// The workers' bus (CW_BUS=1).
+    bus: Bus?;
 }
 
 impl WorkerMain for Bench {
     fn run(borrow this, worker: Worker) -> i32 {
         match (borrow this.listener) {
-            Some(l) => { return serveOn(worker, l, this.words); }
+            Some(l) => { return serveOn(worker, l, this.words, this.bus); }
             null => {}
         }
         match (listening(true)) {
-            Ok(mine) => { return serveOn(worker, mine, this.words); }
+            Ok(mine) => { return serveOn(worker, mine, this.words, this.bus); }
             Err(e) => {
                 Console.writeLine(NetErrors.describe(e));
                 return 1;
@@ -635,7 +799,7 @@ fn main() {
     let procs = setting("CW_PROCS", 0);
     if (procs == 0) {
         match (listening(setting("CW_REUSEPORT", 0) == 1)) {
-            Ok(mine) => { Process.exit(serveOn(Worker.alone(), mine, null)); }
+            Ok(mine) => { Process.exit(serveOn(Worker.alone(), mine, null, null)); }
             Err(e) => {
                 Console.writeLine(NetErrors.describe(e));
                 Process.exit(1);
@@ -648,7 +812,10 @@ fn main() {
     options.memoryBytes = setting("CW_MEMORY_MB", 0) * 1048576;
     Console.writeLine("bench: supervising");
     // CW_INHERIT=1: the supervisor binds the port and the workers inherit the socket.
-    var bench = Bench { listener: null, words: null };
+    var bench = Bench { listener: null, words: null, bus: null };
+    if (setting("CW_BUS", 0) == 1) {
+        bench.bus = Bus.create(truncate<u32>(procs), 65536);
+    }
     if (setting("CW_SHARED", 0) == 1) {
         bench.words = SharedWords.create(4096);
     }

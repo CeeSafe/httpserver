@@ -135,6 +135,13 @@ counter or a cache is per worker unless it is put somewhere they share. `SharedW
 words mapped before the workers are forked and changed only atomically, with no locks and no pointers in them, so a
 worker that traps cannot leave the others anything half written. `RateLimit.shared` counts there.
 
+For events there is `Bus`: each worker publishes into a ring of its own in shared memory and the others read it on
+a timer (`carry`, raced against the server as `tend` is), so a message reaches them within that interval (5 ms in
+the benchmark server). Nothing blocks: a reader that falls a whole ring behind skips to the newest and counts it
+(`missed`). An application gives each topic a number and a `BusSink` that acts on it, such as
+`OutputCache.forget` for a target another worker changed. The bus is one machine's; across machines a broker is
+needed.
+
 `python3 tools/supervisor_check.py [--inherit] [--memory-mb 512]` checks all of this against the benchmark server:
 five traps, a handler that never returns and one that takes memory until it fails, each followed by the server
 still answering.
@@ -196,6 +203,9 @@ answers the same routes (server GC). One machine and one run each: read the rati
   counted in `SharedWords` answers 240 000 to 259 000 `/small` a second, one each worker counts for itself 261 000,
   and no limit 254 000 to 275 000. `tools/ratelimit_check.py`: of 992 requests against a limit of 200, exactly 200
   are answered with the shared words, 727 to 800 without.
+- `tools/bus_check.py`, four workers: a number said to one is heard by all four, and a cached response forgotten
+  through one is made again by all four (by one, without the bus). A bus nobody publishes on costs nothing
+  measurable (272 000 to 276 000 `/small` a second with it, 263 000 to 278 000 without).
 - CosmoApiServer answered 56 and 16 of about 1.3 million `/users/42` requests with a status that was not 2xx; not
   looked into.
 
@@ -213,6 +223,7 @@ ceesafec test --cflag -fsanitize=address,undefined
 python3 tools/supervisor_check.py # the supervisor, against bench/out/bench
 python3 tools/gzip_check.py       # compressed responses, against Python's gzip
 python3 tools/ratelimit_check.py  # one rate limit for four workers (add --inherit on macOS)
+python3 tools/bus_check.py        # the bus between four workers (add --inherit on macOS)
 python3 tools/ws_check.py         # the hub, with WebSocket clients written from RFC 6455
 ```
 

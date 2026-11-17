@@ -1,0 +1,230 @@
+// A bus between the supervisor's workers: what one publishes, the others receive.
+//
+// Each worker has a ring of bytes in memory mapped before the workers are forked. Only its worker writes a ring;
+// the others read it, each from a place of its own. Nothing waits for anything: a writer never blocks on a reader,
+// and a reader that falls a whole ring behind skips to the newest and counts that it missed something. A worker
+// that traps while writing leaves a message nobody was told of; the worker started in its place goes on from the
+// last one that was. Messages are for one machine's workers and are not kept: a worker started later does not see
+// what was published before.
+//
+// Readers look at the rings on a timer (`carry`), so a message reaches the other workers within that interval.
+import web_core;
+
+/// The bytes before a message in a ring: its length and its topic.
+const RECORD: u64 = 8;
+
+/// The words before a ring's bytes: how far it has been written, how far it is being written, whether its writer
+/// is in `publish`, and one to spare.
+const HEADER: usize = 32;
+
+/// The rings the workers publish in. Make it before `supervise`, and have each worker `join`. POSIX only.
+public struct Bus {
+    /// The mapping's address (a number: see `SharedWords`).
+    private base: usize;
+    private rings: u32;
+    /// A ring's bytes: a power of two.
+    private size: u64;
+
+    /// Rings for `workers` workers of `ringBytes` each (rounded up to a power of two, at least 4096), or null if
+    /// the system gives no shared memory. A message may be a quarter of a ring at most.
+    /// Safety: `mmap` is asked for a new anonymous mapping and its result is checked.
+    public fn create(workers: u32, ringBytes: usize) -> Bus? {
+        if (workers == 0 || workers > maxWorkers()) {
+            return null;
+        }
+        var size: usize = 4096;
+        while (size < ringBytes) {
+            size *= 2;
+        }
+        let length = workers as usize * (HEADER + size);
+        let page = unsafe { mmap(0 as *mut void, length, PROT_READ + PROT_WRITE, MAP_SHARED + MAP_ANON, -1, 0) };
+        if (page == 0 as *mut void || page as usize == 0xFFFFFFFFFFFFFFFF) {
+            return null;
+        }
+        return Some(Bus { base: page as usize, rings: workers, size: size as u64 });
+    }
+
+    /// How many workers the bus is for.
+    public fn workers(this) -> u32 => this.rings;
+
+    /// The longest message.
+    public fn maxMessage(this) -> usize => truncate<usize>(this.size / 4);
+
+    /// Word `which` of ring `ring`'s header.
+    /// Safety: the mapping holds `rings` rings of `HEADER + size` bytes, is page aligned and never unmapped; the
+    /// callers pass a ring below `rings` and a word below 4, and the words are only ever accessed atomically.
+    fn word(borrow this, ring: u32, which: usize) -> borrow AtomicU64 =>
+        unsafe { Ptr.toBorrow(
+            ((this.base + ring as usize * (HEADER + truncate<usize>(this.size))) as *mut AtomicU64).add(which),
+        ) };
+
+    /// The address of ring `ring`'s byte at `offset` (taken modulo the ring's size).
+    fn byte(this, ring: u32, offset: u64) -> usize =>
+        this.base + ring as usize * (HEADER + truncate<usize>(this.size)) + HEADER + truncate<usize>(
+            offset & (this.size - 1),
+        );
+
+    /// Writes `bytes` into ring `ring` from `offset`.
+    /// Safety: `byte` stays inside the ring; only the ring's one writer calls this, for bytes no reader trusts
+    /// until the ring's written mark passes them.
+    fn write(this, ring: u32, offset: u64, bytes: Slice<u8>) {
+        for (i in 0..bytes.length) {
+            unsafe { (this.byte(ring, offset + i as u64) as *mut u8).write(bytes[i]); }
+        }
+    }
+
+    /// Reads ring `ring`'s byte at `offset`.
+    /// Safety: `byte` stays inside the ring; what is read is checked against the ring's marks before it is used.
+    fn read(this, ring: u32, offset: u64) -> u8 => unsafe { (this.byte(ring, offset) as *u8).read() };
+
+    /// This worker's end of the bus. A worker that takes the place of one that ended goes on in its ring, and
+    /// starts reading the others where they are now.
+    public fn join(this, worker: u32) -> Result<BusPort, AllocError> {
+        let mine = worker % this.rings;
+        // What the worker before was writing when it ended is dropped.
+        this.word(mine, 1).store(this.word(mine, 0).load());
+        this.word(mine, 2).store(0);
+        var cursors = Vector<u64>.create();
+        cursors.reserve(this.rings as usize)?;
+        for (r in 0..this.rings) {
+            cursors.push(this.word(r, 0).load())?;
+        }
+        return Ok(BusPort { bus: this, mine: mine, cursors: cursors, next: 0, lost: 0 });
+    }
+}
+
+/// A message's sender and topic; its bytes are in the vector given to `poll`.
+public struct BusMessage {
+    /// The worker that published it.
+    public from: u32;
+    /// What it is about: the application's own numbering.
+    public topic: u32;
+}
+
+/// One worker's end of the bus.
+public struct BusPort {
+    private bus: Bus;
+    private mine: u32;
+    /// Where this worker has read each ring to.
+    private cursors: Vector<u64>;
+    private next: u32;
+    private lost: u64;
+
+    /// Which worker this is on the bus.
+    public fn worker(borrow this) -> u32 => this.mine;
+
+    /// How many times this worker fell a ring behind another and skipped what it had not read.
+    public fn missed(borrow this) -> u64 => this.lost;
+
+    /// The publishing half, to give to the handlers while `carry` holds the port.
+    public fn sender(borrow this) -> BusSender => BusSender { bus: this.bus, mine: this.mine };
+
+    /// `sender().publish`.
+    public fn publish(borrow this, topic: u32, payload: Slice<u8>) -> bool => this.sender().publish(topic, payload);
+
+    /// The next message another worker published, its bytes in `out` (cleared first); null if there is none, or
+    /// no memory for it.
+    public fn poll(borrow mut this, out: borrow mut Vector<u8>) -> BusMessage? {
+        let bus = this.bus;
+        out.clear();
+        for (turn in 0..bus.rings) {
+            let ring = (this.next + turn) % bus.rings;
+            if (ring == this.mine) {
+                continue;
+            }
+            let i = ring as usize;
+            let head = bus.word(ring, 0).load();
+            var at = this.cursors[i];
+            if (head - at > bus.size) {
+                // A ring behind: what was there is gone.
+                this.lost += 1;
+                at = head;
+                this.cursors[i] = head;
+            }
+            if (at == head) {
+                continue;
+            }
+            var length: u32 = 0;
+            var topic: u32 = 0;
+            for (b in 0..4u32) {
+                length = length | (bus.read(ring, at + b as u64) as u32 << (b * 8));
+                topic = topic | (bus.read(ring, at + 4 + b as u64) as u32 << (b * 8));
+            }
+            var whole = length as usize <= bus.maxMessage() && out.reserve(length as usize).isOk();
+            if (whole) {
+                for (b in 0..length as u64) {
+                    whole = whole && out.push(bus.read(ring, at + RECORD + b)).isOk();
+                }
+            }
+            // The writer may have come round while this read: then what was read is not to be trusted.
+            if (!whole || bus.word(ring, 1).load() - at > bus.size) {
+                out.clear();
+                this.lost += 1;
+                this.cursors[i] = bus.word(ring, 0).load();
+                continue;
+            }
+            this.cursors[i] = at + RECORD + ((length as u64 + 7) & 0xFFFFFFFFFFFFFFF8);
+            this.next = ring; // the same ring first next time: its messages stay in order
+            return Some(BusMessage { from: ring, topic: topic });
+        }
+        return null;
+    }
+}
+
+/// The publishing half of a worker's end of the bus: small, and copied to whoever publishes.
+public struct BusSender {
+    private bus: Bus;
+    private mine: u32;
+
+    /// Which worker this is on the bus.
+    public fn worker(this) -> u32 => this.mine;
+
+    /// Publishes `payload` under `topic` to the other workers (this one does not receive it). False if it is
+    /// longer than `Bus.maxMessage()`, or if this worker is already publishing (another thread of the application).
+    public fn publish(borrow this, topic: u32, payload: Slice<u8>) -> bool {
+        let bus = this.bus;
+        if (payload.length > bus.maxMessage()) {
+            return false;
+        }
+        if (bus.word(this.mine, 2).compareExchange(0, 1).isErr()) {
+            return false;
+        }
+        let head = bus.word(this.mine, 0).load();
+        let total = RECORD + ((payload.length as u64 + 7) & 0xFFFFFFFFFFFFFFF8);
+        // Readers are told what is about to be overwritten before it is, and of the message only once it is whole.
+        bus.word(this.mine, 1).store(head + total);
+        var record = [0u8; 8];
+        let length = truncate<u32>(payload.length);
+        for (i in 0..4u32) {
+            record[i as usize] = truncate<u8>(length >> (i * 8));
+            record[4 + i as usize] = truncate<u8>(topic >> (i * 8));
+        }
+        bus.write(this.mine, head, record[..]);
+        bus.write(this.mine, head + RECORD, payload);
+        bus.word(this.mine, 0).store(head + total);
+        bus.word(this.mine, 2).store(0);
+        return true;
+    }
+}
+
+/// What a worker does with the messages of the others.
+public interface BusSink {
+    /// One message, from worker `from` under `topic`.
+    fn deliver(borrow this, from: u32, topic: u32, payload: Slice<u8>);
+}
+
+/// A worker's reading of the bus, to race against its server as `tend` is: every `everyMs` it gives `sink` what the
+/// other workers published. It returns only an error.
+public async fn carry<T, K: BusSink>(port: borrow mut BusPort, sink: borrow K, everyMs: u64) -> Result<T, NetError> {
+    var payload = Vector<u8>.create();
+    loop {
+        loop {
+            let message = port.poll(mut payload) ?? { break; };
+            sink.deliver(message.from, message.topic, payload.view());
+        }
+        match (await Timer.sleep(everyMs)) {
+            Ok() => {}
+            Err(e) => { return Err(NetErrors.fromAsync(e)); }
+        }
+    }
+}
