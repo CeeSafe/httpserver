@@ -1,0 +1,142 @@
+// Form bodies through an application on mock connections: a URL-encoded body, and multipart bodies as browsers
+// send them (RFC 7578), with a file whose bytes look like the framing, and bodies that are cut or not multipart.
+import web_core;
+import web_transport;
+import web_http;
+import web_http1;
+
+/// Answers each part of the request's multipart body as `name=data[filename;type]`, one a line, then `ok` or
+/// `broken`; for a URL-encoded body, the decoded `title`.
+struct Posted {}
+
+fn add(out: borrow mut Vector<u8>, bytes: Slice<u8>) -> Result<void, HandlerError> {
+    match (out.extend(bytes)) {
+        Ok() => { return Ok(); }
+        Err(_) => { return Err(HandlerError.Internal); }
+    }
+}
+
+impl Handler<St> for Posted {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut Context<St>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        var body = match (OwnedBuffer.create(65536)) {
+            Ok(b) => b,
+            Err(_) => { return Err(HandlerError.Internal); },
+        };
+        await exchange.readToEnd(mut body)?;
+        let kind = request.headers().get(HeaderName.ContentType) ?? "".bytes();
+        var out = Vector<u8>.create();
+        match (Multipart.boundary(kind)) {
+            Some(boundary) => {
+                var parts = Multipart.of(body.readable(), boundary);
+                loop {
+                    let part = parts.next() ?? { break; };
+                    add(mut out, part.name)?;
+                    add(mut out, "=".bytes())?;
+                    add(mut out, part.data)?;
+                    match (part.filename) {
+                        Some(f) => {
+                            add(mut out, "[".bytes())?;
+                            add(mut out, f)?;
+                            add(mut out, ";".bytes())?;
+                            add(mut out, part.contentType ?? "".bytes())?;
+                            add(mut out, "]".bytes())?;
+                        }
+                        null => {}
+                    }
+                    add(mut out, "\n".bytes())?;
+                }
+                add(mut out, if (parts.failed()) "broken".bytes() else "ok".bytes())?;
+            }
+            null => {
+                if (!Form.value(body.readable(), "title", mut out)) {
+                    out.clear();
+                    add(mut out, "none".bytes())?;
+                }
+            }
+        }
+        return await exchange.send(Status.ok(), out.view());
+    }
+}
+
+/// POSTs `content` as `kind` and checks the answer's body.
+async fn posted(a: borrow App<St>, kind: StringView, content: StringView, expected: StringView) -> Result<void, TestFailure> {
+    var request = Vector<u8>.create();
+    var length = [0u8; 20];
+    var w = TextWriter.create(mut length[..]);
+    w.decimal(content.length as u64);
+    alloc(request.extend("POST /f HTTP/1.1\r\nhost: a\r\ncontent-type: ".bytes()))?;
+    alloc(request.extend(kind.bytes()))?;
+    alloc(request.extend("\r\ncontent-length: ".bytes()))?;
+    alloc(request.extend(w.written()))?;
+    alloc(request.extend("\r\n\r\n".bytes()))?;
+    alloc(request.extend(content.bytes()))?;
+    var conn = match (MockTransport.create(request.view())) {
+        Ok(m) => m,
+        Err(_) => { return Err(TestFailure.create("a mock")); },
+    };
+    let drain = match (Drain.create()) {
+        Ok(d) => d,
+        Err(_) => { return Err(TestFailure.create("a drain")); },
+    };
+    let ctx = ConnectionContext.acceptedNow(1, drain);
+    match (await web_http1.serve(mut conn, ctx, a, a.limits())) {
+        Ok() => {}
+        Err(e) => { return Err(TestFailure.create(NetErrors.describe(e))); }
+    }
+    let written = conn.written();
+    var at: usize = 0;
+    while (at + 4 <= written.length && !(written[at] == 13 && written[at + 1] == 10 && written[at + 2] == 13 && written[at + 3] == 10)) {
+        at += 1;
+    }
+    Check.isTrue(at + 4 <= written.length, "a response with a body")?;
+    return Check.equalBytes(expected.bytes(), written[at + 4..]);
+}
+
+@test
+async fn formBodies() -> Result<void, TestFailure> {
+    var a = routed(App<St>.create(state(), quiet()))?;
+    let h: Box<dyn Handler<St> + Send + Share> = alloc(Box.create(Posted {}))?;
+    routed(a.post("/f", h))?;
+    await posted(a, "application/x-www-form-urlencoded", "a=1&title=two+words%21&b=", "two words!")?;
+    await posted(a, "application/x-www-form-urlencoded", "a=1&titles=x", "none")?;
+    await posted(a, "application/x-www-form-urlencoded", "title", "")?;
+    await posted(a, "application/x-www-form-urlencoded", "title=%zz", "none")?;
+
+    // As a browser sends a text field, an empty one and a file. The file's bytes hold a line end, `--`, and a line
+    // that starts like the delimiter but goes on.
+    let kind = "multipart/form-data; boundary=----WebKitFormBoundary7MA4YWxk";
+    let body = "------WebKitFormBoundary7MA4YWxk\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nhello\r\n------WebKitFormBoundary7MA4YWxk\r\nContent-Disposition: form-data; name=\"note\"\r\n\r\n\r\n------WebKitFormBoundary7MA4YWxk\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a;b.txt\"\r\nContent-Type: text/plain\r\n\r\nline 1\r\n--\r\n------WebKitFormBoundary7MA4YWxkX\r\nend\r\n------WebKitFormBoundary7MA4YWxk--\r\n";
+    await posted(
+        a,
+        kind,
+        body,
+        "title=hello\nnote=\nfile=line 1\r\n--\r\n------WebKitFormBoundary7MA4YWxkX\r\nend[a;b.txt;text/plain]\nok",
+    )?;
+    // A quoted boundary, a preamble, padding after a delimiter, and an epilogue.
+    await posted(
+        a,
+        "Multipart/Form-Data; charset=utf-8; boundary=\"x y\"",
+        "ignored\r\n--x y \t\r\ncontent-disposition: form-data; name=a\r\n\r\n1\r\n--x y--\r\nignored too",
+        "a=1\nok",
+    )?;
+    // Cut before the closing delimiter: the part that was whole is given, and the body is marked.
+    await posted(
+        a,
+        "multipart/form-data; boundary=b",
+        "--b\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\n1\r\n--b\r\nContent-Disposition: form-data; name=\"c\"\r\n\r\n2",
+        "a=1\nbroken",
+    )?;
+    // No delimiter at all, and a part without a name.
+    await posted(a, "multipart/form-data; boundary=b", "a=1", "broken")?;
+    await posted(a, "multipart/form-data; boundary=b", "--b\r\nContent-Type: text/plain\r\n\r\n1\r\n--b--\r\n", "broken")?;
+    // An empty form.
+    await posted(a, "multipart/form-data; boundary=b", "--b--\r\n", "ok")?;
+    // `multipart/form-data` without a boundary is not read as multipart.
+    await posted(a, "multipart/form-data", "title=x", "x")?;
+    return Ok();
+}

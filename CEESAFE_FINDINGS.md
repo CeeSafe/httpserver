@@ -15,6 +15,7 @@ Bugs and gaps in CeeSafe and CeeSafe.Web met while writing httpserver, with cees
 | S8 | A connection does not say whether it came over TLS | CeeSafe.Web | `HttpsRedirect` redirects everything; the application on the plain port uses it |
 | S9 | `Application.beforeHead` gets the request and the head, not the handler's context | CeeSafe.Web | a group's middleware has no `after`; a response cannot be timed from one hook |
 | S10 | Nothing can change a response's body after the handler sends it | CeeSafe.Web | compression is a call the handler makes (`Compression.send`), not a middleware |
+| S11 | `for (x in it)` over an iterator that is Copy walks a copy, and says nothing | ceesafec | `Multipart` is `@noncopy` |
 
 ## S1: a nested `if` expression's literals are `i32`
 
@@ -120,3 +121,16 @@ passed to `beforeHead`.
 an output cache and a response logger are therefore not middleware in httpserver: a handler that wants its body
 compressed answers through `Compression.send`. Wanted: a body filter an application can put between the handler's
 writes and the connection.
+
+## S11: a `for` loop over a Copy iterator walks a copy
+
+```ceesafe
+var parts = Multipart.of(body, boundary);   // every field Copy, so the struct is Copy
+for (part in parts) { ... }                  // walks a copy of `parts`
+parts.failed()                               // the original: never advanced, never failed
+```
+
+Seen in tests/form.cee: a body cut short was reported as well-formed, because `failed()` was asked of the value the
+loop had not touched. Nothing warns. A struct with `fn next(borrow mut this)` whose state matters after the loop
+has to be `@noncopy`, after which the loop is refused and the caller writes `parts.next()` in a `loop`. Wanted: a
+warning for a `for` over a Copy value that is read again afterwards, or the loop borrowing a named variable.

@@ -67,6 +67,12 @@ impl Handler<Shop> for Item {
 - **Compression.** `Compression.send` answers with gzip when the request accepts it, the body is not small and gzip
   makes it smaller, and marks such responses `vary: accept-encoding`. The encoder uses fixed Huffman codes: JSON-like
   text comes out at about a sixth of its size. `tools/gzip_check.py` checks it against Python's gzip.
+- **Forms.** `Form.value` for a URL-encoded body, and `Multipart` for `multipart/form-data` (RFC 7578): the parts
+  of a body already read, as views of it (name, file name, content type, bytes), with `failed()` for a body that is
+  not multipart or was cut.
+- **Static files** (`static/`, the package `httpserver_static`, on CeeSafe.Web's `web_static`): `Files` serves a
+  root with media types, ETag and Last-Modified, conditional requests, one range, and `sendFile`; a path that leaves
+  the root is 404. `FilesOptions.singlePage("index.html")` answers a single-page application's routes with its page.
 - **Replies.** `Reply.text`, `html`, `json`, `bytes`, `empty`, `redirect` and `problem` (RFC 9457).
 - **The query.** `Query.raw`, `Query.value` (decoded) and `Query.number`.
 - **HTTP/1.1 and HTTP/2** on one port: `h2` by ALPN over TLS (`web_tls`'s acceptor), or by its preface in clear.
@@ -104,7 +110,7 @@ still answering.
 
 ## What is not here yet
 
-Of CosmoApiServer: request timeouts, logging and tracing, Brotli, response and output caching, tokens signed with RSA or Ed25519 and authorisation policies, multipart forms, static files, WebSocket hubs, the
+Of CosmoApiServer: request timeouts, logging and tracing, Brotli, response and output caching, tokens signed with RSA or Ed25519 and authorisation policies, WebSocket hubs, the
 scheduler. The rate limit counts in one process: under the supervisor, each worker has its own counters. Not planned: reflection controllers and
 dependency injection (handlers are structs), Razor and Blazor, the front-end development helpers, SignalR's wire
 protocol; gRPC and OpenAPI unless asked for.
@@ -155,6 +161,7 @@ ceesafec check && ceesafec fmt --check
 ceesafec test
 ceesafec test --cflag -fsanitize=address,undefined
 (cd auth && ceesafec test)
+(cd static && ceesafec test)
 (cd bench && ceesafec build)      # then: python3 <CeeSafe.Web>/benchmarks/servers/conform.py --port 8090
 python3 tools/supervisor_check.py # the supervisor, against bench/out/bench
 python3 tools/gzip_check.py       # compressed responses, against Python's gzip

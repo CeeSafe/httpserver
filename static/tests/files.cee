@@ -1,0 +1,215 @@
+// `Files` over HTTP/1.1's driver on mock connections, against a root made in a temporary directory. A file's ETag
+// and date change from run to run, so a response is checked by its status line, the fields that are fixed, and its
+// body.
+import web_core;
+import web_transport;
+import web_http;
+import web_http1;
+import httpserver;
+
+struct St {}
+
+fn alloc<T>(r: Result<T, AllocError>) -> Result<T, TestFailure> {
+    match (r) {
+        Ok(v) => { return Ok(v); }
+        Err(_) => { return Err(TestFailure.create("out of memory")); }
+    }
+}
+
+fn io<T>(r: Result<T, IoError>, what: StringView) -> Result<T, TestFailure> {
+    match (r) {
+        Ok(v) => { return Ok(v); }
+        Err(_) => { return Err(TestFailure.create(what)); }
+    }
+}
+
+fn routed<T>(r: Result<T, RouteError>) -> Result<T, TestFailure> {
+    match (r) {
+        Ok(v) => { return Ok(v); }
+        Err(_) => { return Err(TestFailure.create("a route error")); }
+    }
+}
+
+fn joined(dir: StringView, name: StringView) -> Result<String, TestFailure> {
+    var s = String.create();
+    alloc(s.append(dir))?;
+    alloc(s.append("/"))?;
+    alloc(s.append(name))?;
+    return Ok(s);
+}
+
+fn writeFile(dir: StringView, name: StringView, text: StringView) -> Result<void, TestFailure> {
+    let path = joined(dir, name)?;
+    var f = io(File.create(path.view()), "creating a file")?;
+    io(f.write(text.bytes()), "writing a file")?;
+    return Ok();
+}
+
+/// `<dir>/secret.txt` outside the root, and the root `<dir>/public` with `index.html`, `app.js`, `letters.txt` (the
+/// alphabet) and the empty directory `empty/`.
+fn site() -> Result<String, TestFailure> {
+    let dir = io(Directory.temporary(), "a temporary directory")?;
+    writeFile(dir.view(), "secret.txt", "secret")?;
+    let root = joined(dir.view(), "public")?;
+    io(Directory.create(root.view()), "a directory")?;
+    writeFile(root.view(), "index.html", "<p>home</p>")?;
+    writeFile(root.view(), "app.js", "let a = 1;")?;
+    writeFile(root.view(), "letters.txt", "abcdefghijklmnopqrstuvwxyz")?;
+    let empty = joined(root.view(), "empty")?;
+    io(Directory.create(empty.view()), "a directory")?;
+    return Ok(dir);
+}
+
+fn removed(dir: StringView) {
+    for (n in ["public/index.html", "public/app.js", "public/letters.txt", "secret.txt"]) {
+        match (joined(dir, n)) {
+            Ok(p) => { let _ = File.remove(p.view()); }
+            Err(_) => {}
+        }
+    }
+    for (n in ["public/empty", "public"]) {
+        match (joined(dir, n)) {
+            Ok(p) => { let _ = Directory.remove(p.view()); }
+            Err(_) => {}
+        }
+    }
+    let _ = Directory.remove(dir);
+}
+
+async fn served(app: borrow App<St>, text: Slice<u8>) -> Result<Vector<u8>, TestFailure> {
+    var conn = match (MockTransport.create(text)) {
+        Ok(m) => m,
+        Err(_) => { return Err(TestFailure.create("a mock")); },
+    };
+    let drain = match (Drain.create()) {
+        Ok(d) => d,
+        Err(_) => { return Err(TestFailure.create("a drain")); },
+    };
+    let ctx = ConnectionContext.acceptedNow(1, drain);
+    match (await web_http1.serve(mut conn, ctx, app, app.limits())) {
+        Ok() => {}
+        Err(e) => { return Err(TestFailure.create(NetErrors.describe(e))); }
+    }
+    var out = Vector<u8>.create();
+    for (b in conn.written()) {
+        alloc(out.push(b))?;
+    }
+    return Ok(out);
+}
+
+/// Where `part` is in `text`, or null.
+fn find(text: Slice<u8>, part: StringView) -> usize? {
+    let p = part.bytes();
+    if (p.length > text.length) {
+        return null;
+    }
+    for (at in 0..text.length - p.length + 1) {
+        var same = true;
+        for (i in 0..p.length) {
+            if (text[at + i] != p[i]) {
+                same = false;
+                break;
+            }
+        }
+        if (same) {
+            return Some(at);
+        }
+    }
+    return null;
+}
+
+/// Checks that `response` starts with `start`, has each of `fields` (none for an empty one), and ends with `end`.
+fn shaped(
+    response: Slice<u8>,
+    start: StringView,
+    fieldA: StringView,
+    fieldB: StringView,
+    end: StringView,
+) -> Result<void, TestFailure> {
+    Check.isTrue(find(response, start) == Some(0usize), start)?;
+    if (fieldA.length > 0) {
+        Check.isTrue(find(response, fieldA).isSome(), fieldA)?;
+    }
+    if (fieldB.length > 0) {
+        Check.isTrue(find(response, fieldB).isSome(), fieldB)?;
+    }
+    let e = end.bytes();
+    Check.isTrue(response.length >= e.length, "long enough for its end")?;
+    return Check.equalBytes(e, response[response.length - e.length..]);
+}
+
+async fn checks(dir: StringView) -> Result<void, TestFailure> {
+    let root = joined(dir, "public")?;
+    var limits = Limits.defaults();
+    limits.sendDate = false;
+    var a = routed(App<St>.create(St {}, limits))?;
+    let files: Box<dyn Handler<St> + Send + Share> =
+        alloc(Box.create(alloc(Files<St>.create(root.view(), FilesOptions.defaults()))?))?;
+    routed(a.get("/site/{*path}", files))?;
+    let spa: Box<dyn Handler<St> + Send + Share> =
+        alloc(Box.create(alloc(Files<St>.create(root.view(), alloc(FilesOptions.singlePage("index.html"))?))?))?;
+    routed(a.get("/app/{*path}", spa))?;
+
+    let script = await served(a, "GET /site/app.js HTTP/1.1\r\nhost: a\r\n\r\n".bytes())?;
+    shaped(script.view(), "HTTP/1.1 200 OK\r\n", "\r\naccept-ranges: bytes\r\n", "\r\ncontent-length: 10\r\n", "\r\n\r\nlet a = 1;")?;
+    Check.isTrue(find(script.view(), "javascript").isSome(), "a JavaScript media type")?;
+    // A directory is its index; one without an index, a missing file and a path that leaves the root are 404.
+    let home = await served(a, "GET /site/ HTTP/1.1\r\nhost: a\r\n\r\n".bytes())?;
+    shaped(home.view(), "HTTP/1.1 200 OK\r\n", "\r\ncontent-type: text/html", "", "\r\n\r\n<p>home</p>")?;
+    for (target in ["/site/empty/", "/site/nope.css", "/site/users/42", "/site/../secret.txt", "/site/%2e%2e/secret.txt", "/site/..%2Fsecret.txt"]) {
+        var request = Vector<u8>.create();
+        alloc(request.extend("GET ".bytes()))?;
+        alloc(request.extend(target.bytes()))?;
+        alloc(request.extend(" HTTP/1.1\r\nhost: a\r\n\r\n".bytes()))?;
+        let missing = await served(a, request.view())?;
+        Check.isTrue(find(missing.view(), "HTTP/1.1 404 Not Found\r\n") == Some(0usize), target)?;
+        Check.isTrue(find(missing.view(), "secret").isNull(), "nothing from outside the root")?;
+    }
+    // One range (RFC 9110 §14.2).
+    let part = await served(a, "GET /site/letters.txt HTTP/1.1\r\nhost: a\r\nrange: bytes=2-5\r\n\r\n".bytes())?;
+    shaped(part.view(), "HTTP/1.1 206 Partial Content\r\n", "\r\ncontent-range: bytes 2-5/26\r\n", "\r\ncontent-length: 4\r\n", "\r\n\r\ncdef")?;
+    let beyond = await served(a, "GET /site/letters.txt HTTP/1.1\r\nhost: a\r\nrange: bytes=40-\r\n\r\n".bytes())?;
+    shaped(beyond.view(), "HTTP/1.1 416 Range Not Satisfiable\r\n", "\r\ncontent-range: bytes */26\r\n", "", "\r\n\r\n")?;
+    // A conditional request with the ETag the first response gave (where the system tells a file's time).
+    match (find(script.view(), "\r\netag: ")) {
+        Some(at) => {
+            var end = at + 8;
+            while (script.view()[end] != 13) {
+                end += 1;
+            }
+            var request = Vector<u8>.create();
+            alloc(request.extend("GET /site/app.js HTTP/1.1\r\nhost: a\r\nif-none-match: ".bytes()))?;
+            alloc(request.extend(script.view()[at + 8..end]))?;
+            alloc(request.extend("\r\n\r\n".bytes()))?;
+            let same = await served(a, request.view())?;
+            shaped(same.view(), "HTTP/1.1 304 Not Modified\r\n", "\r\netag: ", "", "\r\n\r\n")?;
+            Check.isTrue(find(same.view(), "let a").isNull(), "no body")?;
+        }
+        null => {}
+    }
+    let post = await served(a, "POST /site/app.js HTTP/1.1\r\nhost: a\r\ncontent-length: 0\r\n\r\n".bytes())?;
+    Check.isTrue(find(post.view(), "HTTP/1.1 405 Method Not Allowed\r\n") == Some(0usize), "405 for POST")?;
+    // HEAD: GET's fields, no body.
+    let head = await served(a, "HEAD /site/letters.txt HTTP/1.1\r\nhost: a\r\n\r\n".bytes())?;
+    shaped(head.view(), "HTTP/1.1 200 OK\r\n", "\r\ncontent-length: 26\r\n", "", "\r\n\r\n")?;
+
+    // The single-page application: a route gets the page, never cached; a file gets itself; a missing file is 404.
+    let route = await served(a, "GET /app/users/42 HTTP/1.1\r\nhost: a\r\n\r\n".bytes())?;
+    shaped(route.view(), "HTTP/1.1 200 OK\r\n", "\r\ncontent-type: text/html", "\r\ncache-control: no-cache\r\n", "\r\n\r\n<p>home</p>")?;
+    let asset = await served(a, "GET /app/app.js HTTP/1.1\r\nhost: a\r\n\r\n".bytes())?;
+    shaped(asset.view(), "HTTP/1.1 200 OK\r\n", "", "", "\r\n\r\nlet a = 1;")?;
+    Check.isTrue(find(asset.view(), "no-cache").isNull(), "a file is not marked no-cache")?;
+    let gone = await served(a, "GET /app/old.js HTTP/1.1\r\nhost: a\r\n\r\n".bytes())?;
+    Check.isTrue(find(gone.view(), "HTTP/1.1 404 Not Found\r\n") == Some(0usize), "a missing file is not the page")?;
+    let escape = await served(a, "GET /app/..%2Fsecret HTTP/1.1\r\nhost: a\r\n\r\n".bytes())?;
+    Check.isTrue(find(escape.view(), "HTTP/1.1 404 Not Found\r\n") == Some(0usize), "a refused path is not the page")?;
+    return Ok();
+}
+
+@test
+fn filesAndTheSinglePageFallback() -> Result<void, TestFailure> {
+    let dir = site()?;
+    let result = Async.run(checks(dir.view()));
+    removed(dir.view());
+    return result;
+}
