@@ -1,5 +1,6 @@
-// JSON Web Tokens (RFC 7519) signed with HMAC-SHA-256 (`HS256`, RFC 7518 §3.2), and the filter that asks a request
-// for one (`Authorization: Bearer <token>`, RFC 6750).
+// JSON Web Tokens (RFC 7519) signed with HS256, RS256, EdDSA or ES256 (RFC 7518 §3, RFC 8037), the keys they are
+// checked against (secrets, PEM public keys, JSON Web Key Sets), and the filters that ask a request for one
+// (`Authorization: Bearer <token>`, RFC 6750) and for what its claims must say.
 import web_core;
 import web_http;
 import httpserver;
@@ -7,14 +8,16 @@ import sha256;
 import encoding;
 import json.Json;
 import json.JsonValue;
+import pkey;
 
-/// Why a token was refused.
+/// Why a token was refused, or a key not taken.
 public enum JwtError {
     /// Not three base64url parts, or a part is not JSON.
     Malformed,
-    /// The header's `alg` is not `HS256`: `none` and every other algorithm are refused, whatever the token says.
+    /// The header's `alg` is one this verifier has no key for: `none` and every algorithm not asked for are
+    /// refused, whatever the token says.
     Algorithm,
-    /// The signature is not this key's.
+    /// The signature is not one of this verifier's keys'.
     Signature,
     /// `exp` has passed, or is missing when it is required.
     Expired,
@@ -24,31 +27,156 @@ public enum JwtError {
     Issuer,
     /// `aud` does not name the audience asked for.
     Audience,
+    /// A key that could not be read: not PEM, not a key set, or of a kind not supported.
+    Key,
     /// Out of memory.
     OutOfMemory,
 }
 
-/// Checks tokens signed with one secret.
+/// The algorithms: HMAC-SHA-256; RSA PKCS #1 v1.5 with SHA-256; Ed25519; ECDSA on P-256 with SHA-256 (RFC 7518 §3,
+/// RFC 8037).
+const HS256: u8 = 1;
+const RS256: u8 = 2;
+const EDDSA: u8 = 3;
+const ES256: u8 = 4;
+
+/// A key: a secret for HS256, a public key for the others. A key is used for its own algorithm only, so a token
+/// that names HS256 is never checked against a public key as if it were a secret.
+struct Key {
+    kid: Vector<u8>;
+    algorithm: u8;
+    /// HS256: the secret. RS256: SubjectPublicKeyInfo or RSAPublicKey DER. EdDSA: the 32 bytes. ES256:
+    /// SubjectPublicKeyInfo DER.
+    material: Vector<u8>;
+}
+
+/// What comes before the 32 key bytes in an Ed25519 SubjectPublicKeyInfo, and before the 65-byte point in a P-256
+/// one (RFC 8410 §4, RFC 5480 §2).
+fn ed25519Prefix() -> [u8; 12] => [0x30, 0x2A, 0x30, 0x05, 0x06, 0x03, 0x2B, 0x65, 0x70, 0x03, 0x21, 0x00];
+
+fn p256Prefix() -> [u8; 26] => [
+    0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01, 0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE,
+    0x3D, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00,
+];
+
+/// Checks tokens against its keys.
 public struct JwtVerifier {
-    private secret: Vector<u8>;
+    private keys: Vector<Key>;
     private issuer: Vector<u8>;
     private audience: Vector<u8>;
     /// How far this clock may differ from the issuer's.
     private leeway: i64;
     private needsExpiry: bool;
 
-    /// Tokens signed with `secret`, which must carry an `exp`; 30 seconds of leeway; any issuer and audience.
+    /// A verifier with no keys yet: tokens must carry an `exp`; 30 seconds of leeway; any issuer and audience.
+    public fn create() -> JwtVerifier => JwtVerifier {
+        keys: Vector<Key>.create(),
+        issuer: Vector<u8>.create(),
+        audience: Vector<u8>.create(),
+        leeway: 30,
+        needsExpiry: true,
+    };
+
+    /// A verifier for HS256 tokens signed with `secret`.
     public fn hs256(secret: Slice<u8>) -> Result<JwtVerifier, AllocError> {
-        var v = JwtVerifier {
-            secret: Vector<u8>.create(),
-            issuer: Vector<u8>.create(),
-            audience: Vector<u8>.create(),
-            leeway: 30,
-            needsExpiry: true,
-        };
-        copied(mut v.secret, secret)?;
+        var v = JwtVerifier.create();
+        v.add("".bytes(), HS256, secret)?;
         return Ok(v);
     }
+
+    fn add(borrow mut this, kid: Slice<u8>, algorithm: u8, material: Slice<u8>) -> Result<void, AllocError> {
+        var k = Key { kid: Vector<u8>.create(), algorithm: algorithm, material: Vector<u8>.create() };
+        k.kid.extend(kid)?;
+        k.material.extend(material)?;
+        return this.keys.push(k);
+    }
+
+    /// Adds a secret for HS256 tokens; `kid` (may be empty) is the key's id in a token's header.
+    public fn addSecret(borrow mut this, kid: StringView, secret: Slice<u8>) -> Result<void, AllocError> =>
+        this.add(kid.bytes(), HS256, secret);
+
+    /// Adds a public key in PEM (`-----BEGIN PUBLIC KEY-----`): RSA for RS256, Ed25519 for EdDSA, or P-256 for ES256;
+    /// the kind is read from the key.
+    public fn addPublicKeyPem(borrow mut this, kid: StringView, pem: Slice<u8>) -> Result<void, JwtError> {
+        var der = Vector<u8>.create();
+        unarmoured(pem, mut der)?;
+        let d = der.view();
+        let ed = ed25519Prefix();
+        let ec = p256Prefix();
+        if (d.length == 44 && same(d[0..12], ed[..])) {
+            return grown(this.add(kid.bytes(), EDDSA, d[12..]));
+        }
+        if (d.length == 91 && same(d[0..26], ec[..])) {
+            return grown(this.add(kid.bytes(), ES256, d));
+        }
+        // Anything else is taken as RSA: a key that is not fails every signature.
+        return grown(this.add(kid.bytes(), RS256, d));
+    }
+
+    /// Adds the keys of a JSON Web Key Set (RFC 7517 §5: `{"keys":[…]}`), as an identity provider publishes it:
+    /// RSA (`n`, `e`), Ed25519 (`OKP`, `x`) and P-256 (`EC`, `x`, `y`) keys, each under its `kid`. Keys of other
+    /// kinds, or marked for encryption (`"use":"enc"`), are passed over. How many were added.
+    public fn addJwks(borrow mut this, text: Slice<u8>) -> Result<u32, JwtError> {
+        let set = match (Json.parse(text)) {
+            Ok(v) => v,
+            Err(_) => { return Err(JwtError.Key); },
+        };
+        let list = set.get("keys") ?? { return Err(JwtError.Key); };
+        if (!list.isArray()) {
+            return Err(JwtError.Key);
+        }
+        var added: u32 = 0;
+        for (i in 0..list.length()) {
+            let jwk = list.at(i) ?? { continue; };
+            if (stringOf(jwk, "use") == "enc") {
+                continue;
+            }
+            let kid = stringOf(jwk, "kid");
+            let kty = stringOf(jwk, "kty");
+            if (kty == "RSA") {
+                var n = Vector<u8>.create();
+                var e = Vector<u8>.create();
+                if (!member(jwk, "n", mut n) || !member(jwk, "e", mut e)) {
+                    return Err(JwtError.Key);
+                }
+                // RSAPublicKey ::= SEQUENCE { modulus INTEGER, publicExponent INTEGER } (RFC 8017 A.1.1)
+                var body = Vector<u8>.create();
+                grown(derInteger(n.view(), mut body))?;
+                grown(derInteger(e.view(), mut body))?;
+                var der = Vector<u8>.create();
+                grown(der.push(0x30))?;
+                grown(derLength(body.length, mut der))?;
+                grown(der.extend(body.view()))?;
+                grown(this.add(kid.bytes(), RS256, der.view()))?;
+                added += 1;
+            } else if (kty == "OKP" && stringOf(jwk, "crv") == "Ed25519") {
+                var x = Vector<u8>.create();
+                if (!member(jwk, "x", mut x) || x.length != 32) {
+                    return Err(JwtError.Key);
+                }
+                grown(this.add(kid.bytes(), EDDSA, x.view()))?;
+                added += 1;
+            } else if (kty == "EC" && stringOf(jwk, "crv") == "P-256") {
+                var x = Vector<u8>.create();
+                var y = Vector<u8>.create();
+                if (!member(jwk, "x", mut x) || !member(jwk, "y", mut y) || x.length != 32 || y.length != 32) {
+                    return Err(JwtError.Key);
+                }
+                let prefix = p256Prefix();
+                var der = Vector<u8>.create();
+                grown(der.extend(prefix[..]))?;
+                grown(der.push(4))?; // an uncompressed point
+                grown(der.extend(x.view()))?;
+                grown(der.extend(y.view()))?;
+                grown(this.add(kid.bytes(), ES256, der.view()))?;
+                added += 1;
+            }
+        }
+        return Ok(added);
+    }
+
+    /// How many keys the verifier has.
+    public fn keyCount(borrow this) -> usize => this.keys.length;
 
     /// Only tokens whose `iss` is `issuer`.
     public fn requireIssuer(borrow mut this, issuer: StringView) -> Result<void, AllocError> {
@@ -72,7 +200,56 @@ public struct JwtVerifier {
         this.needsExpiry = false;
     }
 
-    /// The claims of `token` if it is this key's and valid at `nowSeconds` (Unix time).
+    /// Whether `signature` over `signed` is good under one of the keys for `algorithm` (and `kid`, if the token
+    /// names one and the key has one).
+    fn signedBy(
+        borrow this,
+        algorithm: u8,
+        kid: Slice<u8>,
+        signed: Slice<u8>,
+        signature: Slice<u8>,
+    ) -> Result<void, JwtError> {
+        var any = false;
+        for (i in 0..this.keys.length) {
+            let k = borrow this.keys[i];
+            if (k.algorithm != algorithm) {
+                continue;
+            }
+            any = true;
+            if (kid.length > 0 && k.kid.length > 0 && !same(kid, k.kid.view())) {
+                continue;
+            }
+            var verdict = Verdict.Bad;
+            if (algorithm == HS256) {
+                let expected = HmacSha256.mac(k.material.view(), signed);
+                if (constantTimeEqual(expected[..], signature)) {
+                    return Ok();
+                }
+            } else if (algorithm == RS256) {
+                verdict = Signatures.verifyRsaSha256(k.material.view(), signed, signature);
+            } else if (algorithm == EDDSA) {
+                verdict = Signatures.verifyEd25519(k.material.view(), signed, signature);
+            } else if (signature.length == 64) {
+                // A token carries ECDSA's r and s as 32 bytes each (RFC 7518 §3.4); OpenSSL takes them as DER.
+                var body = Vector<u8>.create();
+                grown(derInteger(signature[0..32], mut body))?;
+                grown(derInteger(signature[32..64], mut body))?;
+                var der = Vector<u8>.create();
+                grown(der.push(0x30))?;
+                grown(derLength(body.length, mut der))?;
+                grown(der.extend(body.view()))?;
+                verdict = Signatures.verifyEcdsa(k.material.view(), signed, der.view());
+            }
+            match (verdict) {
+                Verdict.Good => { return Ok(); }
+                Verdict.OutOfMemory => { return Err(JwtError.OutOfMemory); }
+                _ => {}
+            }
+        }
+        return Err(if (any) JwtError.Signature else JwtError.Algorithm);
+    }
+
+    /// The claims of `token` if one of this verifier's keys signed it and it is valid at `nowSeconds` (Unix time).
     public fn verify(borrow this, token: Slice<u8>, nowSeconds: i64) -> Result<JsonValue, JwtError> {
         // header.payload.signature
         var firstDot: usize = token.length;
@@ -98,19 +275,22 @@ public struct JwtVerifier {
             Ok(v) => v,
             Err(_) => { return Err(JwtError.Malformed); },
         };
-        let algorithm = match (header.get("alg")) {
-            Some(v) => v.asStr() ?? "",
-            null => "",
-        };
-        if (algorithm != "HS256") {
+        let named = stringOf(header, "alg");
+        var algorithm: u8 = 0;
+        if (named == "HS256") {
+            algorithm = HS256;
+        } else if (named == "RS256") {
+            algorithm = RS256;
+        } else if (named == "EdDSA") {
+            algorithm = EDDSA;
+        } else if (named == "ES256") {
+            algorithm = ES256;
+        } else {
             return Err(JwtError.Algorithm);
         }
         var signature = Vector<u8>.create();
         decoded(token[secondDot + 1..], mut signature)?;
-        let expected = HmacSha256.mac(this.secret.view(), token[0..secondDot]);
-        if (!constantTimeEqual(expected[..], signature.view())) {
-            return Err(JwtError.Signature);
-        }
+        this.signedBy(algorithm, stringOf(header, "kid").bytes(), token[0..secondDot], signature.view())?;
         var payload = Vector<u8>.create();
         decoded(token[firstDot + 1..secondDot], mut payload)?;
         let claims = match (Json.parse(payload.view())) {
@@ -142,14 +322,8 @@ public struct JwtVerifier {
             }
             null => {}
         }
-        if (this.issuer.length > 0) {
-            let issuer = match (claims.get("iss")) {
-                Some(v) => v.asStr() ?? "",
-                null => "",
-            };
-            if (!same(issuer.bytes(), this.issuer.view())) {
-                return Err(JwtError.Issuer);
-            }
+        if (this.issuer.length > 0 && !same(stringOf(claims, "iss").bytes(), this.issuer.view())) {
+            return Err(JwtError.Issuer);
         }
         if (this.audience.length > 0 && !this.named(claims)) {
             return Err(JwtError.Audience);
@@ -160,30 +334,130 @@ public struct JwtVerifier {
     /// Whether `claims`' `aud`, a string or a list of them, names the audience asked for.
     fn named(borrow this, claims: borrow JsonValue) -> bool {
         let aud = claims.get("aud") ?? { return false; };
-        match (aud.asStr()) {
-            Some(one) => { return same(one.bytes(), this.audience.view()); }
-            null => {}
-        }
-        if (!aud.isArray()) {
+        return holds(aud, this.audience.view(), false);
+    }
+}
+
+/// The string member `name` of the object `v`, or empty.
+fn stringOf<region r>(v: borrow(r) JsonValue, name: StringView) -> StringView<r> => match (v.get(name)) {
+    Some(m) => m.asStr() ?? "",
+    null => "",
+};
+
+/// Whether `v` is the string `wanted`, a list with it, or, with `words`, a string of space-separated words with it
+/// (OAuth's `scope`, RFC 6749 §3.3).
+fn holds(v: borrow JsonValue, wanted: Slice<u8>, words: bool) -> bool {
+    match (v.asStr()) {
+        Some(one) => {
+            let bytes = one.bytes();
+            if (!words) {
+                return same(bytes, wanted);
+            }
+            var at: usize = 0;
+            while (at <= bytes.length) {
+                var end = at;
+                while (end < bytes.length && bytes[end] != 32) {
+                    end += 1;
+                }
+                if (same(bytes[at..end], wanted)) {
+                    return true;
+                }
+                at = end + 1;
+            }
             return false;
         }
-        for (i in 0..aud.length()) {
-            match (aud.at(i)) {
-                Some(entry) => {
-                    match (entry.asStr()) {
-                        Some(one) => {
-                            if (same(one.bytes(), this.audience.view())) {
-                                return true;
-                            }
-                        }
-                        null => {}
-                    }
-                }
-                null => {}
-            }
-        }
+        null => {}
+    }
+    if (!v.isArray()) {
         return false;
     }
+    for (i in 0..v.length()) {
+        match (v.at(i)) {
+            Some(entry) => {
+                match (entry.asStr()) {
+                    Some(one) => {
+                        if (same(one.bytes(), wanted)) {
+                            return true;
+                        }
+                    }
+                    null => {}
+                }
+            }
+            null => {}
+        }
+    }
+    return false;
+}
+
+/// The base64url member `name` of the JSON Web Key `jwk`, decoded into `out`; false without one.
+fn member(jwk: borrow JsonValue, name: StringView, out: borrow mut Vector<u8>) -> bool {
+    let value = stringOf(jwk, name);
+    return value.length > 0 && Base64.decodeUrl(value.bytes(), out).isOk();
+}
+
+fn grown(r: Result<void, AllocError>) -> Result<void, JwtError> => match (r) {
+    Ok() => Ok(),
+    Err(_) => Err(JwtError.OutOfMemory),
+};
+
+/// A DER length (X.690 §8.1.3).
+fn derLength(n: usize, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    if (n < 128) {
+        return out.push(truncate<u8>(n));
+    }
+    if (n < 256) {
+        out.push(0x81)?;
+        return out.push(truncate<u8>(n));
+    }
+    out.push(0x82)?;
+    out.push(truncate<u8>(n >> 8))?;
+    return out.push(truncate<u8>(n));
+}
+
+/// The unsigned big-endian number `bytes` as a DER INTEGER: without leading zeros, and with one zero byte before a
+/// number whose first bit is set, which would otherwise read as negative (X.690 §8.3).
+fn derInteger(bytes: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    var start: usize = 0;
+    while (start + 1 < bytes.length && bytes[start] == 0) {
+        start += 1;
+    }
+    let digits = bytes[start..];
+    let padded = digits.length > 0 && digits[0] >= 128;
+    out.push(2)?;
+    derLength(digits.length + (if (padded) 1usize else 0usize), out)?;
+    if (padded) {
+        out.push(0)?;
+    }
+    return out.extend(digits);
+}
+
+/// The DER inside the PEM `pem`: the base64 between the `-----BEGIN …-----` and `-----END …-----` lines.
+fn unarmoured(pem: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, JwtError> {
+    var body = Vector<u8>.create();
+    var at: usize = 0;
+    var inside = false;
+    var ended = false;
+    while (at < pem.length) {
+        var end = at;
+        while (end < pem.length && pem[end] != 10) {
+            end += 1;
+        }
+        let line = pem[at..end];
+        if (line.length >= 5 && line[0] == 45) {
+            if (inside) {
+                ended = true;
+                break;
+            }
+            inside = true;
+        } else if (inside) {
+            grown(body.extend(line))?;
+        }
+        at = end + 1;
+    }
+    if (!ended || Base64.decodeIgnoringSpace(body.view(), out).isErr()) {
+        return Err(JwtError.Key);
+    }
+    return Ok();
 }
 
 /// Making tokens.
@@ -281,6 +555,52 @@ impl Filter for BearerAuth {
             return Err(HandlerError.Internal);
         }
         return Ok(Flow.Continue);
+    }
+
+    async fn after(borrow this, request: borrow Request, head: borrow mut ResponseHead) -> Result<void, HandlerError> =>
+        Ok();
+}
+
+/// Lets through only requests whose token has a claim that names a value: a role, a scope, a tenant. It runs after
+/// `BearerAuth`, whose claims it reads; a request without them is answered 401, one whose claim does not name the
+/// value 403 (RFC 6750 §3.1: `insufficient_scope`).
+public struct RequireClaim {
+    private claim: String;
+    private value: Vector<u8>;
+
+    /// The claim `claim` must be `value`, or a list with it; a `scope` claim, a string of space-separated words
+    /// with it (`RequireClaim.create("roles", "admin")`, `RequireClaim.create("scope", "orders:write")`).
+    public fn create(claim: StringView, value: StringView) -> Result<RequireClaim, AllocError> {
+        var r = RequireClaim { claim: String.create(), value: Vector<u8>.create() };
+        r.claim.append(claim)?;
+        r.value.extend(value.bytes())?;
+        return Ok(r);
+    }
+}
+
+impl Filter for RequireClaim {
+    async fn before(
+        borrow this,
+        scope: borrow mut Scope,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<Flow, HandlerError> {
+        let held = scope.value("claims") ?? { return await refused(exchange, "Bearer"); };
+        let claims = match (Json.parse(held)) {
+            Ok(c) => c,
+            Err(_) => { return Err(HandlerError.Internal); },
+        };
+        let allowed = match (claims.get(this.claim.view())) {
+            Some(v) => holds(v, this.value.view(), this.claim.view() == "scope"),
+            null => false,
+        };
+        if (allowed) {
+            return Ok(Flow.Continue);
+        }
+        exchange.header("www-authenticate", "Bearer error=\"insufficient_scope\"".bytes())?;
+        let status = StatusCode.of(403) ?? { return Err(HandlerError.Internal); };
+        await Reply.problem(exchange, status, "", "")?;
+        return Ok(Flow.Responded);
     }
 
     async fn after(borrow this, request: borrow Request, head: borrow mut ResponseHead) -> Result<void, HandlerError> =>

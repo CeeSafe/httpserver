@@ -57,9 +57,12 @@ impl Handler<Shop> for Item {
 - **Cookies.** `Cookies.get(request, name)` and `SetCookie` (path, domain, max age, `Secure`, `HttpOnly`,
   `SameSite`).
 - **Health.** `Health.answer`: 200, or 503 once the server drains.
-- **Tokens** (`auth/`, the package `httpserver_auth`, on CeeSafeLibs' sha256, encoding and json): `JwtVerifier` for
-  HS256 tokens (`exp`, `nbf`, issuer, audience, leeway; `alg: none` and every other algorithm refused), `Jwt.signHs256`,
-  and `BearerAuth`, which answers 401 with `WWW-Authenticate` or leaves the token's `sub` and claims for the handler.
+- **Tokens** (`auth/`, the package `httpserver_auth`, on CeeSafeLibs' sha256, encoding, json and pkey): `JwtVerifier`
+  checks HS256, RS256, EdDSA and ES256 tokens (`exp`, `nbf`, issuer, audience, leeway) against secrets, PEM public
+  keys, or a JSON Web Key Set as an identity provider publishes it, by `kid`. A key is used for its own algorithm
+  only, and `alg: none` is refused. `BearerAuth` answers 401 with `WWW-Authenticate` or leaves the token's `sub` and
+  claims for the handler; `RequireClaim` after it asks for a role or a scope, or answers 403. The package links
+  OpenSSL's libcrypto through pkey.
 - **Sessions and CSRF** (`auth/`): `Sessions` keeps a session's bytes in a cookie the server signed (HMAC-SHA-256),
   so nothing is stored, nothing is shared between workers, and there is no session id to fix; `Csrf` is the signed
   double-submit token: a cookie on the first visit, and 403 for a request that changes something without the same
@@ -109,7 +112,7 @@ still answering.
 
 ## What is not here yet
 
-Of CosmoApiServer: request timeouts, logging and tracing, response and output caching, tokens signed with RSA or Ed25519 and authorisation policies, the scheduler. The rate limit counts in one process: under the supervisor, each worker has its own counters. Not planned: reflection controllers and
+Of CosmoApiServer: request timeouts, logging and tracing, response and output caching, the scheduler. The rate limit counts in one process: under the supervisor, each worker has its own counters. Not planned: reflection controllers and
 dependency injection (handlers are structs), Razor and Blazor, the front-end development helpers, SignalR's wire
 protocol; gRPC and OpenAPI unless asked for.
 

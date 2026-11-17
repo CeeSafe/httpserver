@@ -15,4 +15,6 @@ web_http1 = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "4bb64c6
 # HMAC-SHA-256 for HS256, base64url for the token's parts, JSON for its header and claims.
 sha256 = { git = "https://github.com/CeeSafe/CeeSafeLibs.git", rev = "ca0a13fec248bbe192f0b61b930c8b8259175eed", dir = "sha256" }
 encoding = { git = "https://github.com/CeeSafe/CeeSafeLibs.git", rev = "ca0a13fec248bbe192f0b61b930c8b8259175eed", dir = "encoding" }
+# RSA, Ed25519 and ECDSA signatures, through OpenSSL 3.
+pkey = { git = "https://github.com/CeeSafe/CeeSafeLibs.git", rev = "ca0a13fec248bbe192f0b61b930c8b8259175eed", dir = "pkey" }
 json = { git = "https://github.com/CeeSafe/CeeSafeLibs.git", rev = "ca0a13fec248bbe192f0b61b930c8b8259175eed", dir = "json" }

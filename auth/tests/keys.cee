@@ -1,0 +1,144 @@
+// Tokens signed with RSA, Ed25519 and ECDSA P-256 keys. The keys were made and the tokens signed with OpenSSL 3's
+// command line (`openssl genrsa`, `genpkey`, `ecparam`; `dgst -sha256 -sign`, `pkeyutl -sign -rawin`), and the key
+// set written with Python from the public keys' DER: nothing here was made with this package. Every token's claims
+// are {"sub":"kim","exp":4102444800,"roles":["admin","dev"],"scope":"read write"}.
+import web_core;
+import web_transport;
+import web_http;
+import httpserver;
+
+fn rsToken() -> StringView => "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InIxIn0.eyJzdWIiOiJraW0iLCJleHAiOjQxMDI0NDQ4MDAsInJvbGVzIjpbImFkbWluIiwiZGV2Il0sInNjb3BlIjoicmVhZCB3cml0ZSJ9.Y3IJ3wgF3r36vPS-kamh4PNmWA0Kt271d5r83Mb8Wo61cCNU5n8rzevrtRQ879g5UrfAJQW-V_qGq5u__SBaLvBF6GTwwsfnhjA8HiEdokAYlPIiPghUxl8EPOVcts3R3E65RqZUMeGN6lTJ3lmmv8EyEqZnnI4d6OH5qfhzFtBGwer6ge_4NR1okOXYvl3ASsFHjbObaMplOjaGN6z_Huzg8iT3uC1gIsjeqju6PoX7cNMkxvz4SEclJnzvidTc9D97iLhAX_8ZlDHTT6SuTcKf7bk_0sYYcL3Ox8GPfTCGIIX6_G1oUbjOW0yu9PsFk2WhaHu4Ykb_HvJpUcIGOg";
+
+fn edToken() -> StringView => "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCIsImtpZCI6ImUxIn0.eyJzdWIiOiJraW0iLCJleHAiOjQxMDI0NDQ4MDAsInJvbGVzIjpbImFkbWluIiwiZGV2Il0sInNjb3BlIjoicmVhZCB3cml0ZSJ9.H8CBwOgepTIQ1VbbmZmlcpXMPDn-UTAP1Fd5ohG8KYA0lsIlQSd3StLHiZww5-u9WbC6epg1lg6VjI9En299BA";
+
+fn esToken() -> StringView => "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6ImMxIn0.eyJzdWIiOiJraW0iLCJleHAiOjQxMDI0NDQ4MDAsInJvbGVzIjpbImFkbWluIiwiZGV2Il0sInNjb3BlIjoicmVhZCB3cml0ZSJ9.NS1ckHPvCcv8qhnHVU784mEkRuDmsdT-IE0hCI4ZPIyRy30D15q5n3QkEG6dqzB0QC_1eKBVFRsL0CNzKyw9qw";
+
+fn keySet() -> StringView => "{\"keys\":[{\"kty\":\"RSA\",\"kid\":\"r1\",\"alg\":\"RS256\",\"use\":\"sig\",\"n\":\"z8gOwQrC7UaO2GYAjwgVeP8OHhbCVzkHXLwRHBX986xV3Y6EbIX2H6gaepY8SN86kcz6Reo_BycFFUwTRqMhDyz4HPOWSVJpdEU76TlW5xny_KX3TkfeEC0elRk5h-em2QXCj4WHz38y0Z7ZnFUrdMpF82lLrwatGnoYDlT4v386Ngl8eMUlQCqgKViDuUDHovk8Tg_u0BeRiXZV5_NYUvYQ-xIIgwpS7jbldfIutIprLWT8MXYy6NYT6WmSqzCv03oG29lgYWfaxqWLO1GPJ2LUw_x8h30wdqLe0HrdD92A7zqaMXEy3H7WXGjiz4M-AhI3BFnNl1BCQbVfPcJ09Q\",\"e\":\"AQAB\"},{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"kid\":\"e1\",\"x\":\"vUZc3Kvh9i49Z_tPCCRxI6j2g3i0AqM07jN5AnScCvE\"},{\"kty\":\"EC\",\"crv\":\"P-256\",\"kid\":\"c1\",\"x\":\"k9K4duzWje2eJ9nFdd8EmzrYhmix3pu2EeRQAlvUSu0\",\"y\":\"4F2uGYL-1QAC4DIwZKg5jRP93dce_K5gW7RfjH-pu4Q\"},{\"kty\":\"oct\",\"kid\":\"ignored\",\"k\":\"AAAA\"}]}";
+
+fn rsaPem() -> StringView => "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAz8gOwQrC7UaO2GYAjwgV\neP8OHhbCVzkHXLwRHBX986xV3Y6EbIX2H6gaepY8SN86kcz6Reo/BycFFUwTRqMh\nDyz4HPOWSVJpdEU76TlW5xny/KX3TkfeEC0elRk5h+em2QXCj4WHz38y0Z7ZnFUr\ndMpF82lLrwatGnoYDlT4v386Ngl8eMUlQCqgKViDuUDHovk8Tg/u0BeRiXZV5/NY\nUvYQ+xIIgwpS7jbldfIutIprLWT8MXYy6NYT6WmSqzCv03oG29lgYWfaxqWLO1GP\nJ2LUw/x8h30wdqLe0HrdD92A7zqaMXEy3H7WXGjiz4M+AhI3BFnNl1BCQbVfPcJ0\n9QIDAQAB\n-----END PUBLIC KEY-----\n";
+
+fn edPem() -> StringView => "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAvUZc3Kvh9i49Z/tPCCRxI6j2g3i0AqM07jN5AnScCvE=\n-----END PUBLIC KEY-----\n";
+
+fn ecPem() -> StringView => "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEk9K4duzWje2eJ9nFdd8EmzrYhmix\n3pu2EeRQAlvUSu3gXa4Zgv7VAALgMjBkqDmNE/3d1x78rmBbtF+Mf6m7hA==\n-----END PUBLIC KEY-----\n";
+
+/// An HS256 token whose "secret" is the RSA public key's PEM text: what an attacker who has the public key can make.
+fn confusedToken() -> StringView => "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InIxIn0.eyJzdWIiOiJraW0iLCJleHAiOjQxMDI0NDQ4MDB9.bt3yn6c3FuiiKPZXnopiGQ0GTQUNWacI0O1n5GYPl7Y";
+
+/// `token` with one character of its signature changed.
+fn spoiled(token: StringView) -> Result<Vector<u8>, TestFailure> {
+    var out = Vector<u8>.create();
+    alloc(out.extend(token.bytes()))?;
+    let at = out.length - 20;
+    out[at] = if (out[at] == 65) 66 else 65;
+    return Ok(out);
+}
+
+fn outcomeOf(v: borrow JwtVerifier, token: Slice<u8>) -> u64 => match (v.verify(token, 1800000000)) {
+    Ok(_) => 0,
+    Err(JwtError.Malformed) => 1,
+    Err(JwtError.Algorithm) => 2,
+    Err(JwtError.Signature) => 3,
+    Err(JwtError.Expired) => 4,
+    Err(JwtError.NotYet) => 5,
+    Err(JwtError.Issuer) => 6,
+    Err(JwtError.Audience) => 7,
+    Err(JwtError.OutOfMemory) => 8,
+    Err(JwtError.Key) => 9,
+};
+
+@test
+fn aKeySet() -> Result<void, TestFailure> {
+    var v = JwtVerifier.create();
+    let added = match (v.addJwks(keySet().bytes())) {
+        Ok(n) => n,
+        Err(_) => { return Err(TestFailure.create("the key set")); },
+    };
+    Check.equalU64(3, added as u64)?; // the `oct` key is passed over
+    Check.equalU64(0, outcomeOf(v, rsToken().bytes()))?;
+    Check.equalU64(0, outcomeOf(v, edToken().bytes()))?;
+    Check.equalU64(0, outcomeOf(v, esToken().bytes()))?;
+    Check.equalU64(3, outcomeOf(v, spoiled(rsToken())?.view()))?;
+    Check.equalU64(3, outcomeOf(v, spoiled(edToken())?.view()))?;
+    Check.equalU64(3, outcomeOf(v, spoiled(esToken())?.view()))?;
+    // No HS256 key: such a token is refused for its algorithm, whoever signed it.
+    Check.equalU64(2, outcomeOf(v, kim().bytes()))?;
+    Check.equalU64(2, outcomeOf(v, confusedToken().bytes()))?;
+    Check.isTrue(v.addJwks("{}".bytes()).isErr(), "not a key set")?;
+    Check.isTrue(v.addJwks("[".bytes()).isErr(), "not JSON")?;
+    return Ok();
+}
+
+@test
+fn publicKeysInPem() -> Result<void, TestFailure> {
+    var v = JwtVerifier.create();
+    Check.isTrue(v.addPublicKeyPem("r1", rsaPem().bytes()).isOk(), "the RSA key")?;
+    Check.equalU64(0, outcomeOf(v, rsToken().bytes()))?;
+    Check.equalU64(2, outcomeOf(v, edToken().bytes()))?; // no Ed25519 key yet
+    Check.isTrue(v.addPublicKeyPem("", edPem().bytes()).isOk(), "the Ed25519 key")?;
+    Check.isTrue(v.addPublicKeyPem("c1", ecPem().bytes()).isOk(), "the P-256 key")?;
+    Check.equalU64(0, outcomeOf(v, edToken().bytes()))?;
+    Check.equalU64(0, outcomeOf(v, esToken().bytes()))?;
+    Check.equalU64(3, outcomeOf(v, spoiled(esToken())?.view()))?;
+    Check.isTrue(v.addPublicKeyPem("x", "not a key".bytes()).isErr(), "not PEM")?;
+    // The public key is never an HMAC secret: with an HS256 secret of its own the verifier still refuses the token
+    // an attacker made from the PEM.
+    alloc(v.addSecret("", "secret".bytes()))?;
+    Check.equalU64(0, outcomeOf(v, kim().bytes()))?;
+    Check.equalU64(3, outcomeOf(v, confusedToken().bytes()))?;
+    // A key under another id is not tried for a token that names its key.
+    var other = JwtVerifier.create();
+    Check.isTrue(other.addPublicKeyPem("r2", rsaPem().bytes()).isOk(), "the RSA key")?;
+    Check.equalU64(3, outcomeOf(other, rsToken().bytes()))?;
+    return Ok();
+}
+
+fn boxed<F: Filter + Send + Share>(f: F) -> Result<Box<dyn Filter + Send + Share>, TestFailure> {
+    let b: Box<dyn Filter + Send + Share> = alloc(Box.create(f))?;
+    return Ok(b);
+}
+
+@test
+async fn whatTheClaimsMustSay() -> Result<void, TestFailure> {
+    var a = quietApp()?;
+    var v = JwtVerifier.create();
+    Check.isTrue(v.addPublicKeyPem("r1", rsaPem().bytes()).isOk(), "the RSA key")?;
+    let api = routed(a.group("/api"))?;
+    routed(a.filterIn(api, boxed(BearerAuth.create(v))?))?;
+    let admin = routed(a.groupIn(api, "/admin"))?;
+    routed(a.filterIn(admin, boxed(alloc(RequireClaim.create("roles", "admin"))?)?))?;
+    let ops = routed(a.groupIn(api, "/ops"))?;
+    routed(a.filterIn(ops, boxed(alloc(RequireClaim.create("roles", "ops"))?)?))?;
+    let writes = routed(a.groupIn(api, "/orders"))?;
+    routed(a.filterIn(writes, boxed(alloc(RequireClaim.create("scope", "write"))?)?))?;
+    let deletes = routed(a.groupIn(api, "/purge"))?;
+    routed(a.filterIn(deletes, boxed(alloc(RequireClaim.create("scope", "writ"))?)?))?;
+    let unguarded = routed(a.group("/loose"))?;
+    routed(a.filterIn(unguarded, boxed(alloc(RequireClaim.create("roles", "admin"))?)?))?;
+    for (group in [admin, ops, writes, deletes, unguarded]) {
+        let h: Box<dyn Handler<St> + Send + Share> = alloc(Box.create(Who {}))?;
+        routed(a.routeIn(group, Method.Get, "/x", h))?;
+    }
+    let refusal = "HTTP/1.1 403 Forbidden\r\nwww-authenticate: Bearer error=\"insufficient_scope\"\r\ncontent-type: application/problem+json\r\ncontent-length: 55\r\n\r\n{\"type\":\"about:blank\",\"title\":\"Forbidden\",\"status\":403}";
+    let expected = [200u32, 403u32, 200u32, 403u32];
+    let paths = ["/api/admin/x", "/api/ops/x", "/api/orders/x", "/api/purge/x"];
+    for (i in 0..4usize) {
+        var request = Vector<u8>.create();
+        alloc(request.extend("GET ".bytes()))?;
+        alloc(request.extend(paths[i].bytes()))?;
+        alloc(request.extend(" HTTP/1.1\r\nhost: a\r\nauthorization: Bearer ".bytes()))?;
+        alloc(request.extend(rsToken().bytes()))?;
+        alloc(request.extend("\r\n\r\n".bytes()))?;
+        let got = await served(a, request.view())?;
+        if (expected[i] == 200) {
+            let ok = "HTTP/1.1 200 OK\r\n".bytes();
+            Check.equalBytes(ok, got.view()[0..ok.length])?;
+        } else {
+            Check.equalBytes(refusal.bytes(), got.view())?;
+        }
+    }
+    // Without `BearerAuth` before it there are no claims: 401, not a pass.
+    let loose = await served(a, "GET /loose/x HTTP/1.1\r\nhost: a\r\n\r\n".bytes())?;
+    let unauthorised = "HTTP/1.1 401 Unauthorized\r\nwww-authenticate: Bearer\r\n".bytes();
+    Check.equalBytes(unauthorised, loose.view()[0..unauthorised.length])?;
+    return Ok();
+}

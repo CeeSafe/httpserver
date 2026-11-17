@@ -32,6 +32,7 @@ fn outcome(v: borrow JwtVerifier, token: StringView, now: i64) -> u32 => match (
     Err(JwtError.Issuer) => 6,
     Err(JwtError.Audience) => 7,
     Err(JwtError.OutOfMemory) => 8,
+    Err(JwtError.Key) => 9,
 };
 
 /// {"sub":"kim","exp":4102444800}, signed with "secret".
