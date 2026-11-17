@@ -1,0 +1,113 @@
+// The output cache, through an application on mock connections. The validators expected here (the body's length
+// and FNV-1a hash) were worked out in Python.
+import web_core;
+import web_transport;
+import web_http;
+import web_http1;
+
+/// Answers `v<n>` at its n-th run, through the cache: `/short` for one second, `/long/…` not at all (too long for
+/// the cache), anything else for a minute.
+struct Costly {
+    cache: Arc<OutputCache>;
+    runs: AtomicU64;
+}
+
+impl Handler<St> for Costly {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut Context<St>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        let n = this.runs.load() + 1;
+        this.runs.store(n);
+        var body = [118u8, 48u8, 46u8, 46u8, 46u8, 46u8, 46u8, 46u8, 46u8, 46u8];
+        body[1] = truncate<u8>(48 + n % 10);
+        let long = request.path() == "/long";
+        let seconds: u32 = if (request.path() == "/short") 1 else 60;
+        let sent = if (long) body[..] else body[0..2];
+        return await this.cache.get().send(request, exchange, Status.ok(), "text/plain", sent, seconds);
+    }
+}
+
+@test
+async fn responsesKeptAndAnsweredAgain() -> Result<void, TestFailure> {
+    var a = routed(App<St>.create(state(), quiet()))?;
+    let cache = alloc(Arc<OutputCache>.create(alloc(OutputCache.create(16, 8))?))?;
+    let filter: Box<dyn Filter + Send + Share> = alloc(Box.create(Cached.create(cache.clone())))?;
+    routed(a.filter(filter))?;
+    let h: Box<dyn Handler<St> + Send + Share> =
+        alloc(Box.create(Costly { cache: cache.clone(), runs: AtomicU64.create(0) }))?;
+    routed(a.route(Method.Get, "/{*rest}", h))?;
+    let p: Box<dyn Handler<St> + Send + Share> =
+        alloc(Box.create(Costly { cache: cache.clone(), runs: AtomicU64.create(2) }))?;
+    routed(a.post("/page", p))?;
+
+    // The handler's first run is kept; the second request does not reach it.
+    let first = await served(a, "GET /page HTTP/1.1\r\nhost: a\r\n\r\n")?;
+    Check.equalBytes(
+        "HTTP/1.1 200 OK\r\netag: W/\"2-08cf0b07b5709128\"\r\ncontent-type: text/plain\r\ncontent-length: 2\r\n\r\nv1".bytes(),
+        first.view(),
+    )?;
+    let again = await served(a, "GET /page HTTP/1.1\r\nhost: a\r\n\r\n")?;
+    Check.equalBytes(
+        "HTTP/1.1 200 OK\r\netag: W/\"2-08cf0b07b5709128\"\r\nage: 0\r\ncontent-type: text/plain\r\ncontent-length: 2\r\n\r\nv1".bytes(),
+        again.view(),
+    )?;
+    let head = await served(a, "HEAD /page HTTP/1.1\r\nhost: a\r\n\r\n")?;
+    Check.equalBytes(
+        "HTTP/1.1 200 OK\r\netag: W/\"2-08cf0b07b5709128\"\r\nage: 0\r\ncontent-type: text/plain\r\ncontent-length: 2\r\n\r\n".bytes(),
+        head.view(),
+    )?;
+    // A client that holds it, by the weak validator or by its opaque part in a list.
+    let unchanged = "HTTP/1.1 304 Not Modified\r\netag: W/\"2-08cf0b07b5709128\"\r\nage: 0\r\n\r\n";
+    let held = await served(a, "GET /page HTTP/1.1\r\nhost: a\r\nif-none-match: W/\"2-08cf0b07b5709128\"\r\n\r\n")?;
+    Check.equalBytes(unchanged.bytes(), held.view())?;
+    let listed = await served(a, "GET /page HTTP/1.1\r\nhost: a\r\nif-none-match: \"x\", \"2-08cf0b07b5709128\"\r\n\r\n")?;
+    Check.equalBytes(unchanged.bytes(), listed.view())?;
+    let other = await served(a, "GET /page HTTP/1.1\r\nhost: a\r\nif-none-match: \"2-08cf0b07b5709129\"\r\n\r\n")?;
+    Check.equalBytes(again.view(), other.view())?;
+    Check.equalU64(5, cache.get().hits())?;
+    Check.equalU64(1, cache.get().misses())?;
+
+    // Another query is another response.
+    let query = await served(a, "GET /page?x=1 HTTP/1.1\r\nhost: a\r\n\r\n")?;
+    Check.equalBytes(
+        "HTTP/1.1 200 OK\r\netag: W/\"2-08cf0e07b5709641\"\r\ncontent-type: text/plain\r\ncontent-length: 2\r\n\r\nv2".bytes(),
+        query.view(),
+    )?;
+    // A POST is neither answered from the cache nor kept.
+    let posted = await served(a, "POST /page HTTP/1.1\r\nhost: a\r\ncontent-length: 0\r\n\r\n")?;
+    Check.equalBytes("HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: 2\r\n\r\nv3".bytes(), posted.view())?;
+    let still = await served(a, "GET /page HTTP/1.1\r\nhost: a\r\n\r\n")?;
+    Check.equalBytes(again.view(), still.view())?;
+    // A response longer than the cache keeps runs the handler every time.
+    let long = await served(a, "GET /long HTTP/1.1\r\nhost: a\r\n\r\n")?;
+    Check.equalBytes(
+        "HTTP/1.1 200 OK\r\netag: W/\"a-f44ea77a43d8871e\"\r\ncontent-type: text/plain\r\ncontent-length: 10\r\n\r\nv3........".bytes(),
+        long.view(),
+    )?;
+    let longer = await served(a, "GET /long HTTP/1.1\r\nhost: a\r\n\r\n")?;
+    Check.isTrue(longer.length == long.length && longer.view()[longer.length - 9] == 52, "the fourth run")?;
+
+    // Forgotten, the handler runs again; so it does once a response's time is up.
+    cache.get().forget("/page");
+    let fresh = await served(a, "GET /page HTTP/1.1\r\nhost: a\r\n\r\n")?;
+    Check.equalBytes(
+        "HTTP/1.1 200 OK\r\netag: W/\"2-08cf0f07b57097f4\"\r\ncontent-type: text/plain\r\ncontent-length: 2\r\n\r\nv5".bytes(),
+        fresh.view(),
+    )?;
+    let short = await served(a, "GET /short HTTP/1.1\r\nhost: a\r\n\r\n")?;
+    let kept = await served(a, "GET /short HTTP/1.1\r\nhost: a\r\n\r\n")?;
+    Check.isTrue(short.view()[short.length - 1] == 54 && kept.view()[kept.length - 1] == 54, "the sixth run, twice")?;
+    match (await Timer.sleep(1100)) {
+        Ok() => {}
+        Err(_) => { return Err(TestFailure.create("a timer")); }
+    }
+    let expired = await served(a, "GET /short HTTP/1.1\r\nhost: a\r\n\r\n")?;
+    Check.isTrue(expired.view()[expired.length - 1] == 55, "the seventh run")?;
+    cache.get().clear();
+    let cleared = await served(a, "GET /page HTTP/1.1\r\nhost: a\r\n\r\n")?;
+    Check.isTrue(cleared.view()[cleared.length - 1] == 56, "the eighth run")?;
+    return Ok();
+}

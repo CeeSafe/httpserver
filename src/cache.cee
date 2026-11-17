@@ -1,0 +1,287 @@
+// An output cache: responses kept in memory and answered again without running the handler.
+//
+// A handler that wants its response kept answers through `OutputCache.send`; the filter `Cached`, put before it,
+// answers the next requests for the same target from what was kept, until its time is up. Nothing can keep a
+// response a handler sent any other way (CEESAFE_FINDINGS.md, S10).
+//
+// The cache is a table of a fixed number of places, each holding one response of a bounded size, so its memory is
+// bounded whatever is asked for: a response that falls on a taken place takes it. The key is the request's target
+// (path and query) alone, so do not keep what depends on who asks (a cookie, a token, `Accept-Language`), and put
+// `Cached` after the filters that refuse requests. The table is one process's: each of the supervisor's workers
+// keeps its own.
+import web_core;
+import web_http;
+
+/// One response that was kept.
+struct Kept {
+    target: Vector<u8>;
+    status: StatusCode;
+    contentType: Vector<u8>;
+    body: Vector<u8>;
+    /// Its validator, `W/"…"` with the body's length and hash.
+    tag: Vector<u8>;
+    storedMs: u64;
+    untilMs: u64;
+}
+
+/// FNV-1a over `bytes`.
+fn hashOf(bytes: Slice<u8>) -> u64 {
+    var h: u64 = 14695981039346656037;
+    for (b in bytes) {
+        h = (h ^ b as u64).wrappingMul(1099511628211);
+    }
+    return h;
+}
+
+/// `W/"<length in hex>-<hash in hex>"` for `body`, appended to `out`: a weak validator (RFC 9110 §8.8.1), the same
+/// for the same bytes in every worker.
+fn tagOf(body: Slice<u8>, out: borrow mut Vector<u8>) -> bool {
+    let digits = "0123456789abcdef".bytes();
+    var ok = put(out, "W/\"".bytes());
+    var started = false;
+    for (i in 0..16u64) {
+        let nibble = truncate<usize>((body.length as u64 >> (60 - i * 4)) & 15);
+        if (nibble != 0 || started || i == 15) {
+            started = true;
+            ok = ok && out.push(digits[nibble]).isOk();
+        }
+    }
+    ok = ok && out.push(45).isOk();
+    let h = hashOf(body);
+    for (i in 0..16u64) {
+        ok = ok && out.push(digits[truncate<usize>((h >> (60 - i * 4)) & 15)]).isOk();
+    }
+    return ok && out.push(34).isOk();
+}
+
+/// Whether the request's `If-None-Match` names `tag` (or is `*`): the client holds this very response.
+fn holds(request: borrow Request, tag: Slice<u8>) -> bool {
+    let named = request.headers().getNamed("if-none-match") ?? { return false; };
+    if (named.length == 1 && named[0] == 42) {
+        return true;
+    }
+    if (tag.length == 0 || named.length < tag.length) {
+        return false;
+    }
+    // The comparison is weak (§8.8.3.2): a strong `"…"` the client sends back fits the weak one kept.
+    let opaque = tag[2..];
+    for (at in 0..named.length - opaque.length + 1) {
+        if (sameBytes(named[at..at + opaque.length], opaque)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Responses kept in memory for a time.
+public struct OutputCache {
+    private places: Mutex<Vector<Arc<Kept>?>>;
+    private maxBody: usize;
+    private found: AtomicU64;
+    private missed: AtomicU64;
+
+    /// A cache of `places` responses (rounded up to a power of two, at least 16) of at most `maxBodyBytes` each: a
+    /// longer response is sent and not kept.
+    public fn create(places: usize, maxBodyBytes: usize) -> Result<OutputCache, AllocError> {
+        var size: usize = 16;
+        while (size < places) {
+            size *= 2;
+        }
+        var table = Vector<Arc<Kept>?>.create();
+        for (i in 0..size) {
+            table.push(null)?;
+        }
+        return Ok(OutputCache {
+            places: Mutex<Vector<Arc<Kept>?>>.create(table)?,
+            maxBody: maxBodyBytes,
+            found: AtomicU64.create(0),
+            missed: AtomicU64.create(0),
+        });
+    }
+
+    /// How many requests `answer` answered, and how many it did not.
+    public fn hits(borrow this) -> u64 => this.found.load();
+    public fn misses(borrow this) -> u64 => this.missed.load();
+
+    /// What is kept for `target` and still good at `nowMs`.
+    fn kept(borrow this, target: Slice<u8>, nowMs: u64) -> Arc<Kept>? {
+        // One event loop a process: the lock is free. If it is not (another thread of the application), a miss.
+        var guard = this.places.tryLock() ?? { return null; };
+        let table = guard.data();
+        let slot = (hashOf(target) as usize) & (table.length - 1);
+        match (borrow table[slot]) {
+            Some(k) => {
+                let entry = k.get();
+                if (nowMs < entry.untilMs && sameBytes(entry.target.view(), target)) {
+                    return Some(k.clone());
+                }
+            }
+            null => {}
+        }
+        return null;
+    }
+
+    /// Answers a GET or HEAD request from what is kept for its target, if anything is: with 304 if the client holds
+    /// the same response (`If-None-Match`), else the response with its `etag` and its `age`. Whether it answered.
+    public async fn answer(
+        borrow this,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<bool, HandlerError> {
+        let reads = match (request.method()) {
+            Method.Get => true,
+            Method.Head => true,
+            _ => false,
+        };
+        if (!reads) {
+            return Ok(false);
+        }
+        let now = nowMs();
+        let k = this.kept(request.target().bytes(), now) ?? {
+            this.missed.store(this.missed.load() + 1);
+            return Ok(false);
+        };
+        this.found.store(this.found.load() + 1);
+        let entry = k.get();
+        exchange.header("etag", entry.tag.view())?;
+        var text = [0u8; 20];
+        var w = TextWriter.create(mut text[..]);
+        w.decimal((now - entry.storedMs) / 1000);
+        exchange.header("age", w.written())?;
+        if (holds(request, entry.tag.view())) {
+            let unchanged = StatusCode.of(304) ?? { return Err(HandlerError.Internal); };
+            await exchange.send(unchanged, "".bytes())?;
+            return Ok(true);
+        }
+        if (entry.contentType.length > 0) {
+            exchange.header("content-type", entry.contentType.view())?;
+        }
+        await exchange.send(entry.status, entry.body.view())?;
+        return Ok(true);
+    }
+
+    /// Keeps the response for `target` until `maxAgeSeconds` from now. False if it was not kept: too long, or no
+    /// memory.
+    fn keep(
+        borrow this,
+        target: Slice<u8>,
+        status: StatusCode,
+        contentType: StringView,
+        body: Slice<u8>,
+        tag: Slice<u8>,
+        maxAgeSeconds: u32,
+    ) -> bool {
+        if (body.length > this.maxBody || maxAgeSeconds == 0) {
+            return false;
+        }
+        let now = nowMs();
+        var k = Kept {
+            target: Vector<u8>.create(),
+            status: status,
+            contentType: Vector<u8>.create(),
+            body: Vector<u8>.create(),
+            tag: Vector<u8>.create(),
+            storedMs: now,
+            untilMs: now + maxAgeSeconds as u64 * 1000,
+        };
+        if (k.body.reserve(body.length).isErr()) {
+            return false;
+        }
+        let copied = put(mut k.target, target) &&
+            put(mut k.contentType, contentType.bytes()) &&
+            put(mut k.body, body) &&
+            put(mut k.tag, tag);
+        if (!copied) {
+            return false;
+        }
+        let shared = match (Arc<Kept>.create(k)) {
+            Ok(a) => a,
+            Err(_) => { return false; },
+        };
+        var guard = this.places.tryLock() ?? { return false; };
+        let table = guard.data();
+        let slot = (hashOf(target) as usize) & (table.length - 1);
+        table[slot] = Some(shared);
+        return true;
+    }
+
+    /// Sends `body` with `status` and `contentType` (none if empty), and keeps it for `maxAgeSeconds` if the request
+    /// is a GET and the status is 200. The response carries the `etag` the kept one will, and a request that
+    /// holds it already (`If-None-Match`) is answered 304.
+    public async fn send(
+        borrow this,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+        status: StatusCode,
+        contentType: StringView,
+        body: Slice<u8>,
+        maxAgeSeconds: u32,
+    ) -> Result<void, HandlerError> {
+        let get = match (request.method()) {
+            Method.Get => true,
+            _ => false,
+        };
+        var tag = Vector<u8>.create();
+        if (get && status.code() == 200 && tagOf(body, mut tag)) {
+            let _ = this.keep(request.target().bytes(), status, contentType, body, tag.view(), maxAgeSeconds);
+            exchange.header("etag", tag.view())?;
+            if (holds(request, tag.view())) {
+                let unchanged = StatusCode.of(304) ?? { return Err(HandlerError.Internal); };
+                return await exchange.send(unchanged, "".bytes());
+            }
+        }
+        if (contentType.length > 0) {
+            exchange.header("content-type", contentType.bytes())?;
+        }
+        return await exchange.send(status, body);
+    }
+
+    /// Forgets what is kept for `target` (the path and query as requested): what changed it was just done.
+    public fn forget(borrow this, target: StringView) {
+        var guard = this.places.tryLock() ?? { return; };
+        let table = guard.data();
+        let slot = (hashOf(target.bytes()) as usize) & (table.length - 1);
+        let same = match (borrow table[slot]) {
+            Some(k) => sameBytes(k.get().target.view(), target.bytes()),
+            null => false,
+        };
+        if (same) {
+            table[slot] = null;
+        }
+    }
+
+    /// Forgets everything.
+    public fn clear(borrow this) {
+        var guard = this.places.tryLock() ?? { return; };
+        let table = guard.data();
+        for (i in 0..table.length) {
+            table[i] = null;
+        }
+    }
+}
+
+/// The filter that answers from an `OutputCache`: put it on the application or on a group, and have the handlers
+/// behind it answer through the same cache's `send`.
+public struct Cached {
+    private cache: Arc<OutputCache>;
+
+    /// A filter answering from `cache`.
+    public fn create(cache: Arc<OutputCache>) -> Cached => Cached { cache: cache };
+}
+
+impl Filter for Cached {
+    async fn before(
+        borrow this,
+        scope: borrow mut Scope,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<Flow, HandlerError> {
+        if (await this.cache.get().answer(request, exchange)?) {
+            return Ok(Flow.Responded);
+        }
+        return Ok(Flow.Continue);
+    }
+
+    async fn after(borrow this, request: borrow Request, head: borrow mut ResponseHead) -> Result<void, HandlerError> =>
+        Ok();
+}

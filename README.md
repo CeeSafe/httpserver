@@ -84,6 +84,12 @@ impl Handler<Shop> for Item {
 - **Access log.** `app.logTo(log)` tells an `AccessLog` of every request once it is answered (the request, the
   connection, the status, the microseconds), a 404 or a timeout included. `ConsoleLog` writes a line a request to
   standard output; an application's own can count, sample, or write somewhere else.
+- **Output cache.** A handler that answers through `OutputCache.send(request, exchange, status, type, body,
+  seconds)` has its response kept in memory; the filter `Cached` before it answers the next GET and HEAD requests
+  for the same path and query without running it, with `age`, and with 304 for a client that sends the `etag` back
+  (`If-None-Match`). The table has a fixed number of places and a largest body, so its memory is bounded;
+  `forget(target)` and `clear()` drop what changed. The key is the target alone: do not keep what depends on who
+  asks. Each worker keeps its own.
 - **Scheduled jobs.** `Scheduler` runs a `Job` by a cron expression (`0 9 * * mon-fri`, `*/15 * * * *`, `@daily`;
   on UTC, the system's time zone with its daylight saving, or a fixed offset) or every so many seconds. An
   expression is parsed once into bit sets and asked for its next time, so an idle scheduler does one comparison a
@@ -125,7 +131,7 @@ still answering.
 
 ## What is not here yet
 
-Of CosmoApiServer: tracing (trace ids passed on and spans exported), response and output caching. The rate limit counts in one process: under the supervisor, each worker has its own counters. Not planned: reflection controllers and
+Of CosmoApiServer: tracing (trace ids passed on and spans exported), and `Vary` in the output cache. The output cache has not been measured under load. The rate limit counts in one process: under the supervisor, each worker has its own counters. Not planned: reflection controllers and
 dependency injection (handlers are structs), Razor and Blazor, the front-end development helpers, SignalR's wire
 protocol; gRPC and OpenAPI unless asked for.
 
