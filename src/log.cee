@@ -1,0 +1,34 @@
+// A stock access log: a line a request on standard output.
+import web_core;
+import web_http;
+
+/// Writes `GET /users/7 200 153us` for each request, the query left out (it may hold what should not be kept). A
+/// line is one write, so several workers' lines do not mix; each costs a system call, which a server that answers
+/// a hundred thousand requests a second will notice.
+public struct ConsoleLog {}
+
+impl AccessLog for ConsoleLog {
+    async fn record(
+        borrow this,
+        request: borrow Request,
+        connection: borrow ConnectionContext,
+        status: u16,
+        micros: u64,
+    ) {
+        var line = Vector<u8>.create();
+        let ok = put(mut line, Methods.text(request.method()).bytes()) &&
+            put(mut line, " ".bytes()) &&
+            put(mut line, request.path().bytes()) &&
+            put(mut line, " ".bytes()) &&
+            putDecimal(mut line, status as u64) &&
+            put(mut line, " ".bytes()) &&
+            putDecimal(mut line, micros) &&
+            put(mut line, "us".bytes());
+        if (!ok) {
+            return;
+        }
+        // A path that is not UTF-8 is not written.
+        let text = StringView.fromUtf8(line.view()) ?? { return; };
+        let _ = await AsyncConsole.writeLine(text);
+    }
+}

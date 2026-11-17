@@ -1,0 +1,126 @@
+// Request timeouts and the access log, through an application on mock connections.
+import web_core;
+import web_transport;
+import web_http;
+import web_http1;
+
+/// Waits `ms`, then answers "late"; with `headFirst`, starts its response before it waits, and with `flushed`
+/// sends that start.
+struct Slow {
+    ms: u64;
+    headFirst: bool;
+    flushed: bool;
+}
+
+impl Handler<St> for Slow {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut Context<St>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        if (this.headFirst) {
+            exchange.setContentLength(9);
+            await exchange.write("soon ".bytes())?;
+            if (this.flushed) {
+                await exchange.flush()?;
+            }
+        }
+        match (await Timer.sleep(this.ms)) {
+            Ok() => {}
+            Err(_) => { return Err(HandlerError.Internal); }
+        }
+        if (this.headFirst) {
+            return await exchange.write("late".bytes());
+        }
+        return await exchange.send(Status.ok(), "late".bytes());
+    }
+}
+
+fn slow(ms: u64, headFirst: bool, flushed: bool) -> Result<Box<dyn Handler<St> + Send + Share>, TestFailure> {
+    let h: Box<dyn Handler<St> + Send + Share> = alloc(Box.create(Slow { ms: ms, headFirst: headFirst, flushed: flushed }))?;
+    return Ok(h);
+}
+
+/// What `app` wrote for `text`, whether or not the connection ended well.
+async fn wrote(app: borrow App<St>, text: StringView) -> Result<Vector<u8>, TestFailure> {
+    var conn = match (MockTransport.create(text.bytes())) {
+        Ok(m) => m,
+        Err(_) => { return Err(TestFailure.create("a mock")); },
+    };
+    let drain = match (Drain.create()) {
+        Ok(d) => d,
+        Err(_) => { return Err(TestFailure.create("a drain")); },
+    };
+    let ctx = ConnectionContext.acceptedNow(1, drain);
+    let _ = await web_http1.serve(mut conn, ctx, app, app.limits());
+    var out = Vector<u8>.create();
+    for (b in conn.written()) {
+        alloc(out.push(b))?;
+    }
+    return Ok(out);
+}
+
+/// Appends each request's status as three digits to a number.
+struct Seen {
+    statuses: Arc<AtomicU64>;
+}
+
+impl AccessLog for Seen {
+    async fn record(
+        borrow this,
+        request: borrow Request,
+        connection: borrow ConnectionContext,
+        status: u16,
+        micros: u64,
+    ) {
+        let s = this.statuses.get();
+        s.store(s.load() * 1000 + status as u64);
+    }
+}
+
+@test
+async fn requestsThatTakeTooLong() -> Result<void, TestFailure> {
+    var a = routed(App<St>.create(state(), quiet()))?;
+    let uploads = routed(a.group("/uploads"))?;
+    let inner = routed(a.groupIn(uploads, "/big"))?;
+    routed(a.get("/slow", slow(300, false, false)?))?;
+    routed(a.get("/quick", slow(1, false, false)?))?;
+    routed(a.get("/begun", slow(300, true, false)?))?;
+    routed(a.get("/sent", slow(300, true, true)?))?;
+    routed(a.routeIn(uploads, Method.Get, "/slow", slow(60, false, false)?))?;
+    routed(a.routeIn(inner, Method.Get, "/slow", slow(60, false, false)?))?;
+    let statuses = alloc(Arc<AtomicU64>.create(AtomicU64.create(0)))?;
+    let log: Box<dyn AccessLog + Send + Share> = alloc(Box.create(Seen { statuses: statuses.clone() }))?;
+    a.logTo(log);
+
+    // No bound: the slow handler answers.
+    let unbounded = await wrote(a, "GET /uploads/slow HTTP/1.1\r\nhost: a\r\n\r\n")?;
+    Check.equalBytes("HTTP/1.1 200 OK\r\ncontent-length: 4\r\n\r\nlate".bytes(), unbounded.view())?;
+
+    a.timeout(20);
+    routed(a.timeoutIn(uploads, 2000))?;
+    Check.isTrue(a.timeoutIn(9, 1).isErr(), "no such group")?;
+    let late = await wrote(a, "GET /slow HTTP/1.1\r\nhost: a\r\n\r\n")?;
+    Check.equalBytes("HTTP/1.1 504 Gateway Timeout\r\ncontent-length: 0\r\n\r\n".bytes(), late.view())?;
+    let quick = await wrote(a, "GET /quick HTTP/1.1\r\nhost: a\r\n\r\n")?;
+    Check.equalBytes("HTTP/1.1 200 OK\r\ncontent-length: 4\r\n\r\nlate".bytes(), quick.view())?;
+    Check.equalU64(200504200, statuses.get().load())?;
+    statuses.get().store(0);
+    // The group's longer bound, and the group under it that set none.
+    let upload = await wrote(a, "GET /uploads/slow HTTP/1.1\r\nhost: a\r\n\r\n")?;
+    Check.equalBytes(unbounded.view(), upload.view())?;
+    let deeper = await wrote(a, "GET /uploads/big/slow HTTP/1.1\r\nhost: a\r\n\r\n")?;
+    Check.equalBytes(unbounded.view(), deeper.view())?;
+    // A response that had begun but still waited in the buffer is dropped for the 504.
+    let begun = await wrote(a, "GET /begun HTTP/1.1\r\nhost: a\r\n\r\n")?;
+    Check.equalBytes(late.view(), begun.view())?;
+    // One whose start was sent cannot become a 504: what was sent stays, and the rest never comes.
+    let sent = await wrote(a, "GET /sent HTTP/1.1\r\nhost: a\r\n\r\n")?;
+    Check.equalBytes("HTTP/1.1 200 OK\r\ncontent-length: 9\r\n\r\nsoon ".bytes(), sent.view())?;
+    let missing = await wrote(a, "GET /nowhere HTTP/1.1\r\nhost: a\r\n\r\n")?;
+    Check.equalBytes("HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n".bytes(), missing.view())?;
+
+    // The response whose start was sent is told as it began: 200.
+    return Check.equalU64(200200504200404, statuses.get().load());
+}

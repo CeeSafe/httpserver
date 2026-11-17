@@ -77,6 +77,13 @@ impl Handler<Shop> for Item {
   checks it against Python's gzip.
 - **Replies.** `Reply.text`, `html`, `json`, `bytes`, `empty`, `redirect` and `problem` (RFC 9457).
 - **The query.** `Query.raw`, `Query.value` (decoded) and `Query.number`.
+- **Request timeouts.** `app.timeout(ms)` bounds every request and `app.timeoutIn(group, ms)` a group's (longer for
+  uploads, shorter for an API): a request whose middleware and handler have not returned is cancelled and answered
+  504, or its connection is closed if part of the response had left. The time runs while a handler waits, not
+  while it computes: one that never awaits is the supervisor's to stop.
+- **Access log.** `app.logTo(log)` tells an `AccessLog` of every request once it is answered (the request, the
+  connection, the status, the microseconds), a 404 or a timeout included. `ConsoleLog` writes a line a request to
+  standard output; an application's own can count, sample, or write somewhere else.
 - **Scheduled jobs.** `Scheduler` runs a `Job` by a cron expression (`0 9 * * mon-fri`, `*/15 * * * *`, `@daily`;
   on UTC, the system's time zone with its daylight saving, or a fixed offset) or every so many seconds. An
   expression is parsed once into bit sets and asked for its next time, so an idle scheduler does one comparison a
@@ -118,7 +125,7 @@ still answering.
 
 ## What is not here yet
 
-Of CosmoApiServer: request timeouts, logging and tracing, response and output caching. The rate limit counts in one process: under the supervisor, each worker has its own counters. Not planned: reflection controllers and
+Of CosmoApiServer: tracing (trace ids passed on and spans exported), response and output caching. The rate limit counts in one process: under the supervisor, each worker has its own counters. Not planned: reflection controllers and
 dependency injection (handlers are structs), Razor and Blazor, the front-end development helpers, SignalR's wire
 protocol; gRPC and OpenAPI unless asked for.
 
@@ -162,6 +169,9 @@ answers the same routes (server GC). One machine and one run each: read the rati
 - Under the supervisor, four workers answer about 275 000 `/small` a second in either listener mode. While a
   worker was made to trap twice a second, no request was answered wrongly; the load generator does not reconnect, so
   its rate fell as it lost the connections of each worker that ended.
+- A request timeout costs about 5% on `/small` (94 000 to 102 000 a second with one set, against 102 000 to
+  105 000 without; the runs vary by that much), an access log that only counts nothing measurable, and `ConsoleLog`
+  about 20% (81 000) with standard output sent to `/dev/null`.
 - CosmoApiServer answered 56 and 16 of about 1.3 million `/users/42` requests with a status that was not 2xx; not
   looked into.
 

@@ -22,6 +22,9 @@
 // ends and kills one whose loop has stopped; CW_MEMORY_MB limits each worker's address space; CW_INHERIT=1 has the
 // workers accept from one socket the supervisor bound, instead of each binding the shared port.
 //
+// CW_TIMEOUT_MS=n bounds every request (`App.timeout`); CW_LOG=1 adds an access log that only counts, CW_LOG=2 the
+// stock one that writes a line a request to standard output.
+//
 // CW_HOOKS=n adds n middleware that do nothing to the application, to measure what one costs. CW_STOCK=1 adds the
 // stock filters a public API would run: security headers, CORS for any origin, and a rate limit nobody reaches.
 import web_core;
@@ -405,6 +408,23 @@ fn filled(count: usize) -> Result<Vector<u8>, RouteError> {
     return Ok(v);
 }
 
+/// An access log that only counts: what the hook itself costs.
+struct Counted {
+    requests: AtomicU64;
+}
+
+impl AccessLog for Counted {
+    async fn record(
+        borrow this,
+        request: borrow Request,
+        connection: borrow ConnectionContext,
+        status: u16,
+        micros: u64,
+    ) {
+        this.requests.store(this.requests.load() + 1);
+    }
+}
+
 fn setting(name: StringView, otherwise: u64) -> u64 {
     let text = match (Environment.variable(name)) {
         Some(t) => t,
@@ -431,6 +451,24 @@ fn application(worker: u32) -> Result<App<St>, RouteError> {
         app.filter(stock(SecurityHeaders.defaults())?)?;
         app.filter(stock(corsForAll())?)?;
         app.filter(stock(RateLimit.create(0xFFFFFFFF, 60000, 4096))?)?;
+    }
+    app.timeout(setting("CW_TIMEOUT_MS", 0));
+    match (setting("CW_LOG", 0)) {
+        1 => {
+            let log: Box<dyn AccessLog + Send + Share> = match (Box.create(Counted { requests: AtomicU64.create(0) })) {
+                Ok(b) => b,
+                Err(_) => { return Err(RouteError.OutOfMemory); },
+            };
+            app.logTo(log);
+        }
+        2 => {
+            let log: Box<dyn AccessLog + Send + Share> = match (Box.create(ConsoleLog {})) {
+                Ok(b) => b,
+                Err(_) => { return Err(RouteError.OutOfMemory); },
+            };
+            app.logTo(log);
+        }
+        _ => {}
     }
     var small = Vector<u8>.create();
     for (b in "hello, world\n".bytes()) {

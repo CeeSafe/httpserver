@@ -17,6 +17,15 @@ struct Group {
     /// The middleware in the order it runs: an index into the application's `hooks`, or into its `filters` with
     /// `FILTER` set.
     chain: Vector<u32>;
+    /// The longest a request to one of its routes may take; 0: as its parent's.
+    timeoutMs: u64;
+}
+
+/// What an application tells of each request it has answered: `App.logTo`.
+public interface AccessLog {
+    /// One request. `status` is the response's, 0 if the connection failed before one was sent; `micros` is the
+    /// time from the request's head to the handler's return, body included when the handler sent it whole.
+    async fn record(borrow this, request: borrow Request, connection: borrow ConnectionContext, status: u16, micros: u64);
 }
 
 /// An HTTP application whose state is `S`.
@@ -29,12 +38,15 @@ public struct App<S: Send + Share> {
     private httpLimits: Limits;
     /// The UDP port the same application is served on over HTTP/3, advertised in `Alt-Svc`.
     private http3Port: u16?;
+    private log: Box<dyn AccessLog + Send + Share>?;
 
     /// An application owning `state`, with no routes and no middleware; `limits` bound each connection's requests.
     public fn create(state: S, limits: Limits) -> Result<App<S>, RouteError> {
         let routes = Router<S>.create()?;
         var groups = Vector<Group>.create();
-        match (groups.push(Group { prefix: Vector<u8>.create(), parent: 0, chain: Vector<u32>.create() })) {
+        match (groups.push(
+            Group { prefix: Vector<u8>.create(), parent: 0, chain: Vector<u32>.create(), timeoutMs: 0 },
+        )) {
             Ok() => {}
             Err(_) => { return Err(RouteError.OutOfMemory); }
         }
@@ -46,6 +58,7 @@ public struct App<S: Send + Share> {
             groups: groups,
             httpLimits: limits,
             http3Port: null,
+            log: null,
         });
     }
 
@@ -80,6 +93,92 @@ public struct App<S: Send + Share> {
             Err(_) => { return Err(RouteError.OutOfMemory); }
         }
         return this.chained(group, truncate<u32>(this.filters.length - 1) | FILTER);
+    }
+
+    /// Runs the application's middleware, then what `found` says: the route's group's middleware and its handler, or
+    /// the answer for a path without one.
+    async fn dispatch(
+        borrow this,
+        found: RouteMatch,
+        params: Params,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+        connection: borrow ConnectionContext,
+    ) -> Result<void, HandlerError> {
+        let path = request.path();
+        var ctx = Context<S>.create(this.appState, connection, this.routes, path, params);
+        let everywhere = borrow this.groups[0].chain;
+        for (i in 0..everywhere.length) {
+            match (await this.enter(everywhere[i], mut ctx, request, exchange)?) {
+                Flow.Continue => {}
+                Flow.Responded => { return Ok(); }
+            }
+        }
+        match (found) {
+            RouteMatch.Found(index) => {
+                let group = this.routes.group(index);
+                if (group != 0) {
+                    // a group's chain starts with nothing of the application's: those ran above
+                    let chain = borrow this.groups[group as usize].chain;
+                    for (i in 0..chain.length) {
+                        match (await this.enter(chain[i], mut ctx, request, exchange)?) {
+                            Flow.Continue => {}
+                            Flow.Responded => { return Ok(); }
+                        }
+                    }
+                }
+                return await this.routes.handler(index).handle(mut ctx, request, exchange);
+            }
+            RouteMatch.MethodNotAllowed(mask) => {
+                let options = Methods.same(request.method(), Method.Options);
+                var text = [0u8; 96];
+                let n = allowText(mask | (1u32 << Methods.index(Method.Options)), mut text);
+                exchange.header("allow", text[0..n])?;
+                let status = if (options) Status.noContent() else Status.methodNotAllowed();
+                return await exchange.send(status, "".bytes());
+            }
+            RouteMatch.NotFound => {
+                let options = Methods.same(request.method(), Method.Options);
+                let asterisk = Ascii.equals(path.bytes(), "*");
+                let status = if (options && asterisk) Status.noContent() else Status.notFound();
+                return await exchange.send(status, "".bytes());
+            }
+        }
+    }
+
+    /// Bounds every request: one whose middleware and handler have not returned after `ms` is cancelled and
+    /// answered 504, or its connection closed if the response had begun. 0, the default, is no bound. The time runs
+    /// while the handler waits (for a body, a database, a client that reads slowly), not while it computes: a
+    /// handler that never awaits is the supervisor's to stop.
+    public fn timeout(borrow mut this, ms: u64) {
+        this.groups[0].timeoutMs = ms;
+    }
+
+    /// `timeout` for the routes of `group` and of the groups under it that set none: a longer one for uploads, a
+    /// shorter one for an API.
+    public fn timeoutIn(borrow mut this, group: u32, ms: u64) -> Result<void, RouteError> {
+        if (group as usize >= this.groups.length) {
+            return Err(RouteError.NoSuchGroup);
+        }
+        this.groups[group as usize].timeoutMs = ms;
+        return Ok();
+    }
+
+    /// The bound on a request to a route of `group`.
+    fn timeoutOf(borrow this, group: u32) -> u64 {
+        var at = group;
+        loop {
+            let ms = this.groups[at as usize].timeoutMs;
+            if (ms != 0 || at == 0) {
+                return ms;
+            }
+            at = this.groups[at as usize].parent;
+        }
+    }
+
+    /// Tells `log` of every request once it is answered, one that found no route or timed out included.
+    public fn logTo(borrow mut this, log: Box<dyn AccessLog + Send + Share>) {
+        this.log = Some(log);
     }
 
     /// Adds chain entry `index` to `group` and the groups under it.
@@ -123,7 +222,7 @@ public struct App<S: Send + Share> {
         if (p.length > 0 && (p[0] != 47 || p[p.length - 1] == 47)) {
             return Err(RouteError.BadPattern);
         }
-        var g = Group { prefix: Vector<u8>.create(), parent: parent, chain: Vector<u32>.create() };
+        var g = Group { prefix: Vector<u8>.create(), parent: parent, chain: Vector<u32>.create(), timeoutMs: 0 };
         copyInto(mut g.prefix, this.groups[parent as usize].prefix.view())?;
         copyInto(mut g.prefix, p)?;
         if (parent != 0) {
@@ -338,46 +437,41 @@ impl<S: Send + Share> Application for App<S> {
         connection: borrow ConnectionContext,
     ) -> Result<void, HandlerError> {
         var params = Params.empty();
-        let path = request.path();
-        let found = this.routes.find(request.method(), path.bytes(), mut params);
-        var ctx = Context<S>.create(this.appState, connection, this.routes, path, params);
-        let everywhere = borrow this.groups[0].chain;
-        for (i in 0..everywhere.length) {
-            match (await this.enter(everywhere[i], mut ctx, request, exchange)?) {
-                Flow.Continue => {}
-                Flow.Responded => { return Ok(); }
-            }
+        let found = this.routes.find(request.method(), request.path().bytes(), mut params);
+        let group = match (found) {
+            RouteMatch.Found(index) => this.routes.group(index),
+            _ => 0,
+        };
+        let ms = this.timeoutOf(group);
+        let began = if (this.log.isSome()) Clock.monotonicNanos() else 0;
+        var r: Result<void, HandlerError> = Ok();
+        if (ms == 0) {
+            r = await this.dispatch(found, params, request, exchange, connection);
+        } else {
+            let late = StatusCode.of(504) ?? Status.notFound();
+            r = await Async.timeout(
+                ms,
+                HandlerError.Status(late),
+                async () => await this.dispatch(found, params, request, exchange, connection),
+            );
         }
-        match (found) {
-            RouteMatch.Found(index) => {
-                let group = this.routes.group(index);
-                if (group != 0) {
-                    // a group's chain starts with nothing of the application's: those ran above
-                    let chain = borrow this.groups[group as usize].chain;
-                    for (i in 0..chain.length) {
-                        match (await this.enter(chain[i], mut ctx, request, exchange)?) {
-                            Flow.Continue => {}
-                            Flow.Responded => { return Ok(); }
-                        }
+        match (borrow this.log) {
+            Some(log) => {
+                // A handler that returned has set the status, even where the head still waits in the buffer.
+                var status = exchange.status().code();
+                if (!exchange.headSent()) {
+                    match (borrow r) {
+                        Ok() => {}
+                        Err(HandlerError.Status(code)) => { status = code.code(); }
+                        Err(HandlerError.Internal) => { status = 500; }
+                        Err(HandlerError.Io(_)) => { status = 0; }
                     }
                 }
-                return await this.routes.handler(index).handle(mut ctx, request, exchange);
+                await log.record(request, connection, status, (Clock.monotonicNanos() - began) / 1000);
             }
-            RouteMatch.MethodNotAllowed(mask) => {
-                let options = Methods.same(request.method(), Method.Options);
-                var text = [0u8; 96];
-                let n = allowText(mask | (1u32 << Methods.index(Method.Options)), mut text);
-                exchange.header("allow", text[0..n])?;
-                let status = if (options) Status.noContent() else Status.methodNotAllowed();
-                return await exchange.send(status, "".bytes());
-            }
-            RouteMatch.NotFound => {
-                let options = Methods.same(request.method(), Method.Options);
-                let asterisk = Ascii.equals(path.bytes(), "*");
-                let status = if (options && asterisk) Status.noContent() else Status.notFound();
-                return await exchange.send(status, "".bytes());
-            }
+            null => {}
         }
+        return r;
     }
 
     /// The application's middleware's `after`, in reverse order.

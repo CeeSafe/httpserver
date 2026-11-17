@@ -13,7 +13,7 @@ Bugs and gaps in CeeSafe and CeeSafe.Web met while writing httpserver, with cees
 | S6 | `ProcessSignals` does not survive `fork` | runtime | the supervisor installs its own handler and never subscribes |
 | S7 | A struct without type parameters cannot implement a generic interface for every argument (`impl<S> Middleware<S> for Cors`) | ceesafec (N0267) | a second interface without the parameter (`Filter`) |
 | S8 | A connection does not say whether it came over TLS | CeeSafe.Web | `HttpsRedirect` redirects everything; the application on the plain port uses it |
-| S9 | `Application.beforeHead` gets the request and the head, not the handler's context | CeeSafe.Web | a group's middleware has no `after`; a response cannot be timed from one hook |
+| S9 | `Application.beforeHead` gets the request and the head, not the handler's context | CeeSafe.Web | a group's middleware has no `after`; the access log and the timeout are in `App.handle`, around the whole chain |
 | S10 | Nothing can change a response's body after the handler sends it | CeeSafe.Web | compression is a call the handler makes (`Compression.send`), not a middleware |
 | S11 | `for (x in it)` over an iterator that is Copy walks a copy, and says nothing | ceesafec | `Multipart` is `@noncopy` |
 
@@ -112,7 +112,8 @@ requests, mark a cookie `Secure` by itself, or add HSTS only where it is allowed
 `Application.beforeHead(request, head)` runs when the handler sends, with no way back to what `handle` knew: the
 matched route, its group, what middleware left in the context, or when the request started. So `after` hooks are
 the application's only (a group's would need the route looked up again), and an access log cannot give a
-request's duration from `before` and `after` alone. Wanted: the `Exchange` (or a slot in it the application owns)
+request's duration from `before` and `after` alone. httpserver's access log (`App.logTo`) and request timeout
+therefore sit in `App.handle`, around the middleware and the handler, not in a middleware. Wanted: the `Exchange` (or a slot in it the application owns)
 passed to `beforeHead`.
 
 ## S10: no hook on the response body
