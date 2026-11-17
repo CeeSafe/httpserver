@@ -6,15 +6,17 @@
 //
 // The cache is a table of a fixed number of places, each holding one response of a bounded size, so its memory is
 // bounded whatever is asked for: a response that falls on a taken place takes it. The key is the request's target
-// (path and query) alone, so do not keep what depends on who asks (a cookie, a token, `Accept-Language`), and put
-// `Cached` after the filters that refuse requests. The table is one process's: each of the supervisor's workers
-// keeps its own.
+// (path and query) and the request fields named with `varyBy`, so do not keep what depends on who asks (a cookie,
+// a token), and put `Cached` after the filters that refuse requests. The table is one process's: each of the
+// supervisor's workers keeps its own.
 import web_core;
 import web_http;
 
 /// One response that was kept.
 struct Kept {
     target: Vector<u8>;
+    /// The values of the request fields the cache varies by, a line each.
+    variant: Vector<u8>;
     status: StatusCode;
     contentType: Vector<u8>;
     body: Vector<u8>;
@@ -77,6 +79,8 @@ fn holds(request: borrow Request, tag: Slice<u8>) -> bool {
 public struct OutputCache {
     private places: Mutex<Vector<Arc<Kept>?>>;
     private maxBody: usize;
+    /// The names of the request fields a response depends on, as `Vary` lists them.
+    private vary: Vector<u8>;
     private found: AtomicU64;
     private missed: AtomicU64;
 
@@ -94,25 +98,66 @@ public struct OutputCache {
         return Ok(OutputCache {
             places: Mutex<Vector<Arc<Kept>?>>.create(table)?,
             maxBody: maxBodyBytes,
+            vary: Vector<u8>.create(),
             found: AtomicU64.create(0),
             missed: AtomicU64.create(0),
         });
     }
+
+    /// Has the responses depend on the request field `name` (lower case: `accept-language`) as well as on the
+    /// target: requests that differ in it are kept apart, and responses say so in `Vary`. Call it before the cache
+    /// is shared.
+    public fn varyBy(borrow mut this, name: StringView) -> Result<void, AllocError> {
+        if (this.vary.length > 0) {
+            this.vary.push(44)?;
+            this.vary.push(32)?;
+        }
+        for (b in name.bytes()) {
+            this.vary.push(b)?;
+        }
+        return Ok();
+    }
+
+    /// The request's values of the fields varied by, a line each, into `out`. False if out of memory.
+    fn variant(borrow this, request: borrow Request, out: borrow mut Vector<u8>) -> bool {
+        let names = this.vary.view();
+        var from: usize = 0;
+        while (from < names.length) {
+            var to = from;
+            while (to < names.length && names[to] != 44) {
+                to += 1;
+            }
+            let value = match (StringView.fromUtf8(names[from..to])) {
+                Some(name) => request.headers().getNamed(name) ?? "".bytes(),
+                null => "".bytes(),
+            };
+            if (!put(out, value) || out.push(10).isErr()) {
+                return false;
+            }
+            from = to + 2;
+        }
+        return true;
+    }
+
+    /// The place of a target's variant in a table of `length`.
+    fn place(target: Slice<u8>, variant: Slice<u8>, length: usize) -> usize =>
+        ((hashOf(target) ^ hashOf(variant).wrappingMul(0x9E3779B97F4A7C15)) as usize) & (length - 1);
 
     /// How many requests `answer` answered, and how many it did not.
     public fn hits(borrow this) -> u64 => this.found.load();
     public fn misses(borrow this) -> u64 => this.missed.load();
 
     /// What is kept for `target` and still good at `nowMs`.
-    fn kept(borrow this, target: Slice<u8>, nowMs: u64) -> Arc<Kept>? {
+    fn kept(borrow this, target: Slice<u8>, variant: Slice<u8>, nowMs: u64) -> Arc<Kept>? {
         // One event loop a process: the lock is free. If it is not (another thread of the application), a miss.
         var guard = this.places.tryLock() ?? { return null; };
         let table = guard.data();
-        let slot = (hashOf(target) as usize) & (table.length - 1);
+        let slot = OutputCache.place(target, variant, table.length);
         match (borrow table[slot]) {
             Some(k) => {
                 let entry = k.get();
-                if (nowMs < entry.untilMs && sameBytes(entry.target.view(), target)) {
+                let same = sameBytes(entry.target.view(), target) && sameBytes(entry.variant.view(), variant);
+                if (nowMs < entry.untilMs && same) {
                     return Some(k.clone());
                 }
             }
@@ -137,13 +182,20 @@ public struct OutputCache {
             return Ok(false);
         }
         let now = nowMs();
-        let k = this.kept(request.target().bytes(), now) ?? {
+        var variant = Vector<u8>.create();
+        if (!this.variant(request, mut variant)) {
+            return Err(HandlerError.Internal);
+        }
+        let k = this.kept(request.target().bytes(), variant.view(), now) ?? {
             this.missed.store(this.missed.load() + 1);
             return Ok(false);
         };
         this.found.store(this.found.load() + 1);
         let entry = k.get();
         exchange.header("etag", entry.tag.view())?;
+        if (this.vary.length > 0) {
+            exchange.header("vary", this.vary.view())?;
+        }
         var text = [0u8; 20];
         var w = TextWriter.create(mut text[..]);
         w.decimal((now - entry.storedMs) / 1000);
@@ -165,6 +217,7 @@ public struct OutputCache {
     fn keep(
         borrow this,
         target: Slice<u8>,
+        variant: Slice<u8>,
         status: StatusCode,
         contentType: StringView,
         body: Slice<u8>,
@@ -177,6 +230,7 @@ public struct OutputCache {
         let now = nowMs();
         var k = Kept {
             target: Vector<u8>.create(),
+            variant: Vector<u8>.create(),
             status: status,
             contentType: Vector<u8>.create(),
             body: Vector<u8>.create(),
@@ -187,7 +241,7 @@ public struct OutputCache {
         if (k.body.reserve(body.length).isErr()) {
             return false;
         }
-        let copied = put(mut k.target, target) &&
+        let copied = put(mut k.target, target) && put(mut k.variant, variant) &&
             put(mut k.contentType, contentType.bytes()) &&
             put(mut k.body, body) &&
             put(mut k.tag, tag);
@@ -200,7 +254,7 @@ public struct OutputCache {
         };
         var guard = this.places.tryLock() ?? { return false; };
         let table = guard.data();
-        let slot = (hashOf(target) as usize) & (table.length - 1);
+        let slot = OutputCache.place(target, variant, table.length);
         table[slot] = Some(shared);
         return true;
     }
@@ -223,12 +277,19 @@ public struct OutputCache {
         };
         var tag = Vector<u8>.create();
         if (get && status.code() == 200 && tagOf(body, mut tag)) {
-            let _ = this.keep(request.target().bytes(), status, contentType, body, tag.view(), maxAgeSeconds);
+            var variant = Vector<u8>.create();
+            if (this.variant(request, mut variant)) {
+                let target = request.target().bytes();
+                let _ = this.keep(target, variant.view(), status, contentType, body, tag.view(), maxAgeSeconds);
+            }
             exchange.header("etag", tag.view())?;
             if (holds(request, tag.view())) {
                 let unchanged = StatusCode.of(304) ?? { return Err(HandlerError.Internal); };
                 return await exchange.send(unchanged, "".bytes());
             }
+        }
+        if (this.vary.length > 0) {
+            exchange.header("vary", this.vary.view())?;
         }
         if (contentType.length > 0) {
             exchange.header("content-type", contentType.bytes())?;
@@ -236,17 +297,19 @@ public struct OutputCache {
         return await exchange.send(status, body);
     }
 
-    /// Forgets what is kept for `target` (the path and query as requested): what changed it was just done.
+    /// Forgets what is kept for `target` (the path and query as requested), every variant of it: what changed it
+    /// was just done. It looks at every place.
     public fn forget(borrow this, target: StringView) {
         var guard = this.places.tryLock() ?? { return; };
         let table = guard.data();
-        let slot = (hashOf(target.bytes()) as usize) & (table.length - 1);
-        let same = match (borrow table[slot]) {
-            Some(k) => sameBytes(k.get().target.view(), target.bytes()),
-            null => false,
-        };
-        if (same) {
-            table[slot] = null;
+        for (i in 0..table.length) {
+            let same = match (borrow table[i]) {
+                Some(k) => sameBytes(k.get().target.view(), target.bytes()),
+                null => false,
+            };
+            if (same) {
+                table[i] = null;
+            }
         }
     }
 

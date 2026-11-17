@@ -111,3 +111,71 @@ async fn responsesKeptAndAnsweredAgain() -> Result<void, TestFailure> {
     Check.isTrue(cleared.view()[cleared.length - 1] == 56, "the eighth run")?;
     return Ok();
 }
+
+/// Answers the request's `accept-language` and its run, through the cache.
+struct Spoken {
+    cache: Arc<OutputCache>;
+    runs: AtomicU64;
+}
+
+impl Handler<St> for Spoken {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut Context<St>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        let n = this.runs.load() + 1;
+        this.runs.store(n);
+        var body = Vector<u8>.create();
+        let language = request.headers().getNamed("accept-language") ?? "-".bytes();
+        if (!put(mut body, language) || body.push(truncate<u8>(48 + n % 10)).isErr()) {
+            return Err(HandlerError.Internal);
+        }
+        return await this.cache.get().send(request, exchange, Status.ok(), "", body.view(), 60);
+    }
+}
+
+@test
+async fn responsesThatVary() -> Result<void, TestFailure> {
+    var a = routed(App<St>.create(state(), quiet()))?;
+    var made = alloc(OutputCache.create(64, 64))?;
+    alloc(made.varyBy("accept-language"))?;
+    alloc(made.varyBy("x-plan"))?;
+    let cache = alloc(Arc<OutputCache>.create(made))?;
+    let filter: Box<dyn Filter + Send + Share> = alloc(Box.create(Cached.create(cache.clone())))?;
+    routed(a.filter(filter))?;
+    let h: Box<dyn Handler<St> + Send + Share> =
+        alloc(Box.create(Spoken { cache: cache.clone(), runs: AtomicU64.create(0) }))?;
+    routed(a.get("/hello", h))?;
+
+    // Each language is kept apart, and so is a request without one.
+    let fr = await served(a, "GET /hello HTTP/1.1\r\nhost: a\r\naccept-language: fr\r\n\r\n")?;
+    Check.equalBytes(
+        "HTTP/1.1 200 OK\r\netag: W/\"3-dc8d3718feba4fe0\"\r\nvary: accept-language, x-plan\r\ncontent-length: 3\r\n\r\nfr1".bytes(),
+        fr.view(),
+    )?;
+    let de = await served(a, "GET /hello HTTP/1.1\r\nhost: a\r\naccept-language: de\r\n\r\n")?;
+    Check.isTrue(sameBytes(de.view()[de.length - 3..], "de2".bytes()), "German, the second run")?;
+    let none = await served(a, "GET /hello HTTP/1.1\r\nhost: a\r\n\r\n")?;
+    Check.isTrue(sameBytes(none.view()[none.length - 2..], "-3".bytes()), "no language, the third run")?;
+    // The second field counts too.
+    let paid = await served(a, "GET /hello HTTP/1.1\r\nhost: a\r\naccept-language: fr\r\nx-plan: paid\r\n\r\n")?;
+    Check.isTrue(sameBytes(paid.view()[paid.length - 3..], "fr4".bytes()), "another plan, the fourth run")?;
+    // Each is answered again as it was kept.
+    let frAgain = await served(a, "GET /hello HTTP/1.1\r\nhost: a\r\naccept-language: fr\r\n\r\n")?;
+    Check.equalBytes(
+        "HTTP/1.1 200 OK\r\netag: W/\"3-dc8d3718feba4fe0\"\r\nvary: accept-language, x-plan\r\nage: 0\r\ncontent-length: 3\r\n\r\nfr1".bytes(),
+        frAgain.view(),
+    )?;
+    let deAgain = await served(a, "GET /hello HTTP/1.1\r\nhost: a\r\naccept-language: de\r\n\r\n")?;
+    Check.isTrue(sameBytes(deAgain.view()[deAgain.length - 3..], "de2".bytes()), "German, as kept")?;
+    Check.equalU64(2, cache.get().hits())?;
+    // Forgetting the target forgets every variant.
+    cache.get().forget("/hello");
+    let frNew = await served(a, "GET /hello HTTP/1.1\r\nhost: a\r\naccept-language: fr\r\n\r\n")?;
+    Check.isTrue(sameBytes(frNew.view()[frNew.length - 3..], "fr5".bytes()), "French, the fifth run")?;
+    let deNew = await served(a, "GET /hello HTTP/1.1\r\nhost: a\r\naccept-language: de\r\n\r\n")?;
+    Check.isTrue(sameBytes(deNew.view()[deNew.length - 3..], "de6".bytes()), "German, the sixth run")?;
+    return Ok();
+}

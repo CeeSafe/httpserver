@@ -91,8 +91,9 @@ impl Handler<Shop> for Item {
   seconds)` has its response kept in memory; the filter `Cached` before it answers the next GET and HEAD requests
   for the same path and query without running it, with `age`, and with 304 for a client that sends the `etag` back
   (`If-None-Match`). The table has a fixed number of places and a largest body, so its memory is bounded;
-  `forget(target)` and `clear()` drop what changed. The key is the target alone: do not keep what depends on who
-  asks. Each worker keeps its own.
+  `forget(target)` and `clear()` drop what changed. The key is the target and the request fields named with
+  `varyBy` (`accept-language`), which the responses list in `Vary`: do not keep what depends on who asks. Each
+  worker keeps its own.
 - **Scheduled jobs.** `Scheduler` runs a `Job` by a cron expression (`0 9 * * mon-fri`, `*/15 * * * *`, `@daily`;
   on UTC, the system's time zone with its daylight saving, or a fixed offset) or every so many seconds. An
   expression is parsed once into bit sets and asked for its next time, so an idle scheduler does one comparison a
@@ -134,7 +135,7 @@ still answering.
 
 ## What is not here yet
 
-Of CosmoApiServer: spans exported to a collector, and `Vary` in the output cache. The rate limit counts in one process: under the supervisor, each worker has its own counters. Not planned: reflection controllers and
+Of CosmoApiServer: spans exported to a collector. The rate limit counts in one process: under the supervisor, each worker has its own counters. Not planned: reflection controllers and
 dependency injection (handlers are structs), Razor and Blazor, the front-end development helpers, SignalR's wire
 protocol; gRPC and OpenAPI unless asked for.
 
