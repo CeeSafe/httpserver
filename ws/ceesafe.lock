@@ -1,0 +1,22 @@
+# Written by ceesafec fetch (spec/tooling.md §4.3). Commit it with ceesafe.toml.
+
+[[package]]
+name = "web_core"
+source = "git+https://github.com/CeeSafe/CeeSafe.Web.git"
+commit = "4bb64c6712d9c876a78d33d0214ea8b875f222ff"
+dir = "packages/web_core"
+hash = "sha256:d06487217199835e061256cba71b91354f3b6e5dd049215e123b0eb5f423579a"
+
+[[package]]
+name = "web_http"
+source = "git+https://github.com/CeeSafe/CeeSafe.Web.git"
+commit = "4bb64c6712d9c876a78d33d0214ea8b875f222ff"
+dir = "packages/web_http"
+hash = "sha256:7f446959257ce8dbf2d4a9bb0c049613dc951adccb417e5887d8f28f6ea07289"
+
+[[package]]
+name = "web_ws"
+source = "git+https://github.com/CeeSafe/CeeSafe.Web.git"
+commit = "4bb64c6712d9c876a78d33d0214ea8b875f222ff"
+dir = "packages/web_ws"
+hash = "sha256:a39acfb6dbfcc1fc4d85fe1aad93d73e7c4edb111ed6733406a8b7bbea2c777b"

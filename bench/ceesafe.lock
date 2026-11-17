@@ -5,6 +5,10 @@ name = "httpserver"
 source = "path+.."
 
 [[package]]
+name = "httpserver_ws"
+source = "path+../ws"
+
+[[package]]
 name = "json"
 source = "git+https://github.com/CeeSafe/CeeSafeLibs.git"
 commit = "ca0a13fec248bbe192f0b61b930c8b8259175eed"
@@ -45,3 +49,10 @@ source = "git+https://github.com/CeeSafe/CeeSafe.Web.git"
 commit = "4bb64c6712d9c876a78d33d0214ea8b875f222ff"
 dir = "packages/web_transport"
 hash = "sha256:a70380914c02645dfdfb4dfc3f3f2016017d956b9ef410894a318fae944aa232"
+
+[[package]]
+name = "web_ws"
+source = "git+https://github.com/CeeSafe/CeeSafe.Web.git"
+commit = "4bb64c6712d9c876a78d33d0214ea8b875f222ff"
+dir = "packages/web_ws"
+hash = "sha256:a39acfb6dbfcc1fc4d85fe1aad93d73e7c4edb111ed6733406a8b7bbea2c777b"

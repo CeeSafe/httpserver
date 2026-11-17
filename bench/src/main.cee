@@ -14,6 +14,7 @@
 //   GET  /crash          traps (an index out of bounds), which ends the process
 //   GET  /spin           computes without end, which stops the event loop
 //   GET  /gz/{n:int}     n bytes of JSON-like text through `Compression`: gzip for a client that accepts it
+//   GET  /chat           a WebSocket: every message a session sends goes to all the sessions of this process
 //   GET  /bloat          allocates until an allocation fails, then answers how many MiB it got
 //
 // CW_PROCS=n runs n worker processes under the supervisor (src/supervisor.cee), which starts a worker again when it
@@ -26,11 +27,16 @@ import web_core;
 import web_transport;
 import web_http;
 import httpserver;
+import httpserver_ws;
+import web_ws;
 import json.JsonWriter;
 
 struct St {
     /// Which worker process this is.
     worker: u32;
+    /// The sessions of `/chat`.
+    hub: Hub;
+    sockets: WebSocketOptions;
 }
 
 struct Fixed {
@@ -271,6 +277,38 @@ impl Handler<St> for Packed {
     }
 }
 
+/// A chat room: each message goes to every session, the sender's included.
+struct Chat {}
+
+impl Handler<St> for Chat {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut Context<St>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        let state = ctx.state();
+        var ws = match (await accept(exchange, request, state.sockets, false)?) {
+            Some(w) => w,
+            null => { return Ok(); }, // refused: the response is sent
+        };
+        let member = state.hub.join(ws.sender()) ?? { return Err(HandlerError.Internal); };
+        var message = Vector<u8>.create();
+        loop {
+            match (await ws.receive(mut message)?) {
+                Received.Message(kind) => {
+                    let binary = match (kind) {
+                        MessageKind.Binary => true,
+                        MessageKind.Text => false,
+                    };
+                    let _ = state.hub.broadcast(binary, message.view());
+                }
+                Received.Closed(_) => { return Ok(); }
+            }
+        }
+    }
+}
+
 /// A middleware that does nothing.
 struct Idle {}
 
@@ -352,7 +390,11 @@ fn setting(name: StringView, otherwise: u64) -> u64 {
 fn application(worker: u32) -> Result<App<St>, RouteError> {
     var limits = Limits.defaults();
     limits.maxBodyBytes = 1048576;
-    var app = App<St>.create(St { worker: worker }, limits)?;
+    let hub = match (Hub.create()) {
+        Ok(h) => h,
+        Err(_) => { return Err(RouteError.OutOfMemory); },
+    };
+    var app = App<St>.create(St { worker: worker, hub: hub, sockets: WebSocketOptions.defaults() }, limits)?;
     for (i in 0..setting("CW_HOOKS", 0)) {
         app.use(idle()?)?;
     }
@@ -379,6 +421,7 @@ fn application(worker: u32) -> Result<App<St>, RouteError> {
     app.get("/crash", handler(Box.create(Crash {}))?)?;
     app.get("/spin", handler(Box.create(Spin {}))?)?;
     app.get("/bloat", handler(Box.create(Bloat {}))?)?;
+    app.get("/chat", handler(Box.create(Chat {}))?)?;
     let compression = match (Compression.create(1024)) {
         Ok(c) => c,
         Err(_) => { return Err(RouteError.OutOfMemory); },

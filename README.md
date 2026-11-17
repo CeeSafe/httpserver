@@ -73,6 +73,11 @@ impl Handler<Shop> for Item {
 - **Static files** (`static/`, the package `httpserver_static`, on CeeSafe.Web's `web_static`): `Files` serves a
   root with media types, ETag and Last-Modified, conditional requests, one range, and `sendFile`; a path that leaves
   the root is 404. `FilesOptions.singlePage("index.html")` answers a single-page application's routes with its page.
+- **A WebSocket hub** (`ws/`, the package `httpserver_ws`, on CeeSafe.Web's `web_ws`): the sessions of an
+  application, and messages to all of them, to a group or to one. A message is queued for each session without
+  waiting, so a client that does not read holds up nobody; what its full queue missed is counted. A membership leaves
+  the hub when it is dropped. The hub is one process's: under the supervisor a broadcast reaches the sessions of the
+  worker that makes it. `tools/ws_check.py` checks it end to end with clients written from RFC 6455.
 - **Replies.** `Reply.text`, `html`, `json`, `bytes`, `empty`, `redirect` and `problem` (RFC 9457).
 - **The query.** `Query.raw`, `Query.value` (decoded) and `Query.number`.
 - **HTTP/1.1 and HTTP/2** on one port: `h2` by ALPN over TLS (`web_tls`'s acceptor), or by its preface in clear.
@@ -110,8 +115,7 @@ still answering.
 
 ## What is not here yet
 
-Of CosmoApiServer: request timeouts, logging and tracing, Brotli, response and output caching, tokens signed with RSA or Ed25519 and authorisation policies, WebSocket hubs, the
-scheduler. The rate limit counts in one process: under the supervisor, each worker has its own counters. Not planned: reflection controllers and
+Of CosmoApiServer: request timeouts, logging and tracing, Brotli, response and output caching, tokens signed with RSA or Ed25519 and authorisation policies, the scheduler. The rate limit counts in one process: under the supervisor, each worker has its own counters. Not planned: reflection controllers and
 dependency injection (handlers are structs), Razor and Blazor, the front-end development helpers, SignalR's wire
 protocol; gRPC and OpenAPI unless asked for.
 
@@ -162,9 +166,11 @@ ceesafec test
 ceesafec test --cflag -fsanitize=address,undefined
 (cd auth && ceesafec test)
 (cd static && ceesafec test)
+(cd ws && ceesafec test)
 (cd bench && ceesafec build)      # then: python3 <CeeSafe.Web>/benchmarks/servers/conform.py --port 8090
 python3 tools/supervisor_check.py # the supervisor, against bench/out/bench
 python3 tools/gzip_check.py       # compressed responses, against Python's gzip
+python3 tools/ws_check.py         # the hub, with WebSocket clients written from RFC 6455
 ```
 
 The compiler: ceesafec 0.62.2 or later. The supervisor is POSIX only.

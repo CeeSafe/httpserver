@@ -1,0 +1,136 @@
+// The hub with real `web_ws` sessions over links the test scripts: what each session writes is compared with the
+// frames RFC 6455 §5.2 gives for the messages (a server's frames are not masked: 0x81 or 0x82, the length, the
+// bytes).
+import web_core;
+import web_http;
+import web_ws;
+
+fn alloc<T>(r: Result<T, AllocError>) -> Result<T, TestFailure> {
+    match (r) {
+        Ok(v) => { return Ok(v); }
+        Err(_) => { return Err(TestFailure.create("out of memory")); }
+    }
+}
+
+fn handled<T>(r: Result<T, HandlerError>) -> Result<T, TestFailure> {
+    match (r) {
+        Ok(v) => { return Ok(v); }
+        Err(_) => { return Err(TestFailure.create("a handler error")); }
+    }
+}
+
+/// A peer that sends nothing and, after a pause in which the session writes what is queued, ends the stream.
+struct Quiet {
+    written: Vector<u8>;
+}
+
+impl RawLink for Quiet {
+    async fn readSome(borrow mut this, into: SliceMut<u8>) -> Result<usize, HandlerError> {
+        match (await Timer.sleep(30)) {
+            Ok() => { return Ok(0); }
+            Err(_) => { return Err(HandlerError.Internal); }
+        }
+    }
+
+    async fn writeAll(borrow mut this, bytes: Slice<u8>) -> Result<void, HandlerError> {
+        match (this.written.extend(bytes)) {
+            Ok() => { return Ok(); }
+            Err(_) => { return Err(HandlerError.Internal); }
+        }
+    }
+}
+
+fn options(queue: usize) -> WebSocketOptions {
+    var o = WebSocketOptions.defaults();
+    o.pingIntervalMs = 0;
+    o.deflate = false;
+    o.queueLength = queue;
+    return o;
+}
+
+/// Runs the session until its peer ends the stream, which writes what was queued for it.
+async fn drained(ws: borrow mut WebSocket<Quiet>) -> Result<void, TestFailure> {
+    var message = Vector<u8>.create();
+    match (handled(await ws.receive(mut message))?) {
+        Received.Closed(code) => { return Check.equalU64(1006, code as u64); }
+        Received.Message(_) => { return Err(TestFailure.create("a message from a peer that sent none")); }
+    }
+}
+
+@test
+async fn messagesToAllToAGroupAndToOne() -> Result<void, TestFailure> {
+    let hub = alloc(Hub.create())?;
+    let o = options(8);
+    var a = Quiet { written: Vector<u8>.create() };
+    var b = Quiet { written: Vector<u8>.create() };
+    var c = Quiet { written: Vector<u8>.create() };
+    {
+        var wa = handled(open(mut a, Role.Server, o, null, null))?;
+        var wb = handled(open(mut b, Role.Server, o, null, null))?;
+        var wc = handled(open(mut c, Role.Server, o, null, null))?;
+        let ma = hub.join(wa.sender()) ?? { return Err(TestFailure.create("joining")); };
+        let mb = hub.join(wb.sender()) ?? { return Err(TestFailure.create("joining")); };
+        {
+            let mc = hub.join(wc.sender()) ?? { return Err(TestFailure.create("joining")); };
+            Check.equalU64(3, hub.count() as u64)?;
+            Check.isTrue(ma.enter("room") && mb.enter("room") && mb.enter("other"), "entering groups")?;
+            Check.isTrue(ma.enter("room"), "entering a group twice")?;
+            Check.equalU64(3, hub.broadcast(false, "hi".bytes()) as u64)?;
+            Check.equalU64(2, hub.toGroup("room", false, "yo".bytes()) as u64)?;
+            Check.equalU64(1, hub.toGroup("other", false, "b!".bytes()) as u64)?;
+            Check.equalU64(0, hub.toGroup("nobody", false, "x".bytes()) as u64)?;
+            let two = [1u8, 2u8];
+            Check.isTrue(hub.to(mc.id(), true, two[..]), "to one member")?;
+            Check.isTrue(!hub.to(999, true, two[..]), "to no member")?;
+            mb.exit("room");
+            Check.equalU64(1, hub.toGroup("room", false, "a?".bytes()) as u64)?;
+        }
+        // `mc` was dropped: its session is no longer the hub's.
+        Check.equalU64(2, hub.count() as u64)?;
+        Check.equalU64(2, hub.broadcast(false, "ab".bytes()) as u64)?;
+        await drained(mut wa)?;
+        await drained(mut wb)?;
+        await drained(mut wc)?;
+    }
+    Check.equalU64(0, hub.count() as u64)?;
+    // hi, yo, a?, ab
+    Check.equalBytes(
+        [0x81u8, 2u8, 104u8, 105u8, 0x81u8, 2u8, 121u8, 111u8, 0x81u8, 2u8, 97u8, 63u8, 0x81u8, 2u8, 97u8, 98u8][..],
+        a.written.view(),
+    )?;
+    // hi, yo, b!, ab
+    Check.equalBytes(
+        [0x81u8, 2u8, 104u8, 105u8, 0x81u8, 2u8, 121u8, 111u8, 0x81u8, 2u8, 98u8, 33u8, 0x81u8, 2u8, 97u8, 98u8][..],
+        b.written.view(),
+    )?;
+    // hi, then the binary message
+    Check.equalBytes([0x81u8, 2u8, 104u8, 105u8, 0x82u8, 2u8, 1u8, 2u8][..], c.written.view())?;
+    return Ok();
+}
+
+@test
+async fn aMemberThatDoesNotRead() -> Result<void, TestFailure> {
+    let hub = alloc(Hub.create())?;
+    let small = options(2);
+    let roomy = options(8);
+    var slow = Quiet { written: Vector<u8>.create() };
+    var quick = Quiet { written: Vector<u8>.create() };
+    {
+        var ws = handled(open(mut slow, Role.Server, small, null, null))?;
+        var wq = handled(open(mut quick, Role.Server, roomy, null, null))?;
+        let ms = hub.join(ws.sender()) ?? { return Err(TestFailure.create("joining")); };
+        let mq = hub.join(wq.sender()) ?? { return Err(TestFailure.create("joining")); };
+        // Neither session runs meanwhile. The third and fourth find the small queue full: they go to the other only.
+        Check.equalU64(2, hub.broadcast(false, "1".bytes()) as u64)?;
+        Check.equalU64(2, hub.broadcast(false, "2".bytes()) as u64)?;
+        Check.equalU64(1, hub.broadcast(false, "3".bytes()) as u64)?;
+        Check.equalU64(1, hub.broadcast(false, "4".bytes()) as u64)?;
+        Check.isTrue(hub.missed(ms.id()) == Some(2u64), "two missed by the slow member")?;
+        Check.isTrue(hub.missed(mq.id()) == Some(0u64), "none missed by the other")?;
+        Check.isTrue(hub.missed(999).isNull(), "no such member")?;
+        Check.equalU64(1, hub.closeAll(1001) as u64)?; // the full queue has no room for the Close either
+        await drained(mut ws)?;
+    }
+    Check.equalBytes([0x81u8, 1u8, 49u8, 0x81u8, 1u8, 50u8][..], slow.written.view())?;
+    return Ok();
+}

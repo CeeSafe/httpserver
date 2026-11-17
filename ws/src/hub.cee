@@ -1,0 +1,201 @@
+// A hub: the WebSocket sessions of an application, and messages to all of them, to a group, or to one.
+//
+// A session is CeeSafe.Web's (`web_ws`'s `accept` in a handler): one task that owns the connection and a bounded
+// queue other tasks send through. The hub holds the queues' senders. A message to many is queued for each without
+// waiting, so a client that does not read holds up nobody: when its queue is full the message is not queued for
+// it, and the hub counts that against the member.
+//
+// A hub is one process's. Under the supervisor each worker has its own, so a broadcast reaches the sessions of the
+// worker that makes it; to reach every worker's, the application has to carry the message between them.
+import web_core;
+import web_ws;
+
+/// One session in the hub.
+struct Member {
+    id: u64;
+    sender: WebSocketSender;
+    groups: Vector<Vector<u8>>;
+    /// Messages not queued because the queue was full.
+    missed: u64;
+}
+
+struct Members {
+    next: u64;
+    list: Vector<Member>;
+}
+
+/// The sessions of an application.
+public struct Hub {
+    private members: Mutex<Members>;
+
+    /// An empty hub.
+    public fn create() -> Result<Hub, AllocError> =>
+        Ok(Hub { members: Mutex<Members>.create(Members { next: 1, list: Vector<Member>.create() })? });
+
+    /// Adds a session by its sender (`ws.sender()`); its id, or null if out of memory. The membership leaves the
+    /// hub when it is dropped, however the handler ends.
+    public fn join(borrow this, sender: WebSocketSender) -> Membership? {
+        var guard = this.members.tryLock() ?? { return null; };
+        let m = guard.data();
+        let id = m.next;
+        match (m.list.push(Member { id: id, sender: sender, groups: Vector<Vector<u8>>.create(), missed: 0 })) {
+            Ok() => {}
+            Err(_) => { return null; }
+        }
+        m.next += 1;
+        return Some(Membership { hub: this, number: id });
+    }
+
+    /// How many sessions the hub has.
+    public fn count(borrow this) -> usize {
+        var guard = this.members.tryLock() ?? { return 0; };
+        return guard.data().list.length;
+    }
+
+    /// How many messages were not queued for member `id` because its queue was full; null if it is not a member.
+    public fn missed(borrow this, id: u64) -> u64? {
+        var guard = this.members.tryLock() ?? { return null; };
+        let m = guard.data();
+        for (i in 0..m.list.length) {
+            if (m.list[i].id == id) {
+                return Some(m.list[i].missed);
+            }
+        }
+        return null;
+    }
+
+    /// Queues `bytes` as a text (or, with `binary`, a binary) message for every member; how many it was queued for.
+    public fn broadcast(borrow this, binary: bool, bytes: Slice<u8>) -> usize => this.deliver(binary, bytes, "", 0);
+
+    /// Queues the message for the members of `group`; how many it was queued for.
+    public fn toGroup(borrow this, group: StringView, binary: bool, bytes: Slice<u8>) -> usize =>
+        this.deliver(binary, bytes, group, 0);
+
+    /// Queues the message for member `id`; whether it was queued.
+    public fn to(borrow this, id: u64, binary: bool, bytes: Slice<u8>) -> bool =>
+        this.deliver(binary, bytes, "", id) == 1;
+
+    /// Queues a Close with `code` for every member (1001, "going away", before a shutdown); how many.
+    public fn closeAll(borrow this, code: u16) -> usize {
+        var guard = this.members.tryLock() ?? { return 0; };
+        let m = guard.data();
+        var sent: usize = 0;
+        for (i in 0..m.list.length) {
+            if (m.list[i].sender.trySend(Outbound.Close(code))) {
+                sent += 1;
+            }
+        }
+        return sent;
+    }
+
+    /// Queues the message for the members that are in `group` (if not empty) and are `only` (if not 0).
+    fn deliver(borrow this, binary: bool, bytes: Slice<u8>, group: StringView, only: u64) -> usize {
+        var guard = this.members.tryLock() ?? { return 0; };
+        let m = guard.data();
+        var sent: usize = 0;
+        for (i in 0..m.list.length) {
+            if (only != 0 && m.list[i].id != only) {
+                continue;
+            }
+            if (group.length > 0 && !within(m.list[i].groups, group.bytes())) {
+                continue;
+            }
+            // The queue owns what it holds, so each member gets its own copy.
+            var copy = Vector<u8>.create();
+            match (copy.extend(bytes)) {
+                Ok() => {}
+                Err(_) => {
+                    m.list[i].missed += 1;
+                    continue;
+                }
+            }
+            if (m.list[i].sender.trySend(if (binary) Outbound.Binary(copy) else Outbound.Text(copy))) {
+                sent += 1;
+            } else {
+                m.list[i].missed += 1;
+            }
+        }
+        return sent;
+    }
+
+    fn leave(borrow this, id: u64) {
+        var guard = this.members.tryLock() ?? { return; };
+        let m = guard.data();
+        for (i in 0..m.list.length) {
+            if (m.list[i].id == id) {
+                let _ = m.list.swapRemove(i);
+                return;
+            }
+        }
+    }
+
+    fn enter(borrow this, id: u64, group: Slice<u8>, entering: bool) -> bool {
+        var guard = this.members.tryLock() ?? { return false; };
+        let m = guard.data();
+        for (i in 0..m.list.length) {
+            if (m.list[i].id != id) {
+                continue;
+            }
+            for (g in 0..m.list[i].groups.length) {
+                if (same(m.list[i].groups[g].view(), group)) {
+                    if (!entering) {
+                        let _ = m.list[i].groups.swapRemove(g);
+                    }
+                    return true;
+                }
+            }
+            if (!entering) {
+                return true;
+            }
+            var name = Vector<u8>.create();
+            if (name.extend(group).isErr()) {
+                return false;
+            }
+            return m.list[i].groups.push(name).isOk();
+        }
+        return false;
+    }
+}
+
+fn same(a: Slice<u8>, b: Slice<u8>) -> bool {
+    if (a.length != b.length) {
+        return false;
+    }
+    for (i in 0..a.length) {
+        if (a[i] != b[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn within(groups: borrow Vector<Vector<u8>>, group: Slice<u8>) -> bool {
+    for (g in 0..groups.length) {
+        if (same(groups[g].view(), group)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// A session's place in a hub. Dropping it leaves the hub and every group.
+@noncopy
+public struct Membership<region h> {
+    private hub: borrow(h) Hub;
+    private number: u64;
+
+    /// The member's id, for `Hub.to`.
+    public fn id(borrow this) -> u64 => this.number;
+
+    /// Joins `group` (a room, a topic, a user's name); false if out of memory.
+    public fn enter(borrow this, group: StringView) -> bool => this.hub.enter(this.number, group.bytes(), true);
+
+    /// Leaves `group`.
+    public fn exit(borrow this, group: StringView) {
+        let _ = this.hub.enter(this.number, group.bytes(), false);
+    }
+
+    drop {
+        this.hub.leave(this.number);
+    }
+}
