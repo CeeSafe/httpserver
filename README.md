@@ -77,6 +77,9 @@ impl Handler<Shop> for Item {
   checks it against Python's gzip.
 - **Replies.** `Reply.text`, `html`, `json`, `bytes`, `empty`, `redirect` and `problem` (RFC 9457).
 - **The query.** `Query.raw`, `Query.value` (decoded) and `Query.number`.
+- **Uploads as they arrive.** `Upload` reads a multipart/form-data body through the exchange, part by part and
+  piece by piece through a buffer of a fixed size, so a handler writes a file to disk or hashes it without holding
+  it; `Multipart` remains for bodies that fit in memory.
 - **Request timeouts.** `app.timeout(ms)` bounds every request and `app.timeoutIn(group, ms)` a group's (longer for
   uploads, shorter for an API): a request whose middleware and handler have not returned is cancelled and answered
   504, or its connection is closed if part of the response had left. The time runs while a handler waits, not

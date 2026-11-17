@@ -1,0 +1,170 @@
+// multipart/form-data read as it arrives, through an application on mock connections.
+import web_core;
+import web_transport;
+import web_http;
+import web_http1;
+
+/// Answers a line for each part: `name|filename|type|` and the data, or its length and FNV-1a hash if it is longer
+/// than 40 bytes; and how many pieces the longest part came in.
+struct Takes {}
+
+impl Handler<St> for Takes {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut Context<St>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        let kind = request.headers().getNamed("content-type") ?? "".bytes();
+        let boundary = Multipart.boundary(kind) ?? { return Err(HandlerError.Status(Status.badRequest())); };
+        var upload = match (Upload.create(boundary, 1024)) {
+            Ok(u) => u,
+            Err(_) => { return Err(HandlerError.Internal); },
+        };
+        var out = Vector<u8>.create();
+        var most: u64 = 0;
+        while (await upload.next(exchange)?) {
+            var ok = put(mut out, upload.name())
+                && put(mut out, "|".bytes())
+                && put(mut out, upload.filename() ?? "-".bytes())
+                && put(mut out, "|".bytes())
+                && put(mut out, upload.contentType())
+                && put(mut out, "|".bytes());
+            var data = Vector<u8>.create();
+            var length: u64 = 0;
+            var hash: u64 = 14695981039346656037;
+            var pieces: u64 = 0;
+            while (await upload.read(exchange)? > 0) {
+                pieces += 1;
+                for (b in upload.piece()) {
+                    hash = (hash ^ b as u64).wrappingMul(1099511628211);
+                    length += 1;
+                    if (length <= 40) {
+                        ok = ok && data.push(b).isOk();
+                    }
+                }
+            }
+            if (pieces > most) {
+                most = pieces;
+            }
+            if (length <= 40) {
+                ok = ok && put(mut out, data.view());
+            } else {
+                ok = ok && putDecimal(mut out, length) && put(mut out, ":".bytes()) && putDecimal(mut out, hash);
+            }
+            ok = ok && put(mut out, "\n".bytes());
+            if (!ok) {
+                return Err(HandlerError.Internal);
+            }
+        }
+        if (!(put(mut out, "pieces ".bytes()) && putDecimal(mut out, if (most > 50) 50u64 else most))) {
+            return Err(HandlerError.Internal);
+        }
+        return await exchange.send(Status.ok(), out.view());
+    }
+}
+
+/// A POST of `body` as multipart/form-data with the boundary `xYz`.
+fn uploadOf(body: Slice<u8>) -> Result<Vector<u8>, TestFailure> {
+    var request = Vector<u8>.create();
+    var ok = put(
+        mut request,
+        "POST /up HTTP/1.1\r\nhost: a\r\ncontent-type: multipart/form-data; boundary=xYz\r\ncontent-length: ".bytes(),
+    );
+    ok = ok && putDecimal(mut request, body.length as u64) && put(mut request, "\r\n\r\n".bytes()) && put(mut request, body);
+    if (!ok) {
+        return Err(TestFailure.create("out of memory"));
+    }
+    return Ok(request);
+}
+
+/// What the application answers to `body`: the response's body, or its status line if it is not 200.
+async fn taken(a: borrow App<St>, body: Slice<u8>) -> Result<Vector<u8>, TestFailure> {
+    let request = uploadOf(body)?;
+    let text = StringView.fromUtf8(request.view()) ?? { return Err(TestFailure.create("not text")); };
+    let got = await served(a, text)?;
+    var out = Vector<u8>.create();
+    let all = got.view();
+    var at: usize = 0;
+    if (all.length > 15 && sameBytes(all[0..15], "HTTP/1.1 200 OK".bytes())) {
+        while (at + 4 <= all.length && !sameBytes(all[at..at + 4], "\r\n\r\n".bytes())) {
+            at += 1;
+        }
+        alloc(out.reserve(all.length))?;
+        Check.isTrue(put(mut out, all[at + 4..]), "memory")?;
+    } else {
+        while (at < all.length && all[at] != 13) {
+            at += 1;
+        }
+        Check.isTrue(put(mut out, all[0..at]), "memory")?;
+    }
+    return Ok(out);
+}
+
+@test
+async fn anUploadReadAsItArrives() -> Result<void, TestFailure> {
+    var a = routed(App<St>.create(state(), quiet()))?;
+    let h: Box<dyn Handler<St> + Send + Share> = alloc(Box.create(Takes {}))?;
+    routed(a.post("/up", h))?;
+
+    // Fields, a file, a part with no data, one with an empty header value, and text before and after.
+    let small = await taken(
+        a,
+        "ignored\r\n--xYz\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nhello\r\n--xYz\r\ncontent-disposition: form-data; name=\"doc\"; filename=\"a b.txt\"\r\nContent-Type: text/plain\r\n\r\nline one\r\nline two\r\n\r\n--xYz\r\nContent-Disposition: form-data; name=\"empty\"\r\n\r\n\r\n--xYz\r\nContent-Disposition: form-data; name=\"dash\"\r\n\r\n--xYzNot\r\n--xY\r\n--xYz--\r\nignored too".bytes(),
+    )?;
+    Check.equalBytes(
+        "title|-||hello\ndoc|a b.txt|text/plain|line one\r\nline two\r\n\nempty|-||\ndash|-||--xYzNot\r\n--xY\npieces 1".bytes(),
+        small.view(),
+    )?;
+    // A body that starts at its first delimiter.
+    let direct = await taken(a, "--xYz\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\n1\r\n--xYz--\r\n".bytes())?;
+    Check.equalBytes("a|-||1\npieces 1".bytes(), direct.view())?;
+    let none = await taken(a, "--xYz--\r\n".bytes())?;
+    Check.equalBytes("pieces 0".bytes(), none.view())?;
+
+    // 200 000 bytes through a buffer of about a thousand, full of line ends and of starts of the delimiter.
+    var body = Vector<u8>.create();
+    alloc(body.reserve(201000))?;
+    Check.isTrue(
+        put(mut body, "--xYz\r\nContent-Disposition: form-data; name=\"big\"; filename=\"big.bin\"\r\n\r\n".bytes()),
+        "memory",
+    )?;
+    var hash: u64 = 14695981039346656037;
+    let teasers = "\r\n--xY\r\n-\r\n--xYy".bytes();
+    for (i in 0..200000usize) {
+        let b = if (i % 97 < teasers.length) teasers[i % 97] else truncate<u8>(32 + i * 7 % 95);
+        hash = (hash ^ b as u64).wrappingMul(1099511628211);
+        alloc(body.push(b))?;
+    }
+    Check.isTrue(
+        put(mut body, "\r\n--xYz\r\nContent-Disposition: form-data; name=\"after\"\r\n\r\nstill here\r\n--xYz--".bytes()),
+        "memory",
+    )?;
+    var expected = Vector<u8>.create();
+    let ok = put(mut expected, "big|big.bin||200000:".bytes())
+        && putDecimal(mut expected, hash)
+        && put(mut expected, "\nafter|-||still here\npieces 50".bytes());
+    Check.isTrue(ok, "memory")?;
+    let big = await taken(a, body.view())?;
+    Check.equalBytes(expected.view(), big.view())?;
+
+    // A delimiter with text straight after it is not one: here it is part of what precedes the first part.
+    let before = await taken(a, "--xYzContent-Disposition: form-data; name=\"a\"\r\n\r\n1\r\n--xYz--".bytes())?;
+    Check.equalBytes("pieces 0".bytes(), before.view())?;
+
+    // Not well formed: cut short in a part and in a header, no closing delimiter, a part without a name, text
+    // after a delimiter's padding.
+    let bad = "HTTP/1.1 400 Bad Request";
+    for (cut in [
+        "--xYz\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\n1",
+        "--xYz\r\nContent-Disposition: form-data; na",
+        "--xYz\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\n1\r\n--xYz\r\n",
+        "--xYz\r\nContent-Type: text/plain\r\n\r\n1\r\n--xYz--",
+        "--xYz\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\n1\r\n--xYz junk\r\n",
+        "no delimiter at all",
+    ]) {
+        let got = await taken(a, cut.bytes())?;
+        Check.equalBytes(bad.bytes(), got.view())?;
+    }
+    return Ok();
+}

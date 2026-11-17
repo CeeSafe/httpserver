@@ -1,0 +1,319 @@
+// multipart/form-data read as it arrives: an upload of any size through a buffer of a fixed one.
+//
+// `Multipart` (form.cee) needs the whole body in memory. `Upload` reads the request body through the exchange, part
+// by part and piece by piece, so a handler can write a file to disk, or hash it, as it comes. The body's size is
+// still bounded by the application's `Limits.maxBodyBytes`: raise it for the routes that take uploads.
+import web_core;
+import web_http;
+
+/// Where an `Upload` is in the body.
+enum UploadState {
+    /// In a part's data (at the start, in the preamble before the first part).
+    Data,
+    /// Just after a delimiter.
+    Between,
+    /// After the closing delimiter.
+    Done,
+    /// The body is not well formed.
+    Broken,
+}
+
+/// A multipart/form-data request body, read as it arrives.
+///
+/// ```
+/// var upload = Upload.create(boundary, 65536)?;
+/// while (await upload.next(exchange)?) {
+///     // upload.name(), upload.filename(), upload.contentType()
+///     while (await upload.read(exchange)? > 0) {
+///         // upload.piece(): the next bytes of this part
+///     }
+/// }
+/// ```
+///
+/// A body that is not well formed, or cut short, is `Err(HandlerError.Status(400))`.
+public struct Upload {
+    /// `\r\n--` and the boundary.
+    private delimiter: Vector<u8>;
+    private buffer: OwnedBuffer;
+    private state: UploadState;
+    /// The body has ended.
+    private ended: bool;
+    /// The piece `read` returned last, in the buffer, and how much of the buffer's start the next call drops: the
+    /// piece, and the delimiter after a part's last.
+    private pieceFrom: usize;
+    private pieceTo: usize;
+    private dropTo: usize;
+    /// Bytes still to leave out at the start of the part's data: the line end that closed its header.
+    private skip: usize;
+    private partName: Vector<u8>;
+    private partFile: Vector<u8>;
+    private partType: Vector<u8>;
+    private isFile: bool;
+    private left: u32;
+
+    /// A reader for a body whose boundary is `boundary` (`Multipart.boundary(contentType)`), through a buffer of
+    /// `bufferBytes` (at least 1024): a part's header must fit in it, and a piece is never longer.
+    public fn create(boundary: Slice<u8>, bufferBytes: usize) -> Result<Upload, AllocError> {
+        var delimiter = Vector<u8>.create();
+        delimiter.reserve(boundary.length + 4)?;
+        for (b in "\r\n--".bytes()) {
+            delimiter.push(b)?;
+        }
+        for (b in boundary) {
+            delimiter.push(b)?;
+        }
+        let least = delimiter.length * 2 + 1024;
+        var buffer = OwnedBuffer.create(if (bufferBytes < least) least else bufferBytes)?;
+        // The first delimiter has no line end before it if nothing precedes it: this one stands in.
+        match (buffer.append("\r\n".bytes())) {
+            Ok() => {}
+            Err(_) => { return Err(AllocError.OutOfMemory); }
+        }
+        return Ok(Upload {
+            delimiter: delimiter,
+            buffer: buffer,
+            state: UploadState.Data,
+            ended: false,
+            pieceFrom: 0,
+            pieceTo: 0,
+            dropTo: 0,
+            skip: 0,
+            partName: Vector<u8>.create(),
+            partFile: Vector<u8>.create(),
+            partType: Vector<u8>.create(),
+            isFile: false,
+            left: 1000,
+        });
+    }
+
+    /// The current part's field name.
+    public fn name(borrow this) -> Slice<u8> => this.partName.view();
+
+    /// The current part's file name as the client sent it, if it is a file: never a path to trust.
+    public fn filename(borrow this) -> Slice<u8>? {
+        if (!this.isFile) {
+            return null;
+        }
+        return Some(this.partFile.view());
+    }
+
+    /// The current part's `Content-Type`; empty if it has none.
+    public fn contentType(borrow this) -> Slice<u8> => this.partType.view();
+
+    /// The bytes the last `read` returned; they are good until the next call of `read` or `next`.
+    public fn piece(borrow this) -> Slice<u8> => this.buffer.readable()[this.pieceFrom..this.pieceTo];
+
+    fn broken(borrow mut this) -> HandlerError {
+        this.state = UploadState.Broken;
+        return HandlerError.Status(Status.badRequest());
+    }
+
+    /// Drops the last piece from the buffer.
+    fn passed(borrow mut this) {
+        let _ = this.buffer.consume(this.dropTo);
+        this.pieceFrom = 0;
+        this.pieceTo = 0;
+        this.dropTo = 0;
+    }
+
+    /// Reads more of the body into the buffer. False if the body has ended or the buffer is full.
+    async fn fill(borrow mut this, exchange: borrow mut Exchange) -> Result<bool, HandlerError> {
+        if (this.ended) {
+            return Ok(false);
+        }
+        if (this.buffer.spareLength() == 0) {
+            this.buffer.compact();
+            if (this.buffer.spareLength() == 0) {
+                return Ok(false);
+            }
+        }
+        let n = await exchange.read(this.buffer.spare())?;
+        if (n == 0) {
+            this.ended = true;
+            return Ok(false);
+        }
+        match (this.buffer.commit(n)) {
+            Ok() => { return Ok(true); }
+            Err(_) => { return Err(HandlerError.Internal); }
+        }
+    }
+
+    /// Where `needle` starts in the buffer at or after `from`, or null.
+    fn find(borrow this, needle: Slice<u8>, from: usize) -> usize? {
+        let b = this.buffer.readable();
+        if (b.length < needle.length) {
+            return null;
+        }
+        var at = from;
+        while (at + needle.length <= b.length) {
+            if (b[at] == needle[0] && sameBytes(b[at..at + needle.length], needle)) {
+                return Some(at);
+            }
+            at += 1;
+        }
+        return null;
+    }
+
+    /// Reads the next piece of the current part's data; how long it is (`piece()` has it), 0 at the part's end.
+    public async fn read(borrow mut this, exchange: borrow mut Exchange) -> Result<usize, HandlerError> {
+        this.passed();
+        loop {
+            match (this.state) {
+                UploadState.Data => {}
+                UploadState.Broken => { return Err(HandlerError.Status(Status.badRequest())); }
+                _ => { return Ok(0); }
+            }
+            let held = this.buffer.length();
+            let size = this.delimiter.length;
+            // All but what could be the start of a delimiter, unless one is found.
+            var end = if (held >= size) held - (size - 1) else 0;
+            this.dropTo = end;
+            var from: usize = 0;
+            loop {
+                let at = this.find(this.delimiter.view(), from) ?? { break; };
+                if (at + size + 2 > held) {
+                    // What follows it is not here yet: up to it, and look again with more.
+                    end = at;
+                    this.dropTo = at;
+                    break;
+                }
+                // A delimiter is followed by the line's end, padding before it, or `--`; anything else is data
+                // that looks like one (`--boundaryX`).
+                let b = this.buffer.readable();
+                let one = b[at + size];
+                let two = b[at + size + 1];
+                if ((one == 13 && two == 10) || (one == 45 && two == 45) || one == 32 || one == 9) {
+                    // What is before the delimiter is the part's last piece; the delimiter goes with it.
+                    end = at;
+                    this.state = UploadState.Between;
+                    this.dropTo = at + size;
+                    break;
+                }
+                from = at + 1;
+            }
+            let skipped = if (this.skip < end) this.skip else end;
+            this.skip -= skipped;
+            this.pieceFrom = skipped;
+            this.pieceTo = end;
+            let between = match (this.state) {
+                UploadState.Between => true,
+                _ => false,
+            };
+            if (end > skipped || between) {
+                return Ok(end - skipped);
+            }
+            this.passed();
+            if (!(await this.fill(exchange)?)) {
+                return Err(this.broken()); // the body ended before the part did
+            }
+        }
+    }
+
+    /// Moves to the next part, passing over what is left of the current one. False after the last.
+    public async fn next(borrow mut this, exchange: borrow mut Exchange) -> Result<bool, HandlerError> {
+        loop {
+            match (this.state) {
+                UploadState.Data => {
+                    let _ = await this.read(exchange)?;
+                }
+                UploadState.Broken => { return Err(HandlerError.Status(Status.badRequest())); }
+                UploadState.Done => { return Ok(false); }
+                UploadState.Between => { break; }
+            }
+        }
+        this.passed();
+        // After a delimiter: `--` closes the body; otherwise the line ends, and a header follows up to an empty line.
+        // The line end is left in place, so that "\r\n\r\n" is found even where the header is empty.
+        loop {
+            let b = this.buffer.readable();
+            if (b.length >= 2 && b[0] == 45 && b[1] == 45) {
+                this.state = UploadState.Done;
+                return Ok(false);
+            }
+            var at: usize = 0;
+            while (at < b.length && (b[at] == 32 || b[at] == 9)) {
+                at += 1;
+            }
+            if (at + 2 <= b.length) {
+                if (b[at] != 13 || b[at + 1] != 10) {
+                    return Err(this.broken());
+                }
+                let _ = this.buffer.consume(at);
+                break;
+            }
+            if (!(await this.fill(exchange)?)) {
+                return Err(this.broken());
+            }
+        }
+        if (this.left == 0) {
+            return Err(this.broken());
+        }
+        this.left -= 1;
+        var headEnd: usize = 0;
+        loop {
+            match (this.find("\r\n\r\n".bytes(), 0)) {
+                Some(at) => {
+                    headEnd = at;
+                    break;
+                }
+                null => {}
+            }
+            if (!(await this.fill(exchange)?)) {
+                return Err(this.broken()); // a header longer than the buffer, or the body's end
+            }
+        }
+        this.partName.clear();
+        this.partFile.clear();
+        this.partType.clear();
+        this.isFile = false;
+        var named = false;
+        var copied = true;
+        let b = this.buffer.readable();
+        var at: usize = 2;
+        while (at < headEnd) {
+            var end = at;
+            while (end < headEnd && !(b[end] == 13 && b[end + 1] == 10)) {
+                end += 1;
+            }
+            let line = b[at..end];
+            var colon: usize = 0;
+            while (colon < line.length && line[colon] != 58) {
+                colon += 1;
+            }
+            if (colon < line.length) {
+                let value = trimWhitespace(line[colon + 1..]);
+                if (Ascii.equalsIgnoringCase(line[0..colon], "content-disposition")) {
+                    match (parameter(value, "name")) {
+                        Some(v) => {
+                            named = true;
+                            copied = copied && put(mut this.partName, v);
+                        }
+                        null => {}
+                    }
+                    match (parameter(value, "filename")) {
+                        Some(v) => {
+                            this.isFile = true;
+                            copied = copied && put(mut this.partFile, v);
+                        }
+                        null => {}
+                    }
+                } else if (Ascii.equalsIgnoringCase(line[0..colon], "content-type")) {
+                    copied = copied && put(mut this.partType, value);
+                }
+            }
+            at = end + 2;
+        }
+        if (!copied) {
+            return Err(HandlerError.Internal);
+        }
+        if (!named) {
+            return Err(this.broken());
+        }
+        // The data starts at the header's last line end: the delimiter of a part without data begins there, and
+        // any other part's data has it in front, to be left out.
+        let _ = this.buffer.consume(headEnd + 2);
+        this.skip = 2;
+        this.state = UploadState.Data;
+        return Ok(true);
+    }
+}
