@@ -52,7 +52,8 @@ impl Handler<Shop> for Item {
 - **Filters.** Middleware that needs nothing of the application's state, in the same chains: `Cors` (any or listed
   origins, credentials, preflights answered), `FixedHeaders` and `SecurityHeaders` (nosniff, frame options, referrer
   policy, HSTS, a content security policy), `HttpsRedirect`, and `RateLimit` (requests per window per client address,
-  in a table of fixed size, 429 with `Retry-After`).
+  in a table of fixed size, 429 with `Retry-After`; `RateLimit.shared` counts in `SharedWords`, so the supervisor's
+  workers enforce one limit together).
 - **What middleware leaves for the handler.** `scope.put("user", …)` in a filter, `ctx.value("user")` after it.
 - **Cookies.** `Cookies.get(request, name)` and `SetCookie` (path, domain, max age, `Secure`, `HttpOnly`,
   `SameSite`).
@@ -130,7 +131,9 @@ impl WorkerMain for Server {
   worker, or each bind the shared port (`reusePort`, Linux), which spreads connections evenly.
 
 What it costs: the requests in flight on a worker that ends get no answer, and the workers share no memory, so a
-counter or a cache is per worker unless it is put somewhere they share.
+counter or a cache is per worker unless it is put somewhere they share. `SharedWords` is such a place for numbers:
+words mapped before the workers are forked and changed only atomically, with no locks and no pointers in them, so a
+worker that traps cannot leave the others anything half written. `RateLimit.shared` counts there.
 
 `python3 tools/supervisor_check.py [--inherit] [--memory-mb 512]` checks all of this against the benchmark server:
 five traps, a handler that never returns and one that takes memory until it fails, each followed by the server
@@ -138,7 +141,7 @@ still answering.
 
 ## What is not here yet
 
-Of CosmoApiServer: spans exported to a collector. The rate limit counts in one process: under the supervisor, each worker has its own counters. Not planned: reflection controllers and
+Of CosmoApiServer: spans exported to a collector. Not planned: reflection controllers and
 dependency injection (handlers are structs), Razor and Blazor, the front-end development helpers, SignalR's wire
 protocol; gRPC and OpenAPI unless asked for.
 
@@ -189,6 +192,10 @@ answers the same routes (server GC). One machine and one run each: read the rati
   makes it each time, and 64 KiB 45 000 times against 3 600 to 4 000.
 - The trace filter costs about 10% on `/small` (90 000 to 93 000 a second, against 98 000 to 105 000): four values
   left for the handler and one more response field.
+- With four workers and every request from one address (so every request changes the same shared word), a limit
+  counted in `SharedWords` answers 240 000 to 259 000 `/small` a second, one each worker counts for itself 261 000,
+  and no limit 254 000 to 275 000. `tools/ratelimit_check.py`: of 992 requests against a limit of 200, exactly 200
+  are answered with the shared words, 727 to 800 without.
 - CosmoApiServer answered 56 and 16 of about 1.3 million `/users/42` requests with a status that was not 2xx; not
   looked into.
 
@@ -205,6 +212,7 @@ ceesafec test --cflag -fsanitize=address,undefined
 (cd bench && ceesafec build)      # then: python3 <CeeSafe.Web>/benchmarks/servers/conform.py --port 8090
 python3 tools/supervisor_check.py # the supervisor, against bench/out/bench
 python3 tools/gzip_check.py       # compressed responses, against Python's gzip
+python3 tools/ratelimit_check.py  # one rate limit for four workers (add --inherit on macOS)
 python3 tools/ws_check.py         # the hub, with WebSocket clients written from RFC 6455
 ```
 

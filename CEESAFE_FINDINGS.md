@@ -16,6 +16,8 @@ Bugs and gaps in CeeSafe and CeeSafe.Web met while writing httpserver, with cees
 | S9 | `Application.beforeHead` gets the request and the head, not the handler's context | CeeSafe.Web | a group's middleware has no `after`; the access log and the timeout are in `App.handle`, around the whole chain |
 | S10 | Nothing can change a response's body after the handler sends it | CeeSafe.Web | compression is a call the handler makes (`Compression.send`), not a middleware |
 | S11 | `for (x in it)` over an iterator that is Copy walks a copy, and says nothing | ceesafec | `Multipart` is `@noncopy` |
+| S12 | A struct that holds a raw pointer is not Send or Share, and `@threadSafe` is for trusted packages only | ceesafec, by design | the address is kept as a `usize` and cast where it is used |
+| S13 | An array literal of borrows is refused with a message about the borrowed type not being Copy | ceesafec | the two calls are written out |
 
 ## S1: a nested `if` expression's literals are `i32`
 
@@ -135,3 +137,21 @@ Seen in tests/form.cee: a body cut short was reported as well-formed, because `f
 loop had not touched. Nothing warns. A struct with `fn next(borrow mut this)` whose state matters after the loop
 has to be `@noncopy`, after which the loop is refused and the caller writes `parts.next()` in a `loop`. Wanted: a
 warning for a `for` over a Copy value that is read again afterwards, or the loop borrowing a named variable.
+
+## S12: a raw pointer makes a struct thread-bound
+
+`SharedWords` holds the address of a mapping every process and thread may use, and a filter that holds it must be
+`Send + Share` to go in an application. A `*mut AtomicU64` field makes the struct neither (N0334), and `@threadSafe`
+is refused outside the libraries and packages marked `trusted = true` (N0290). The field is a `usize`, cast to the
+pointer inside the one `unsafe` expression that uses it (`n as *mut T` is allowed, §27.2). That works, but the type
+no longer says it is a pointer. What did work without any C: `Ptr.toBorrow` over the mapping gives a
+`borrow AtomicU64`, whose `compareExchange` is the shared memory's only access.
+
+## S13: an array of borrows
+
+```ceesafe
+for (app in [borrow two, borrow one]) { ... }   // N0259: array elements must be Copy; 'App<St>' is not Copy
+```
+
+A `borrow T` is Copy (§5), but the element type reported is the borrowed `App<St>`. Whether arrays of references
+are meant to be refused or not, the message names the wrong type. tests/filters.cee writes the two calls out.

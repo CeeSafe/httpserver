@@ -2,8 +2,9 @@
 //
 // The counters are a table of a fixed size, so the memory is bounded whatever the number of clients: two clients
 // that fall on the same place share a counter until its window ends (a table several times the number of clients
-// active in one window makes that rare). The table is one process's: under the supervisor each worker counts for
-// itself, so with n workers a client may make up to n times the limit.
+// active in one window makes that rare). `create`'s table is one process's: under the supervisor each worker counts
+// for itself, so with n workers a client may make up to n times the limit. `shared`'s is `SharedWords` that every
+// worker counts in, one word a counter, changed by compare-and-swap.
 import web_core;
 import web_http;
 
@@ -20,6 +21,8 @@ public struct RateLimit {
     private limit: u32;
     private windowMs: u64;
     private table: Mutex<Vector<Counter>>;
+    /// The workers' common counters, if the limit is shared.
+    private common: SharedWords?;
 
     /// `places` counters (rounded up to a power of two, at least 64).
     public fn create(limit: u32, windowMs: u64, places: usize) -> Result<RateLimit, AllocError> {
@@ -31,12 +34,50 @@ public struct RateLimit {
         for (i in 0..size) {
             counters.push(Counter { key: 0, startMs: 0, count: 0 })?;
         }
-        return Ok(RateLimit { limit: limit, windowMs: windowMs, table: Mutex<Vector<Counter>>.create(counters)? });
+        return Ok(RateLimit {
+            limit: limit,
+            windowMs: windowMs,
+            table: Mutex<Vector<Counter>>.create(counters)?,
+            common: null,
+        });
+    }
+
+    /// The same limit counted by every worker of a supervisor together, in `words` (made before `supervise`; a word a
+    /// counter). Windows are the same for all: they start at multiples of `windowMs` on the monotonic clock, which
+    /// the processes of one machine share. A word holds 16 bits of the key, 16 of the window and the count.
+    public fn shared(limit: u32, windowMs: u64, words: SharedWords) -> Result<RateLimit, AllocError> {
+        var r = RateLimit.create(limit, if (windowMs == 0) 1u64 else windowMs, 0)?;
+        r.common = Some(words);
+        return Ok(r);
+    }
+
+    /// `hit` in the shared words.
+    fn hitShared(borrow this, words: borrow SharedWords, key: u64, nowMs: u64) -> Hit {
+        let window = nowMs / this.windowMs;
+        let leftMs = this.windowMs - nowMs % this.windowMs;
+        let mark = ((key >> 48) << 48) | ((window & 0xFFFF) << 32);
+        let word = words.word(truncate<usize>(key));
+        var old = word.load();
+        // Another worker may change the word between the load and the exchange: again, a few times at most.
+        for (attempt in 0..16) {
+            let same = (old >> 32) == (mark >> 32);
+            let before = if (same) old & 0xFFFFFFFF else 0u64;
+            let count = if (before == 0xFFFFFFFF) before else before + 1;
+            match (word.compareExchange(old, mark | count)) {
+                Ok(_) => { return Hit { count: truncate<u32>(count), leftMs: leftMs }; }
+                Err(now) => { old = now; }
+            }
+        }
+        return Hit { count: 0, leftMs: leftMs }; // let through
     }
 
     /// Counts one request of `key` at `nowMs`; how many the key has made in its window, this one included, and the
     /// milliseconds until the window ends.
     fn hit(borrow this, key: u64, nowMs: u64) -> Hit {
+        match (borrow this.common) {
+            Some(words) => { return this.hitShared(words, key, nowMs); }
+            null => {}
+        }
         // One event loop a process: the lock is free. If it is not (another thread of the application), let through.
         var guard = this.table.tryLock() ?? { return Hit { count: 0, leftMs: 0 }; };
         let counters = guard.data();

@@ -23,7 +23,8 @@
 // ends and kills one whose loop has stopped; CW_MEMORY_MB limits each worker's address space; CW_INHERIT=1 has the
 // workers accept from one socket the supervisor bound, instead of each binding the shared port.
 //
-// CW_TRACE=1 adds the trace-context filter. CW_TIMEOUT_MS=n bounds every request (`App.timeout`); CW_LOG=1 adds an access log that only counts, CW_LOG=2 the
+// CW_LIMIT=n adds a rate limit of n requests an hour for each client address; with CW_SHARED=1 the supervisor's
+// workers count in shared memory, so the limit is all of theirs together. CW_TRACE=1 adds the trace-context filter. CW_TIMEOUT_MS=n bounds every request (`App.timeout`); CW_LOG=1 adds an access log that only counts, CW_LOG=2 the
 // stock one that writes a line a request to standard output.
 //
 // CW_HOOKS=n adds n middleware that do nothing to the application, to measure what one costs. CW_STOCK=1 adds the
@@ -454,7 +455,7 @@ fn setting(name: StringView, otherwise: u64) -> u64 {
     };
 }
 
-fn application(worker: u32) -> Result<App<St>, RouteError> {
+fn application(worker: u32, words: SharedWords?) -> Result<App<St>, RouteError> {
     var limits = Limits.defaults();
     limits.maxBodyBytes = 1048576;
     let hub = match (Hub.create()) {
@@ -469,6 +470,14 @@ fn application(worker: u32) -> Result<App<St>, RouteError> {
         app.filter(stock(SecurityHeaders.defaults())?)?;
         app.filter(stock(corsForAll())?)?;
         app.filter(stock(RateLimit.create(0xFFFFFFFF, 60000, 4096))?)?;
+    }
+    let limit = setting("CW_LIMIT", 0);
+    if (limit > 0) {
+        // An hour's window: a check that counts requests does not meet its end.
+        match (words) {
+            Some(w) => { app.filter(stock(RateLimit.shared(truncate<u32>(limit), 3600000, w))?)?; }
+            null => { app.filter(stock(RateLimit.create(truncate<u32>(limit), 3600000, 4096))?)?; }
+        }
     }
     if (setting("CW_TRACE", 0) == 1) {
         let made: Result<Trace, AllocError> = Ok(Trace.create(true));
@@ -580,8 +589,8 @@ async fn serve(app: App<St>, worker: Worker, listener: borrow Listener) -> Resul
 }
 
 /// One process's server on `listener`; the status it exits with.
-fn serveOn(worker: Worker, listener: borrow Listener) -> i32 {
-    let app = match (application(worker.index())) {
+fn serveOn(worker: Worker, listener: borrow Listener, words: SharedWords?) -> i32 {
+    let app = match (application(worker.index(), words)) {
         Ok(a) => a,
         Err(_) => {
             Console.writeLine("bench: could not build the routes");
@@ -602,16 +611,18 @@ fn serveOn(worker: Worker, listener: borrow Listener) -> i32 {
 /// the kernel gives each connection to one of them (Linux), which spreads the load evenly.
 struct Bench {
     listener: Listener?;
+    /// The counters the workers' rate limit shares (CW_SHARED=1).
+    words: SharedWords?;
 }
 
 impl WorkerMain for Bench {
     fn run(borrow this, worker: Worker) -> i32 {
         match (borrow this.listener) {
-            Some(l) => { return serveOn(worker, l); }
+            Some(l) => { return serveOn(worker, l, this.words); }
             null => {}
         }
         match (listening(true)) {
-            Ok(mine) => { return serveOn(worker, mine); }
+            Ok(mine) => { return serveOn(worker, mine, this.words); }
             Err(e) => {
                 Console.writeLine(NetErrors.describe(e));
                 return 1;
@@ -624,7 +635,7 @@ fn main() {
     let procs = setting("CW_PROCS", 0);
     if (procs == 0) {
         match (listening(setting("CW_REUSEPORT", 0) == 1)) {
-            Ok(mine) => { Process.exit(serveOn(Worker.alone(), mine)); }
+            Ok(mine) => { Process.exit(serveOn(Worker.alone(), mine, null)); }
             Err(e) => {
                 Console.writeLine(NetErrors.describe(e));
                 Process.exit(1);
@@ -637,7 +648,10 @@ fn main() {
     options.memoryBytes = setting("CW_MEMORY_MB", 0) * 1048576;
     Console.writeLine("bench: supervising");
     // CW_INHERIT=1: the supervisor binds the port and the workers inherit the socket.
-    var bench = Bench { listener: null };
+    var bench = Bench { listener: null, words: null };
+    if (setting("CW_SHARED", 0) == 1) {
+        bench.words = SharedWords.create(4096);
+    }
     if (setting("CW_INHERIT", 0) == 1) {
         match (listening(false)) {
             Ok(l) => { bench.listener = Some(l); }

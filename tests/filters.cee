@@ -210,3 +210,41 @@ async fn theRateLimitAndHealth() -> Result<void, TestFailure> {
     )?;
     return Ok();
 }
+
+@test
+async fn aRateLimitInSharedWords() -> Result<void, TestFailure> {
+    let words = SharedWords.create(100) ?? { return Err(TestFailure.create("no shared memory")); };
+    Check.equalU64(128, words.length() as u64)?;
+    // Two applications stand for two workers: they count in the same words. The window is an hour, so that the
+    // test does not meet its end.
+    var one = routed(App<St>.create(state(), quiet()))?;
+    routed(one.filter(filtered(alloc(RateLimit.shared(3, 3600000, words))?)?))?;
+    routed(one.get("/x", named(1)?))?;
+    var two = routed(App<St>.create(state(), quiet()))?;
+    routed(two.filter(filtered(alloc(RateLimit.shared(3, 3600000, words))?)?))?;
+    routed(two.get("/x", named(2)?))?;
+    await body(
+        one,
+        "GET /x HTTP/1.1\r\nhost: a\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nratelimit-limit: 3\r\nratelimit-remaining: 2\r\ncontent-length: 2\r\n\r\nh1",
+    )?;
+    await body(
+        two,
+        "GET /x HTTP/1.1\r\nhost: a\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nratelimit-limit: 3\r\nratelimit-remaining: 1\r\ncontent-length: 2\r\n\r\nh2",
+    )?;
+    await body(
+        one,
+        "GET /x HTTP/1.1\r\nhost: a\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nratelimit-limit: 3\r\nratelimit-remaining: 0\r\ncontent-length: 2\r\n\r\nh1",
+    )?;
+    // The fourth, whichever worker it reaches.
+    for (i in 0..2) {
+        let ask = "GET /x HTTP/1.1\r\nhost: a\r\n\r\n";
+        let refused = if (i == 0) await served(two, ask)? else await served(one, ask)?;
+        let head = "HTTP/1.1 429 Too Many Requests\r\nratelimit-limit: 3\r\nratelimit-remaining: 0\r\nretry-after: ".bytes();
+        Check.isTrue(refused.length > head.length, "a refusal")?;
+        Check.equalBytes(head, refused.view()[0..head.length])?;
+    }
+    return Ok();
+}
