@@ -1,0 +1,100 @@
+// The trace filter, through an application on mock connections.
+import web_core;
+import web_transport;
+import web_http;
+import web_http1;
+
+/// Answers `<trace>|<span>|<parent>|<traceparent>` as the filter left them.
+struct Traced {}
+
+impl Handler<St> for Traced {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut Context<St>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        var body = Vector<u8>.create();
+        let ok = put(mut body, ctx.value("trace") ?? "-".bytes())
+            && put(mut body, "|".bytes())
+            && put(mut body, ctx.value("span") ?? "-".bytes())
+            && put(mut body, "|".bytes())
+            && put(mut body, ctx.value("parent") ?? "-".bytes())
+            && put(mut body, "|".bytes())
+            && put(mut body, ctx.value("traceparent") ?? "-".bytes());
+        if (!ok) {
+            return Err(HandlerError.Internal);
+        }
+        return await exchange.send(Status.ok(), body.view());
+    }
+}
+
+/// Whether `text` is `n` lower-case hexadecimal digits, not all 0.
+fn isId(text: Slice<u8>, n: usize) -> bool {
+    var some = false;
+    for (b in text) {
+        if (!((b >= 48 && b <= 57) || (b >= 97 && b <= 102))) {
+            return false;
+        }
+        some = some || b != 48;
+    }
+    return some && text.length == n;
+}
+
+@test
+async fn aRequestsPlaceInATrace() -> Result<void, TestFailure> {
+    var a = routed(App<St>.create(state(), quiet()))?;
+    let trace: Box<dyn Filter + Send + Share> = alloc(Box.create(Trace.create(true)))?;
+    routed(a.filter(trace))?;
+    let h: Box<dyn Handler<St> + Send + Share> = alloc(Box.create(Traced {}))?;
+    routed(a.get("/", h))?;
+
+    // The caller's trace and flags are kept, its span becomes the parent, and the request gets a span of its own.
+    // (The example of the W3C specification.)
+    let got = await served(
+        a,
+        "GET / HTTP/1.1\r\nhost: a\r\ntraceparent: 00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01\r\n\r\n",
+    )?;
+    let head = "HTTP/1.1 200 OK\r\ntraceresponse: 00-0af7651916cd43dd8448eb211c80319c-".bytes();
+    Check.equalBytes(head, got.view()[0..head.length])?;
+    let span = got.view()[head.length..head.length + 16];
+    Check.isTrue(isId(span, 16) && !sameBytes(span, "b7ad6b7169203331".bytes()), "a span of its own")?;
+    var rest = Vector<u8>.create();
+    let ok = put(mut rest, "-01\r\ncontent-length: 122\r\n\r\n0af7651916cd43dd8448eb211c80319c|".bytes())
+        && put(mut rest, span)
+        && put(mut rest, "|b7ad6b7169203331|00-0af7651916cd43dd8448eb211c80319c-".bytes())
+        && put(mut rest, span)
+        && put(mut rest, "-01".bytes());
+    Check.isTrue(ok, "memory")?;
+    Check.equalBytes(rest.view(), got.view()[head.length + 16..])?;
+
+    // No traceparent, or one that is not well formed (upper case, an id of zeros, a version not known): a new trace,
+    // not sampled, with no parent.
+    var last = Vector<u8>.create();
+    for (request in [
+        "GET / HTTP/1.1\r\nhost: a\r\n\r\n",
+        "GET / HTTP/1.1\r\nhost: a\r\ntraceparent: 00-0AF7651916CD43DD8448EB211C80319C-b7ad6b7169203331-01\r\n\r\n",
+        "GET / HTTP/1.1\r\nhost: a\r\ntraceparent: 00-00000000000000000000000000000000-b7ad6b7169203331-01\r\n\r\n",
+        "GET / HTTP/1.1\r\nhost: a\r\ntraceparent: 00-0af7651916cd43dd8448eb211c80319c-0000000000000000-01\r\n\r\n",
+        "GET / HTTP/1.1\r\nhost: a\r\ntraceparent: 01-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01\r\n\r\n",
+        "GET / HTTP/1.1\r\nhost: a\r\ntraceparent: 00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331\r\n\r\n",
+    ]) {
+        let fresh = await served(a, request)?;
+        let start = "HTTP/1.1 200 OK\r\ntraceresponse: 00-".bytes();
+        Check.equalBytes(start, fresh.view()[0..start.length])?;
+        let id = fresh.view()[start.length..start.length + 32];
+        Check.isTrue(isId(id, 32), "a trace id")?;
+        Check.isTrue(!sameBytes(id, "0af7651916cd43dd8448eb211c80319c".bytes()), "not the caller's")?;
+        Check.isTrue(!sameBytes(id, last.view()), "not the last one's")?;
+        last.clear();
+        Check.isTrue(put(mut last, id), "memory")?;
+        Check.isTrue(isId(fresh.view()[start.length + 33..start.length + 49], 16), "a span id")?;
+        let tail = fresh.view()[start.length + 49..start.length + 52];
+        Check.equalBytes("-00".bytes(), tail)?;
+        // trace|span|-|traceparent
+        let body = fresh.view()[fresh.length - 107..];
+        Check.equalBytes(id, body[0..32])?;
+        Check.equalBytes("|-|00-".bytes(), body[49..55])?;
+    }
+    return Ok();
+}

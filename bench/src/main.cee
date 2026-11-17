@@ -13,6 +13,7 @@
 //   GET  /worker         which worker process answered
 //   GET  /crash          traps (an index out of bounds), which ends the process
 //   GET  /spin           computes without end, which stops the event loop
+//   GET  /kept/{n:int}   the same text through the output cache, kept for a minute
 //   GET  /gz/{n:int}     n bytes of JSON-like text through `Compression`: gzip for a client that accepts it
 //   GET  /z/{n:int}      the same text through `Codings`: zstd or Brotli, or gzip for a client that takes neither
 //   GET  /chat           a WebSocket: every message a session sends goes to all the sessions of this process
@@ -22,7 +23,7 @@
 // ends and kills one whose loop has stopped; CW_MEMORY_MB limits each worker's address space; CW_INHERIT=1 has the
 // workers accept from one socket the supervisor bound, instead of each binding the shared port.
 //
-// CW_TIMEOUT_MS=n bounds every request (`App.timeout`); CW_LOG=1 adds an access log that only counts, CW_LOG=2 the
+// CW_TRACE=1 adds the trace-context filter. CW_TIMEOUT_MS=n bounds every request (`App.timeout`); CW_LOG=1 adds an access log that only counts, CW_LOG=2 the
 // stock one that writes a line a request to standard output.
 //
 // CW_HOOKS=n adds n middleware that do nothing to the application, to measure what one costs. CW_STOCK=1 adds the
@@ -292,6 +293,23 @@ impl Handler<St> for Packed {
     }
 }
 
+/// The same text through an `OutputCache`, kept for a minute.
+struct Stored {
+    cache: Arc<OutputCache>;
+}
+
+impl Handler<St> for Stored {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut Context<St>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        let body = jsonLike(asked(ctx))?;
+        return await this.cache.get().send(request, exchange, Status.ok(), "application/json", body.view(), 60);
+    }
+}
+
 /// The same text through `Codings`.
 struct Coded {
     codings: Codings;
@@ -452,6 +470,10 @@ fn application(worker: u32) -> Result<App<St>, RouteError> {
         app.filter(stock(corsForAll())?)?;
         app.filter(stock(RateLimit.create(0xFFFFFFFF, 60000, 4096))?)?;
     }
+    if (setting("CW_TRACE", 0) == 1) {
+        let made: Result<Trace, AllocError> = Ok(Trace.create(true));
+        app.filter(stock(made)?)?;
+    }
     app.timeout(setting("CW_TIMEOUT_MS", 0));
     match (setting("CW_LOG", 0)) {
         1 => {
@@ -501,6 +523,17 @@ fn application(worker: u32) -> Result<App<St>, RouteError> {
         Err(_) => { return Err(RouteError.OutOfMemory); },
     };
     app.get("/gz/{n:int}", handler(Box.create(Packed { compression: compression }))?)?;
+    let cache = match (OutputCache.create(1024, 1048576)) {
+        Ok(c) => match (Arc<OutputCache>.create(c)) {
+            Ok(a) => a,
+            Err(_) => { return Err(RouteError.OutOfMemory); },
+        },
+        Err(_) => { return Err(RouteError.OutOfMemory); },
+    };
+    let kept = app.group("/kept")?;
+    let answering: Result<Cached, AllocError> = Ok(Cached.create(cache.clone()));
+    app.filterIn(kept, stock(answering)?)?;
+    app.routeIn(kept, Method.Get, "/{n:int}", handler(Box.create(Stored { cache: cache }))?)?;
     app.get("/users/{id:int}", handler(Box.create(User {}))?)?;
     let api = app.group("/api")?;
     for (i in 0..setting("CW_HOOKS", 0)) {

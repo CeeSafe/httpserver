@@ -84,6 +84,9 @@ impl Handler<Shop> for Item {
 - **Access log.** `app.logTo(log)` tells an `AccessLog` of every request once it is answered (the request, the
   connection, the status, the microseconds), a 404 or a timeout included. `ConsoleLog` writes a line a request to
   standard output; an application's own can count, sample, or write somewhere else.
+- **Trace context.** The filter `Trace` reads the caller's W3C `traceparent` or starts a trace, gives the request
+  a span id of its own, and leaves `"trace"`, `"span"`, `"parent"` and `"traceparent"` (the header to send on) for
+  the handler; with `respond`, the response says them in `traceresponse`. Spans are not exported to a collector.
 - **Output cache.** A handler that answers through `OutputCache.send(request, exchange, status, type, body,
   seconds)` has its response kept in memory; the filter `Cached` before it answers the next GET and HEAD requests
   for the same path and query without running it, with `age`, and with 304 for a client that sends the `etag` back
@@ -131,7 +134,7 @@ still answering.
 
 ## What is not here yet
 
-Of CosmoApiServer: tracing (trace ids passed on and spans exported), and `Vary` in the output cache. The output cache has not been measured under load. The rate limit counts in one process: under the supervisor, each worker has its own counters. Not planned: reflection controllers and
+Of CosmoApiServer: spans exported to a collector, and `Vary` in the output cache. The rate limit counts in one process: under the supervisor, each worker has its own counters. Not planned: reflection controllers and
 dependency injection (handlers are structs), Razor and Blazor, the front-end development helpers, SignalR's wire
 protocol; gRPC and OpenAPI unless asked for.
 
@@ -178,6 +181,10 @@ answers the same routes (server GC). One machine and one run each: read the rati
 - A request timeout costs about 5% on `/small` (94 000 to 102 000 a second with one set, against 102 000 to
   105 000 without; the runs vary by that much), an access log that only counts nothing measurable, and `ConsoleLog`
   about 20% (81 000) with standard output sent to `/dev/null`.
+- The output cache answers 4 KiB of JSON-like text 83 000 to 85 000 times a second against 33 000 when the handler
+  makes it each time, and 64 KiB 45 000 times against 3 600 to 4 000.
+- The trace filter costs 5% to 17% on `/small` (84 000 to 96 000 a second over four runs, against 100 000 to
+  103 000): four values left for the handler, each two allocations, and one more response field.
 - CosmoApiServer answered 56 and 16 of about 1.3 million `/users/42` requests with a status that was not 2xx; not
   looked into.
 

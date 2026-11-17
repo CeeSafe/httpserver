@@ -1,0 +1,133 @@
+// Trace context (W3C Trace Context, `traceparent`): which trace a request belongs to, and its own span in it.
+//
+// The filter reads the caller's `traceparent`, or starts a trace where there is none, and gives the request a span
+// id of its own. A handler passes `"traceparent"` on in the requests it makes, and a log writes `"trace"`, so what
+// one request caused across services can be found again. Spans are not exported: nothing here speaks to a
+// collector.
+import web_core;
+import web_http;
+
+/// The value of the hexadecimal digit `b` (lower case only, as the specification asks), or 16.
+fn hexDigit(b: u8) -> u8 {
+    if (b >= 48 && b <= 57) {
+        return b - 48;
+    }
+    if (b >= 97 && b <= 102) {
+        return b - 87;
+    }
+    return 16;
+}
+
+/// Whether `text` is lower-case hexadecimal digits, not all of them 0.
+fn hexId(text: Slice<u8>) -> bool {
+    var some = false;
+    for (b in text) {
+        if (hexDigit(b) == 16) {
+            return false;
+        }
+        some = some || b != 48;
+    }
+    return some;
+}
+
+/// Whether `value` is a version 00 `traceparent`: `00-<32 hex>-<16 hex>-<2 hex>`, neither id all zeros.
+fn wellFormed(value: Slice<u8>) -> bool =>
+    value.length == 55 &&
+        value[0] == 48 &&
+        value[1] == 48 &&
+        value[2] == 45 &&
+        value[35] == 45 &&
+        value[52] == 45 &&
+        hexId(value[3..35]) &&
+        hexId(value[36..52]) &&
+        hexDigit(value[53]) != 16 &&
+        hexDigit(value[54]) != 16;
+
+/// Gives each request its place in a trace. For what runs after it leaves `"trace"` (32 hexadecimal digits), `"span"`
+/// (this request's, 16), `"parent"` (the caller's span, if the caller sent a `traceparent`) and `"traceparent"`
+/// (the header to send with requests made on this one's behalf).
+public struct Trace {
+    /// A counter that a mixing function turns into ids: they must differ, not be secret.
+    private counter: AtomicU64;
+    private respond: bool;
+
+    /// The filter. With `respond`, every response says which trace and span it was (`traceresponse`), for a client
+    /// to quote. Ids start from the system's random source.
+    public fn create(respond: bool) -> Trace {
+        var seed = [0u8; 8];
+        var start: u64 = Clock.monotonicNanos();
+        match (Random.fill(mut seed[..])) {
+            Ok() => {
+                for (b in seed) {
+                    start = (start << 8) ^ b as u64;
+                }
+            }
+            Err(_) => {}
+        }
+        return Trace { counter: AtomicU64.create(start), respond: respond };
+    }
+
+    /// 64 bits that differ from the last (SplitMix64), never 0.
+    fn fresh(borrow this) -> u64 {
+        let n = this.counter.load().wrappingAdd(0x9E3779B97F4A7C15);
+        this.counter.store(n);
+        var z = n;
+        z = (z ^ (z >> 30)).wrappingMul(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)).wrappingMul(0x94D049BB133111EB);
+        z = z ^ (z >> 31);
+        return if (z == 0) 1 else z;
+    }
+}
+
+/// `value` as 16 hexadecimal digits into `out` at `at`.
+fn hex16(value: u64, out: borrow mut [u8; 55], at: usize) {
+    let digits = "0123456789abcdef".bytes();
+    for (i in 0..16usize) {
+        out[at + i] = digits[truncate<usize>((value >> (60 - i as u64 * 4)) & 15)];
+    }
+}
+
+impl Filter for Trace {
+    async fn before(
+        borrow this,
+        scope: borrow mut Scope,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<Flow, HandlerError> {
+        // 00-<trace>-<span>-<flags>
+        var mine = [45u8; 55];
+        mine[0] = 48;
+        mine[1] = 48;
+        let sent = request.headers().getNamed("traceparent") ?? "".bytes();
+        var kept = true;
+        if (wellFormed(sent)) {
+            for (i in 3..35usize) {
+                mine[i] = sent[i];
+            }
+            mine[53] = sent[53];
+            mine[54] = sent[54];
+            kept = scope.put("parent", sent[36..52]);
+        } else {
+            // A new trace, not sampled: whoever starts one that is says so.
+            hex16(this.fresh(), mut mine, 3);
+            hex16(this.fresh(), mut mine, 19);
+            mine[53] = 48;
+            mine[54] = 48;
+        }
+        hex16(this.fresh(), mut mine, 36);
+        kept = kept &&
+            scope.put("trace", mine[3..35]) &&
+            scope.put("span", mine[36..52]) &&
+            scope.put("traceparent", mine[..]);
+        if (!kept) {
+            return Err(HandlerError.Internal);
+        }
+        if (this.respond) {
+            exchange.header("traceresponse", mine[..])?;
+        }
+        return Ok(Flow.Continue);
+    }
+
+    async fn after(borrow this, request: borrow Request, head: borrow mut ResponseHead) -> Result<void, HandlerError> =>
+        Ok();
+}
