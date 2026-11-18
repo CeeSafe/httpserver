@@ -22,13 +22,20 @@ def get(path):
     c.close()
     return r, data
 
-def heard(tries=400):
-    """What each worker says it heard last: {worker: number}."""
+def heard(tries=400, deadline=8.0):
+    """What each worker says it heard last: {worker: number}. Asks until all four workers have answered and forty
+    more requests have been made, for at least `tries` requests and at most `deadline` seconds: which worker takes
+    a connection is the kernel's choice, and on a machine with few cores one of four may wait a while for its turn."""
     seen = {}
-    for _ in range(tries):
+    started = time.time()
+    asked = 0
+    while True:
         worker, number = get("/bus/heard")[1].split()
         seen[worker] = int(number)
-        if len(seen) == 4 and _ > 40:
+        asked += 1
+        if len(seen) == 4 and asked > 40:
+            break
+        if asked >= tries and time.time() - started > deadline:
             break
     return seen
 
@@ -45,6 +52,7 @@ def run(bus):
     proc = subprocess.Popen([str(HERE / "bench" / "out" / "bench")], env=env, stdout=subprocess.DEVNULL)
     try:
         time.sleep(1.5)
+        heard()                 # until every worker is up and has answered
         results = []
         for number in (42, 7, 123456):
             said = get(f"/bus/say/{number}")[1]
