@@ -4,7 +4,7 @@
 // `SpanLog` is an access log (`App.logTo`) that keeps a span for each request; `export` is raced against the
 // server, as `tend` is, and posts what has gathered every so often. The queue is bounded: when the collector is
 // slow or away, spans are dropped and counted, and requests are not held up. A request without a trace (no `Trace`
-// filter before it, or cancelled when its time was up) leaves no span.
+// filter before it) leaves no span; one whose time was up leaves its span, with the 504 it was answered.
 import web_core;
 import web_http;
 import web_client;

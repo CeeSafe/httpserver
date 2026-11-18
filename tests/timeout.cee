@@ -78,7 +78,7 @@ impl AccessLog for Seen {
     ) {
         let s = this.statuses.get();
         s.store(s.load() * 1000 + status as u64);
-        // What a filter left is there for the log, unless the request was cancelled.
+        // What a filter left is there for the log.
         match (scope.value("trace")) {
             Some(id) => { this.traces.get().store(this.traces.get().load() + id.length as u64); }
             null => {}
@@ -134,7 +134,6 @@ async fn requestsThatTakeTooLong() -> Result<void, TestFailure> {
 
     // The response whose start was sent is told as it began: 200.
     Check.equalU64(200200504200404, statuses.get().load())?;
-    // Eight requests in all; the three that were cancelled (the two 504s, and the one whose start was sent) come
-    // without what the filters left.
-    return Check.equalU64(5 * 32, traces.get().load());
+    // Eight requests in all, each with what the filters left: those whose time was up too.
+    return Check.equalU64(8 * 32, traces.get().load());
 }

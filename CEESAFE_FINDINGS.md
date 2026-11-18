@@ -1,6 +1,6 @@
 # CeeSafe findings
 
-Bugs and gaps in CeeSafe and CeeSafe.Web met while writing httpserver, with ceesafec 0.62.2 (now built with 0.65.1) and CeeSafe.Web at
+Bugs and gaps in CeeSafe and CeeSafe.Web met while writing httpserver, with ceesafec 0.62.2 (now built with 0.67.0) and CeeSafe.Web at
 `4bb64c6`. Each has what was seen, a reduction where there is one, and what httpserver does instead.
 
 | | What | Where | Status |
@@ -15,12 +15,12 @@ Bugs and gaps in CeeSafe and CeeSafe.Web met while writing httpserver, with cees
 | S8 | A connection does not say whether it came over TLS | CeeSafe.Web | `HttpsRedirect` redirects everything; the application on the plain port uses it |
 | S9 | `Application.beforeHead` gets the request and the head, not the handler's context | CeeSafe.Web | a group's middleware has no `after`; the access log and the timeout are in `App.handle`, around the whole chain |
 | S10 | Nothing can change a response's body after the handler sends it | CeeSafe.Web | compression is a call the handler makes (`Compression.send`), not a middleware |
-| S11 | `for (x in it)` over an iterator that is Copy walks a copy, and says nothing | ceesafec | `Multipart` is `@noncopy` |
+| S11 | `for (x in it)` over an iterator that is Copy walks a copy, and says nothing | ceesafec | ceesafec 0.67.0 warns (N0407, ADR 0167); `for (part in borrow mut parts)` walks the variable itself, as it always did |
 | S12 | A struct that holds a raw pointer is not Send or Share, and `@threadSafe` is for trusted packages only | ceesafec, by design | the address is kept as a `usize` and cast where it is used |
 | S13 | An array literal of borrows is refused with a message about the borrowed type not being Copy | ceesafec | fixed in ceesafec 0.65.1: it is N0246, an array of references |
-| S14 | A method that is given the context by `borrow mut` cannot call a `dyn Handler<S>` with it (N0272) | ceesafec, by design: the handler and `Context<S>` share the flow name `S`, whatever its bounds (§25.6) | the function that makes the context calls the handler; ADR 0168 proposes that a `Send` parameter be no flow name |
-| S15 | A cancelled task's function runs on to its end, and cannot tell without asking (`AsyncControl<E>.checkpoint`) | runtime, by design | the dispatcher asks before it tells the access log |
-| S16 | A closure that stores into a captured local and also captures part of a `borrow mut` parameter is refused as if it stored into the parameter (N0272) | ceesafec, looks like a fault of the checker; reduced, not understood | the closure captures only the parameters; a cancelled request's log entry lacks what the filters left |
+| S14 | A method that is given the context by `borrow mut` cannot call a `dyn Handler<S>` with it (N0272) | ceesafec, by design: the handler and `Context<S>` share the flow name `S`, whatever its bounds (§25.6) | fixed in ceesafec 0.67.0 (ADR 0168) once the interfaces ask `S: Send + Share`, which they do now: `App.handle` owns the context and hands it to the dispatcher |
+| S15 | A cancelled task's function runs on to its end, and cannot tell without asking (`AsyncControl<E>.checkpoint`) | runtime, by design | the dispatcher asks before it tells the access log; `Arc.create(v)` and its like are inferred since ceesafec 0.67.0 (ADR 0166) |
+| S16 | A closure that stores into a captured local and also captures part of a `borrow mut` parameter is refused as if it stored into the parameter (N0272) | ceesafec, looks like a fault of the checker; reduced, not understood | no longer met: with `S: Send + Share` on the interfaces (S14) the closure is accepted in 0.67.0; without the bound it is refused as before, and why is still not known |
 
 ## S1: a nested `if` expression's literals are `i32`
 
@@ -234,3 +234,13 @@ store that `dispatch` may make into `ctx` (its receiver shares `S` with it, S14)
 captures of one closure. This is what refused `Async.timeout(ms, late, async () => await this.dispatch(…, mut ctx,
 …, exchange))` in `App.handle`. One guess was tried in the checker and was wrong (a captured local written "through"
 as a reference is, `collectWrites`): the cause is not known.
+
+## What ceesafec 0.65.1 and 0.67.0 changed
+
+Released 2026-11-18 from these findings and httpclient's. 0.65.1 fixed S1, S6 and S13. 0.67.0 carries three ADRs:
+0166 (S15: a generic type's arguments inferred in a static call), 0167 (S11: warning N0407) and 0168 (S14: a type
+parameter bounded by `Send` or `Share` is no flow name). With 0168 and the bound written on `Handler<S>` and
+`Middleware<S>`, `App.handle` makes the context and passes it to `dispatch`, inside the time limit's closure too, so
+the access log has what the filters left for every request: a request whose time was up used to be logged without
+its trace id. Three more ADRs are accepted and not implemented: 0165 (S7, which would let `Filter` go), 0169 (S4,
+child processes in lib/std) and 0170 (S5, an allocation budget). S2, S3, S8, S9, S10 and S12 are as they were.

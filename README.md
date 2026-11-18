@@ -87,7 +87,7 @@ impl Handler<Shop> for Item {
   while it computes: one that never awaits is the supervisor's to stop.
 - **Access log.** `app.logTo(log)` tells an `AccessLog` of every request once it is answered (the request, its
   scope with the connection and what the filters left, such as the trace id, the status, the microseconds), a 404
-  or a timeout included; a request that timed out comes without what the filters left. `ConsoleLog` writes a line a request to
+  or a timeout included. `ConsoleLog` writes a line a request to
   standard output; an application's own can count, sample, or write somewhere else.
 - **Trace context.** The filter `Trace` reads the caller's W3C `traceparent` or starts a trace, gives the request
   a span id of its own, and leaves `"trace"`, `"span"`, `"parent"` and `"traceparent"` (the header to send on) for
@@ -95,7 +95,7 @@ impl Handler<Shop> for Item {
 - **Spans for a collector** (`otel/`, the package `httpserver_otel`, on CeeSafe.Web's `web_client`): `SpanLog` is an
   access log that keeps each traced request as a span in a bounded queue, and `export`, raced against the server,
   posts them in batches as OTLP/JSON to a collector's `/v1/traces` over plain HTTP. A batch the collector does not
-  take is dropped and counted; requests are never held up. A request that timed out leaves no span.
+  take is dropped and counted; requests are never held up.
 - **Output cache.** A handler that answers through `OutputCache.send(request, exchange, status, type, body,
   seconds)` has its response kept in memory; the filter `Cached` before it answers the next GET and HEAD requests
   for the same path and query without running it, with `age`, and with 304 for a client that sends the `etag` back
@@ -238,7 +238,7 @@ python3 tools/ws_check.py         # the hub, with WebSocket clients written from
 python3 tools/ws_check.py --workers 4   # the same over four workers and the bus (add --inherit on macOS)
 ```
 
-The compiler: ceesafec 0.65.1 or later (CeeSafe.Web at the pinned revision needs 0.62.2; the sources are formatted by 0.65.1). The supervisor is POSIX only.
+The compiler: ceesafec 0.67.0 or later (CeeSafe.Web at the pinned revision needs 0.62.2; `App.handle` hands its context to the dispatcher, which 0.67.0 accepts). The supervisor is POSIX only.
 
 ## License
 

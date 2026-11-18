@@ -97,40 +97,22 @@ public struct App<S: Send + Share> {
     }
 
     /// Runs the application's middleware, then what `found` says: the route's group's middleware and its handler, or
-    /// the answer for a path without one; and tells the access log, setting `logged`.
+    /// the answer for a path without one. The context is the caller's, which reads it afterwards for the access log.
     async fn dispatch(
         borrow this,
         found: RouteMatch,
-        params: Params,
+        ctx: borrow mut Context<S>,
         request: borrow Request,
         exchange: borrow mut Exchange,
-        connection: borrow ConnectionContext,
-        began: u64,
-        logged: borrow mut bool,
     ) -> Result<void, HandlerError> {
-        var ctx = Context<S>.create(this.appState, connection, this.routes, request.path(), params);
-        let r: Result<void, HandlerError> = match (await this.before(found, mut ctx, request, exchange)) {
-            Err(e) => Err(e),
-            Ok(Flow.Responded) => Ok(),
-            Ok(Flow.Continue) => match (found) {
-                RouteMatch.Found(index) => await this.routes.handler(index).handle(mut ctx, request, exchange),
-                _ => await this.unrouted(found, request, exchange),
-            },
-        };
-        // A request that was cancelled (its time was up) still gets here, with whatever its handler made of the
-        // cancellation: `handle` tells the log of it, with the status the client gets.
-        if (AsyncControl<HandlerError>.checkpoint(HandlerError.Internal).isErr()) {
-            return r;
+        match (await this.before(found, ctx, request, exchange)?) {
+            Flow.Responded => { return Ok(); }
+            Flow.Continue => {}
         }
-        match (borrow this.log) {
-            Some(log) => {
-                logged = true;
-                let micros = (Clock.monotonicNanos() - began) / 1000;
-                await log.record(request, ctx.scope(), statusOf(exchange, r), micros);
-            }
-            null => {}
+        match (found) {
+            RouteMatch.Found(index) => { return await this.routes.handler(index).handle(ctx, request, exchange); }
+            _ => { return await this.unrouted(found, request, exchange); }
         }
-        return r;
     }
 
     /// Runs the application's middleware, then that of the group of the route `found` names; whether one of them
@@ -506,29 +488,26 @@ impl<S: Send + Share> Application for App<S> {
         };
         let ms = this.timeoutOf(group);
         let began = if (this.log.isSome()) Clock.monotonicNanos() else 0;
-        var logged = false;
+        // The context is made here, and outlives the dispatch: the log reads what the filters left in it, also
+        // for a request whose time was up.
+        var ctx = Context<S>.create(this.appState, connection, this.routes, request.path(), params);
         var r: Result<void, HandlerError> = Ok();
         if (ms == 0) {
-            r = await this.dispatch(found, params, request, exchange, connection, began, mut logged);
+            r = await this.dispatch(found, mut ctx, request, exchange);
         } else {
             let late = StatusCode.of(504) ?? Status.notFound();
-            let told = borrow mut logged;
             r = await Async.timeout(
                 ms,
                 HandlerError.Status(late),
-                async () => await this.dispatch(found, params, request, exchange, connection, began, told),
+                async () => await this.dispatch(found, mut ctx, request, exchange),
             );
         }
-        if (!logged) {
-            // Cancelled: what the filters had left went with the request.
-            match (borrow this.log) {
-                Some(log) => {
-                    let bare = Scope.bare(connection);
-                    let micros = (Clock.monotonicNanos() - began) / 1000;
-                    await log.record(request, bare, statusOf(exchange, r), micros);
-                }
-                null => {}
+        match (borrow this.log) {
+            Some(log) => {
+                let micros = (Clock.monotonicNanos() - began) / 1000;
+                await log.record(request, ctx.scope(), statusOf(exchange, r), micros);
             }
+            null => {}
         }
         return r;
     }

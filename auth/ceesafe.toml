@@ -4,7 +4,7 @@ version = "0.1.0"
 kind = "library"
 sources = ["src"]
 tests = ["tests"]
-ceesafec = ">=0.65.1"
+ceesafec = ">=0.67.0"
 
 [dependencies]
 httpserver = { path = ".." }
