@@ -39,7 +39,8 @@ You need:
 ```sh
 git clone https://github.com/CeeSafe/httpserver.git
 cd httpserver/examples/hello
-ceesafec build          # fetches CeeSafe.Web at the pinned revision, compiles through C to out/hello
+ceesafec fetch          # CeeSafe.Web's packages, at the revision in ceesafe.lock
+ceesafec build          # compiles through C to out/hello
 out/hello               # hello: listening on http://127.0.0.1:8080
 ```
 
@@ -193,8 +194,8 @@ web_http = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "4bb64c67
 ```
 
 The other packages are directories of this repository: add `dir`, as in
-`httpserver_ws = { git = "https://github.com/CeeSafe/httpserver.git", rev = "…", dir = "ws" }`. `ceesafec fetch`
-resolves them and writes `ceesafe.lock`; `ceesafec build` does it when there is no lock.
+`httpserver_ws = { git = "https://github.com/CeeSafe/httpserver.git", rev = "…", dir = "ws" }`. Run `ceesafec fetch`
+once to resolve them and write `ceesafe.lock`, then `ceesafec build`.
 
 For TLS, give `app.run` `web_tls`'s acceptor in place of `PlainAcceptor {}` (HTTP/2 is then chosen by ALPN); for
 HTTP/3, give `applicationOf(app)` to `web_http3`'s server. Both are CeeSafe.Web's packages.
