@@ -5,15 +5,15 @@
 import web_core;
 import web_http;
 
-fn filtered<F: Filter + Send + Share>(f: F) -> Result<Box<dyn Filter + Send + Share>, TestFailure> {
-    let b: Box<dyn Filter + Send + Share> = alloc(Box.create(f))?;
+fn filtered<F: Middleware<St> + Send + Share>(f: F) -> Result<Box<dyn Middleware<St> + Send + Share>, TestFailure> {
+    let b: Box<dyn Middleware<St> + Send + Share> = alloc(Box.create(f))?;
     return Ok(b);
 }
 
 @test
 async fn corsForAnyOrigin() -> Result<void, TestFailure> {
     var a = routed(App<St>.create(state(), quiet()))?;
-    routed(a.filter(filtered(Cors.create(alloc(CorsOptions.any())?))?))?;
+    routed(a.use(filtered(Cors.create(alloc(CorsOptions.any())?))?))?;
     routed(a.get("/users", named(1)?))?;
     // No `Origin`: not a cross-origin request.
     await body(a, "GET /users HTTP/1.1\r\nhost: a\r\n\r\n", "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nh1")?;
@@ -47,7 +47,7 @@ async fn corsForListedOriginsWithCredentials() -> Result<void, TestFailure> {
     alloc(options.maxAgeSeconds(60))?;
     options.allowCredentials();
     var a = routed(App<St>.create(state(), quiet()))?;
-    routed(a.filter(filtered(Cors.create(options))?))?;
+    routed(a.use(filtered(Cors.create(options))?))?;
     routed(a.get("/users", named(1)?))?;
     await body(
         a,
@@ -94,16 +94,16 @@ impl Handler<St> for Cookied {
 /// Leaves the request's `x-user` for the handler as `user`.
 struct Knows {}
 
-impl Filter for Knows {
+impl Middleware<St> for Knows {
     async fn before(
         borrow this,
-        scope: borrow mut Scope,
+        ctx: borrow mut Context<St>,
         request: borrow Request,
         exchange: borrow mut Exchange,
     ) -> Result<Flow, HandlerError> {
         match (request.headers().getNamed("x-user")) {
             Some(v) => {
-                if (!scope.put("user", v)) {
+                if (!ctx.put("user", v)) {
                     return Err(HandlerError.Internal);
                 }
             }
@@ -122,8 +122,8 @@ async fn headersCookiesAndWhatAFilterLeaves() -> Result<void, TestFailure> {
     alloc(SecurityHeaders.hsts(mut headers, 31536000, true))?;
     alloc(headers.set("content-security-policy", "default-src 'self'"))?;
     var a = routed(App<St>.create(state(), quiet()))?;
-    routed(a.filter(filtered(headers)?))?;
-    routed(a.filter(filtered(Knows {})?))?;
+    routed(a.use(filtered(headers)?))?;
+    routed(a.use(filtered(Knows {})?))?;
     let h: Box<dyn Handler<St> + Send + Share> = alloc(Box.create(Cookied {}))?;
     routed(a.get("/c", h))?;
     routed(a.get("/plain", named(1)?))?;
@@ -149,14 +149,14 @@ async fn headersCookiesAndWhatAFilterLeaves() -> Result<void, TestFailure> {
 @test
 async fn redirectToHttps() -> Result<void, TestFailure> {
     var a = routed(App<St>.create(state(), quiet()))?;
-    routed(a.filter(filtered(HttpsRedirect.create(443))?))?;
+    routed(a.use(filtered(HttpsRedirect.create(443))?))?;
     await body(
         a,
         "POST /a/b?c=1 HTTP/1.1\r\nhost: shop.example:8080\r\ncontent-length: 0\r\n\r\n",
         "HTTP/1.1 308 Permanent Redirect\r\nlocation: https://shop.example/a/b?c=1\r\ncontent-length: 0\r\n\r\n",
     )?;
     var b = routed(App<St>.create(state(), quiet()))?;
-    routed(b.filter(filtered(HttpsRedirect.create(8443))?))?;
+    routed(b.use(filtered(HttpsRedirect.create(8443))?))?;
     await body(
         b,
         "GET / HTTP/1.1\r\nhost: [::1]:8080\r\n\r\n",
@@ -182,7 +182,7 @@ impl Handler<St> for Alive {
 async fn theRateLimitAndHealth() -> Result<void, TestFailure> {
     var a = routed(App<St>.create(state(), quiet()))?;
     let api = routed(a.group("/api"))?;
-    routed(a.filterIn(api, filtered(alloc(RateLimit.create(2, 60000, 16))?)?))?;
+    routed(a.useIn(api, filtered(alloc(RateLimit.create(2, 60000, 16))?)?))?;
     routed(a.routeIn(api, Method.Get, "/x", named(1)?))?;
     let h: Box<dyn Handler<St> + Send + Share> = alloc(Box.create(Alive {}))?;
     routed(a.get("/health", h))?;
@@ -218,10 +218,10 @@ async fn aRateLimitInSharedWords() -> Result<void, TestFailure> {
     // Two applications stand for two workers: they count in the same words. The window is an hour, so that the
     // test does not meet its end.
     var one = routed(App<St>.create(state(), quiet()))?;
-    routed(one.filter(filtered(alloc(RateLimit.shared(3, 3600000, words))?)?))?;
+    routed(one.use(filtered(alloc(RateLimit.shared(3, 3600000, words))?)?))?;
     routed(one.get("/x", named(1)?))?;
     var two = routed(App<St>.create(state(), quiet()))?;
-    routed(two.filter(filtered(alloc(RateLimit.shared(3, 3600000, words))?)?))?;
+    routed(two.use(filtered(alloc(RateLimit.shared(3, 3600000, words))?)?))?;
     routed(two.get("/x", named(2)?))?;
     await body(
         one,

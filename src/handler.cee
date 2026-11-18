@@ -47,7 +47,7 @@ struct Item {
 }
 
 /// The part of a request's context that does not depend on the application's state: the connection, and what
-/// middleware leaves for what runs after it. A `Filter` sees this much.
+/// middleware leaves for what runs after it. An access log is given this much.
 public struct Scope<region r> {
     private conn: borrow(r) ConnectionContext<r>;
     private bytes: Vector<u8>;
@@ -117,21 +117,6 @@ public struct Scope<region r> {
         }
         return null;
     }
-}
-
-/// Middleware that needs nothing of the application's state, so one type serves every application: CORS, security
-/// headers, rate limiting, authentication. It runs in the same chains as `Middleware<S>`, in the order added.
-public interface Filter {
-    /// Before the handler. Response fields can be set here (`exchange.header`).
-    async fn before(
-        borrow this,
-        scope: borrow mut Scope,
-        request: borrow Request,
-        exchange: borrow mut Exchange,
-    ) -> Result<Flow, HandlerError>;
-
-    /// Just before the response head is sent; for the application's filters only, as `Middleware.after`.
-    async fn after(borrow this, request: borrow Request, head: borrow mut ResponseHead) -> Result<void, HandlerError>;
 }
 
 /// What a handler knows besides the request.

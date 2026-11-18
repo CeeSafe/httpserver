@@ -158,10 +158,10 @@ public struct Csrf {
     }
 }
 
-impl Filter for Csrf {
+impl<S: Send + Share> Middleware<S> for Csrf {
     async fn before(
         borrow this,
-        scope: borrow mut Scope,
+        ctx: borrow mut Context<S>,
         request: borrow Request,
         exchange: borrow mut Exchange,
     ) -> Result<Flow, HandlerError> {
@@ -179,7 +179,7 @@ impl Filter for Csrf {
         if (reads) {
             if (known) {
                 let token = cookie ?? "".bytes();
-                if (!scope.put("csrf", token)) {
+                if (!ctx.put("csrf", token)) {
                     return Err(HandlerError.Internal);
                 }
                 return Ok(Flow.Continue);
@@ -200,7 +200,7 @@ impl Filter for Csrf {
                 set = set.withSecure();
             }
             set.write(exchange)?;
-            if (!scope.put("csrf", token.view())) {
+            if (!ctx.put("csrf", token.view())) {
                 return Err(HandlerError.Internal);
             }
             return Ok(Flow.Continue);

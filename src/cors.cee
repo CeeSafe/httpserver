@@ -99,10 +99,10 @@ public struct Cors {
     }
 }
 
-impl Filter for Cors {
+impl<S: Send + Share> Middleware<S> for Cors {
     async fn before(
         borrow this,
-        scope: borrow mut Scope,
+        ctx: borrow mut Context<S>,
         request: borrow Request,
         exchange: borrow mut Exchange,
     ) -> Result<Flow, HandlerError> {

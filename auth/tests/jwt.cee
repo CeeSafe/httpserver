@@ -159,9 +159,9 @@ async fn theBearerFilter() -> Result<void, TestFailure> {
     limits.sendDate = false;
     var a = routed(App<St>.create(St {}, limits))?;
     let api = routed(a.group("/api"))?;
-    let auth: Box<dyn Filter + Send + Share> =
+    let auth: Box<dyn Middleware<St> + Send + Share> =
         alloc(Box.create(BearerAuth.create(alloc(JwtVerifier.hs256("secret".bytes()))?)))?;
-    routed(a.filterIn(api, auth))?;
+    routed(a.useIn(api, auth))?;
     let who: Box<dyn Handler<St> + Send + Share> = alloc(Box.create(Who {}))?;
     routed(a.routeIn(api, Method.Get, "/me", who))?;
     let open: Box<dyn Handler<St> + Send + Share> = alloc(Box.create(Who {}))?;

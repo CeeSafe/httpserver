@@ -3,7 +3,7 @@ name = "bench"
 version = "0.1.0"
 kind = "executable"
 sources = ["src"]
-ceesafec = ">=0.67.0"
+ceesafec = ">=0.68.0"
 
 [dependencies]
 httpserver = { path = ".." }

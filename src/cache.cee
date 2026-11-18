@@ -332,10 +332,10 @@ public struct Cached {
     public fn create(cache: Arc<OutputCache>) -> Cached => Cached { cache: cache };
 }
 
-impl Filter for Cached {
+impl<S: Send + Share> Middleware<S> for Cached {
     async fn before(
         borrow this,
-        scope: borrow mut Scope,
+        ctx: borrow mut Context<S>,
         request: borrow Request,
         exchange: borrow mut Exchange,
     ) -> Result<Flow, HandlerError> {

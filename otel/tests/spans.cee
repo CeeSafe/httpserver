@@ -74,7 +74,7 @@ fn has(text: Slice<u8>, part: StringView) -> bool {
 async fn requestsKeptAsSpans() -> Result<void, TestFailure> {
     let spans = alloc(Arc<Spans>.create(alloc(Spans.create(2))?))?;
     var a = routed(App<St>.create(St {}, Limits.defaults()))?;
-    let trace: Box<dyn Filter + Send + Share> = alloc(Box.create(Trace.create(false)))?;
+    let trace: Box<dyn Middleware<St> + Send + Share> = alloc(Box.create(Trace.create(false)))?;
     let log: Box<dyn AccessLog + Send + Share> = alloc(Box.create(SpanLog.create(spans.clone())))?;
     a.logTo(log);
     let h: Box<dyn Handler<St> + Send + Share> = alloc(Box.create(Fine {}))?;
@@ -87,7 +87,7 @@ async fn requestsKeptAsSpans() -> Result<void, TestFailure> {
     Check.equalU64(0, spans.get().encode("svc", mut out) as u64)?;
     Check.equalU64(0, out.length as u64)?;
 
-    routed(a.filter(trace))?;
+    routed(a.use(trace))?;
     await asked(
         a,
         "GET /a%22b HTTP/1.1\r\nhost: a\r\ntraceparent: 00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01\r\n\r\n",

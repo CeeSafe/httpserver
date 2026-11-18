@@ -102,8 +102,8 @@ async fn requestsThatTakeTooLong() -> Result<void, TestFailure> {
     let log: Box<dyn AccessLog + Send + Share> =
         alloc(Box.create(Seen { statuses: statuses.clone(), traces: traces.clone() }))?;
     a.logTo(log);
-    let trace: Box<dyn Filter + Send + Share> = alloc(Box.create(Trace.create(false)))?;
-    routed(a.filter(trace))?;
+    let trace: Box<dyn Middleware<St> + Send + Share> = alloc(Box.create(Trace.create(false)))?;
+    routed(a.use(trace))?;
 
     // No bound: the slow handler answers.
     let unbounded = await wrote(a, "GET /uploads/slow HTTP/1.1\r\nhost: a\r\n\r\n")?;

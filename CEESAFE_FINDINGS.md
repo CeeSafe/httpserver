@@ -1,6 +1,6 @@
 # CeeSafe findings
 
-Bugs and gaps in CeeSafe and CeeSafe.Web met while writing httpserver, with ceesafec 0.62.2 (now built with 0.67.0) and CeeSafe.Web at
+Bugs and gaps in CeeSafe and CeeSafe.Web met while writing httpserver, with ceesafec 0.62.2 (now built with 0.68.0) and CeeSafe.Web at
 `4bb64c6`. Each has what was seen, a reduction where there is one, and what httpserver does instead.
 
 | | What | Where | Status |
@@ -11,7 +11,7 @@ Bugs and gaps in CeeSafe and CeeSafe.Web met while writing httpserver, with cees
 | S4 | lib/std cannot start a process without waiting for it, signal one, or wait for any child | lib/std | `fork`, `waitpid`, `kill` declared through `extern "C"` |
 | S5 | No allocation budget for a task, and no allocator for `Vector` or `String` but the system's | runtime | a worker's `RLIMIT_AS`; open |
 | S6 | `ProcessSignals` does not survive `fork` | runtime | fixed in ceesafec 0.65.1: a forked child starts with no subscription |
-| S7 | A struct without type parameters cannot implement a generic interface for every argument (`impl<S> Middleware<S> for Cors`) | ceesafec (N0267) | a second interface without the parameter (`Filter`) |
+| S7 | A struct without type parameters cannot implement a generic interface for every argument (`impl<S> Middleware<S> for Cors`) | ceesafec (N0267) | fixed in ceesafec 0.68.0 (ADR 0165, for one state type a program): `Filter` is gone, and `Cors` and the others are `impl<S: Send + Share> Middleware<S>` |
 | S8 | A connection does not say whether it came over TLS | CeeSafe.Web | `HttpsRedirect` redirects everything; the application on the plain port uses it |
 | S9 | `Application.beforeHead` gets the request and the head, not the handler's context | CeeSafe.Web | a group's middleware has no `after`; the access log and the timeout are in `App.handle`, around the whole chain |
 | S10 | Nothing can change a response's body after the handler sends it | CeeSafe.Web | compression is a call the handler makes (`Compression.send`), not a middleware |
@@ -242,5 +242,8 @@ Released 2026-11-18 from these findings and httpclient's. 0.65.1 fixed S1, S6 an
 parameter bounded by `Send` or `Share` is no flow name). With 0168 and the bound written on `Handler<S>` and
 `Middleware<S>`, `App.handle` makes the context and passes it to `dispatch`, inside the time limit's closure too, so
 the access log has what the filters left for every request: a request whose time was up used to be logged without
-its trace id. Three more ADRs are accepted and not implemented: 0165 (S7, which would let `Filter` go), 0169 (S4,
-child processes in lib/std) and 0170 (S5, an allocation budget). S2, S3, S8, S9, S10 and S12 are as they were.
+its trace id. 0.68.0 carries ADR 0165 (S7), for one argument list a type: an impl whose parameter the interface chooses. With it
+the second interface, `Filter`, and the application's second list are gone: each stock middleware is one
+`impl<S: Send + Share> Middleware<S>`. A program whose applications have two state types cannot use one such
+middleware for both (N0267). Two more ADRs are accepted and not implemented: 0169 (S4, child processes in lib/std)
+and 0170 (S5, an allocation budget). S2, S3, S8, S9, S10 and S12 are as they were.

@@ -517,10 +517,10 @@ async fn refused(exchange: borrow mut Exchange, challenge: StringView) -> Result
     return Ok(Flow.Responded);
 }
 
-impl Filter for BearerAuth {
+impl<S: Send + Share> Middleware<S> for BearerAuth {
     async fn before(
         borrow this,
-        scope: borrow mut Scope,
+        ctx: borrow mut Context<S>,
         request: borrow Request,
         exchange: borrow mut Exchange,
     ) -> Result<Flow, HandlerError> {
@@ -551,7 +551,7 @@ impl Filter for BearerAuth {
             Ok() => {}
             Err(_) => { return Err(HandlerError.Internal); }
         }
-        if (!scope.put("user", subject.bytes()) || !scope.put("claims", text.view())) {
+        if (!ctx.put("user", subject.bytes()) || !ctx.put("claims", text.view())) {
             return Err(HandlerError.Internal);
         }
         return Ok(Flow.Continue);
@@ -578,14 +578,14 @@ public struct RequireClaim {
     }
 }
 
-impl Filter for RequireClaim {
+impl<S: Send + Share> Middleware<S> for RequireClaim {
     async fn before(
         borrow this,
-        scope: borrow mut Scope,
+        ctx: borrow mut Context<S>,
         request: borrow Request,
         exchange: borrow mut Exchange,
     ) -> Result<Flow, HandlerError> {
-        let held = scope.value("claims") ?? { return await refused(exchange, "Bearer"); };
+        let held = ctx.value("claims") ?? { return await refused(exchange, "Bearer"); };
         let claims = match (Json.parse(held)) {
             Ok(c) => c,
             Err(_) => { return Err(HandlerError.Internal); },

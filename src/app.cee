@@ -7,15 +7,11 @@ import web_http;
 import web_http1;
 import web_http2;
 
-/// Marks a chain entry as an index into `filters`.
-const FILTER: u32 = 0x80000000;
-
 /// A group of routes: a path prefix and the middleware its routes run. Group 0 is the application itself.
 struct Group {
     prefix: Vector<u8>;
     parent: u32;
-    /// The middleware in the order it runs: an index into the application's `hooks`, or into its `filters` with
-    /// `FILTER` set.
+    /// The middleware in the order it runs: indexes into the application's `hooks`.
     chain: Vector<u32>;
     /// The longest a request to one of its routes may take; 0: as its parent's.
     timeoutMs: u64;
@@ -34,7 +30,6 @@ public struct App<S: Send + Share> {
     private appState: S;
     private routes: Router<S>;
     private hooks: Vector<Box<dyn Middleware<S> + Send + Share>>;
-    private filters: Vector<Box<dyn Filter + Send + Share>>;
     private groups: Vector<Group>;
     private httpLimits: Limits;
     /// The UDP port the same application is served on over HTTP/3, advertised in `Alt-Svc`.
@@ -55,7 +50,6 @@ public struct App<S: Send + Share> {
             appState: state,
             routes: routes,
             hooks: Vector<Box<dyn Middleware<S> + Send + Share>>.create(),
-            filters: Vector<Box<dyn Filter + Send + Share>>.create(),
             groups: groups,
             httpLimits: limits,
             http3Port: null,
@@ -78,22 +72,6 @@ public struct App<S: Send + Share> {
             Err(_) => { return Err(RouteError.OutOfMemory); }
         }
         return this.chained(group, truncate<u32>(this.hooks.length - 1));
-    }
-
-    /// `use` for a filter: middleware that does not see the application's state.
-    public fn filter(borrow mut this, f: Box<dyn Filter + Send + Share>) -> Result<void, RouteError> =>
-        this.filterIn(0, f);
-
-    /// `useIn` for a filter.
-    public fn filterIn(borrow mut this, group: u32, f: Box<dyn Filter + Send + Share>) -> Result<void, RouteError> {
-        if (group as usize >= this.groups.length) {
-            return Err(RouteError.NoSuchGroup);
-        }
-        match (this.filters.push(f)) {
-            Ok() => {}
-            Err(_) => { return Err(RouteError.OutOfMemory); }
-        }
-        return this.chained(group, truncate<u32>(this.filters.length - 1) | FILTER);
     }
 
     /// Runs the application's middleware, then what `found` says: the route's group's middleware and its handler, or
@@ -349,9 +327,6 @@ public struct App<S: Send + Share> {
         request: borrow Request,
         exchange: borrow mut Exchange,
     ) -> Result<Flow, HandlerError> {
-        if ((entry & FILTER) != 0) {
-            return await this.filters[(entry & 0x7FFFFFFF) as usize].before(ctx.scope(), request, exchange);
-        }
         return await this.hooks[entry as usize].before(ctx, request, exchange);
     }
 
@@ -523,11 +498,7 @@ impl<S: Send + Share> Application for App<S> {
         while (i > 0) {
             i -= 1;
             let entry = everywhere[i];
-            if ((entry & FILTER) != 0) {
-                await this.filters[(entry & 0x7FFFFFFF) as usize].after(request, head)?;
-            } else {
-                await this.hooks[entry as usize].after(request, head)?;
-            }
+            await this.hooks[entry as usize].after(request, head)?;
         }
         match (this.http3Port) {
             Some(port) => {

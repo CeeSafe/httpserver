@@ -44,8 +44,8 @@ fn isId(text: Slice<u8>, n: usize) -> bool {
 @test
 async fn aRequestsPlaceInATrace() -> Result<void, TestFailure> {
     var a = routed(App<St>.create(state(), quiet()))?;
-    let trace: Box<dyn Filter + Send + Share> = alloc(Box.create(Trace.create(true)))?;
-    routed(a.filter(trace))?;
+    let trace: Box<dyn Middleware<St> + Send + Share> = alloc(Box.create(Trace.create(true)))?;
+    routed(a.use(trace))?;
     let h: Box<dyn Handler<St> + Send + Share> = alloc(Box.create(Traced {}))?;
     routed(a.get("/", h))?;
 

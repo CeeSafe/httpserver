@@ -87,10 +87,10 @@ fn hex16(value: u64, out: borrow mut [u8; 55], at: usize) {
     }
 }
 
-impl Filter for Trace {
+impl<S: Send + Share> Middleware<S> for Trace {
     async fn before(
         borrow this,
-        scope: borrow mut Scope,
+        ctx: borrow mut Context<S>,
         request: borrow Request,
         exchange: borrow mut Exchange,
     ) -> Result<Flow, HandlerError> {
@@ -106,7 +106,7 @@ impl Filter for Trace {
             }
             mine[53] = sent[53];
             mine[54] = sent[54];
-            kept = scope.put("parent", sent[36..52]);
+            kept = ctx.put("parent", sent[36..52]);
         } else {
             // A new trace, not sampled: whoever starts one that is says so.
             hex16(this.fresh(), mut mine, 3);
@@ -116,9 +116,9 @@ impl Filter for Trace {
         }
         hex16(this.fresh(), mut mine, 36);
         kept = kept &&
-            scope.put("trace", mine[3..35]) &&
-            scope.put("span", mine[36..52]) &&
-            scope.put("traceparent", mine[..]);
+            ctx.put("trace", mine[3..35]) &&
+            ctx.put("span", mine[36..52]) &&
+            ctx.put("traceparent", mine[..]);
         if (!kept) {
             return Err(HandlerError.Internal);
         }

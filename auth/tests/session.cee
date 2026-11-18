@@ -126,8 +126,8 @@ fn with(text: StringView, token: Slice<u8>) -> Result<Vector<u8>, TestFailure> {
 @test
 async fn theCsrfFilter() -> Result<void, TestFailure> {
     var a = quietApp()?;
-    let csrf: Box<dyn Filter + Send + Share> = alloc(Box.create(alloc(Csrf.create(secret().bytes(), false))?))?;
-    routed(a.filter(csrf))?;
+    let csrf: Box<dyn Middleware<St> + Send + Share> = alloc(Box.create(alloc(Csrf.create(secret().bytes(), false))?))?;
+    routed(a.use(csrf))?;
     let get: Box<dyn Handler<St> + Send + Share> = alloc(Box.create(Form {}))?;
     routed(a.get("/form", get))?;
     let post: Box<dyn Handler<St> + Send + Share> = alloc(Box.create(Form {}))?;

@@ -34,8 +34,8 @@ impl Handler<St> for Costly {
 async fn responsesKeptAndAnsweredAgain() -> Result<void, TestFailure> {
     var a = routed(App<St>.create(state(), quiet()))?;
     let cache = alloc(Arc<OutputCache>.create(alloc(OutputCache.create(16, 8))?))?;
-    let filter: Box<dyn Filter + Send + Share> = alloc(Box.create(Cached.create(cache.clone())))?;
-    routed(a.filter(filter))?;
+    let filter: Box<dyn Middleware<St> + Send + Share> = alloc(Box.create(Cached.create(cache.clone())))?;
+    routed(a.use(filter))?;
     let h: Box<dyn Handler<St> + Send + Share> =
         alloc(Box.create(Costly { cache: cache.clone(), runs: AtomicU64.create(0) }))?;
     routed(a.route(Method.Get, "/{*rest}", h))?;
@@ -143,8 +143,8 @@ async fn responsesThatVary() -> Result<void, TestFailure> {
     alloc(made.varyBy("accept-language"))?;
     alloc(made.varyBy("x-plan"))?;
     let cache = alloc(Arc<OutputCache>.create(made))?;
-    let filter: Box<dyn Filter + Send + Share> = alloc(Box.create(Cached.create(cache.clone())))?;
-    routed(a.filter(filter))?;
+    let filter: Box<dyn Middleware<St> + Send + Share> = alloc(Box.create(Cached.create(cache.clone())))?;
+    routed(a.use(filter))?;
     let h: Box<dyn Handler<St> + Send + Share> =
         alloc(Box.create(Spoken { cache: cache.clone(), runs: AtomicU64.create(0) }))?;
     routed(a.get("/hello", h))?;

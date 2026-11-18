@@ -117,14 +117,14 @@ fn addressKey(address: SocketAddress?) -> u64 {
     return h | 1; // never 0, an empty place
 }
 
-impl Filter for RateLimit {
+impl<S: Send + Share> Middleware<S> for RateLimit {
     async fn before(
         borrow this,
-        scope: borrow mut Scope,
+        ctx: borrow mut Context<S>,
         request: borrow Request,
         exchange: borrow mut Exchange,
     ) -> Result<Flow, HandlerError> {
-        let hit = this.hit(addressKey(scope.connection().peerAddress()), Clock.monotonicNanos() / 1000000);
+        let hit = this.hit(addressKey(ctx.connection().peerAddress()), Clock.monotonicNanos() / 1000000);
         var text = [0u8; 20];
         var w = TextWriter.create(mut text[..]);
         w.decimal(this.limit as u64);

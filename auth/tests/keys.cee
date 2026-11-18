@@ -92,8 +92,8 @@ fn publicKeysInPem() -> Result<void, TestFailure> {
     return Ok();
 }
 
-fn boxed<F: Filter + Send + Share>(f: F) -> Result<Box<dyn Filter + Send + Share>, TestFailure> {
-    let b: Box<dyn Filter + Send + Share> = alloc(Box.create(f))?;
+fn boxed<F: Middleware<St> + Send + Share>(f: F) -> Result<Box<dyn Middleware<St> + Send + Share>, TestFailure> {
+    let b: Box<dyn Middleware<St> + Send + Share> = alloc(Box.create(f))?;
     return Ok(b);
 }
 
@@ -103,17 +103,17 @@ async fn whatTheClaimsMustSay() -> Result<void, TestFailure> {
     var v = JwtVerifier.create();
     Check.isTrue(v.addPublicKeyPem("r1", rsaPem().bytes()).isOk(), "the RSA key")?;
     let api = routed(a.group("/api"))?;
-    routed(a.filterIn(api, boxed(BearerAuth.create(v))?))?;
+    routed(a.useIn(api, boxed(BearerAuth.create(v))?))?;
     let admin = routed(a.groupIn(api, "/admin"))?;
-    routed(a.filterIn(admin, boxed(alloc(RequireClaim.create("roles", "admin"))?)?))?;
+    routed(a.useIn(admin, boxed(alloc(RequireClaim.create("roles", "admin"))?)?))?;
     let ops = routed(a.groupIn(api, "/ops"))?;
-    routed(a.filterIn(ops, boxed(alloc(RequireClaim.create("roles", "ops"))?)?))?;
+    routed(a.useIn(ops, boxed(alloc(RequireClaim.create("roles", "ops"))?)?))?;
     let writes = routed(a.groupIn(api, "/orders"))?;
-    routed(a.filterIn(writes, boxed(alloc(RequireClaim.create("scope", "write"))?)?))?;
+    routed(a.useIn(writes, boxed(alloc(RequireClaim.create("scope", "write"))?)?))?;
     let deletes = routed(a.groupIn(api, "/purge"))?;
-    routed(a.filterIn(deletes, boxed(alloc(RequireClaim.create("scope", "writ"))?)?))?;
+    routed(a.useIn(deletes, boxed(alloc(RequireClaim.create("scope", "writ"))?)?))?;
     let unguarded = routed(a.group("/loose"))?;
-    routed(a.filterIn(unguarded, boxed(alloc(RequireClaim.create("roles", "admin"))?)?))?;
+    routed(a.useIn(unguarded, boxed(alloc(RequireClaim.create("roles", "admin"))?)?))?;
     for (group in [admin, ops, writes, deletes, unguarded]) {
         let h: Box<dyn Handler<St> + Send + Share> = alloc(Box.create(Who {}))?;
         routed(a.routeIn(group, Method.Get, "/x", h))?;

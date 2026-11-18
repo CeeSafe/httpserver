@@ -49,12 +49,13 @@ impl Handler<Shop> for Item {
 - **Groups.** A prefix and its middleware; groups nest.
 - **Middleware.** `before` runs in the order added, for the application and then for the route's group, and may
   answer itself; the application's `after` runs in reverse order just before the head is sent.
-- **Filters.** Middleware that needs nothing of the application's state, in the same chains: `Cors` (any or listed
+- **Stock middleware.** Each is written once for every application state (`impl<S: Send + Share> Middleware<S> for
+  Cors`) and added with `use` or `useIn` like any other: `Cors` (any or listed
   origins, credentials, preflights answered), `FixedHeaders` and `SecurityHeaders` (nosniff, frame options, referrer
   policy, HSTS, a content security policy), `HttpsRedirect`, and `RateLimit` (requests per window per client address,
   in a table of fixed size, 429 with `Retry-After`; `RateLimit.shared` counts in `SharedWords`, so the supervisor's
   workers enforce one limit together).
-- **What middleware leaves for the handler.** `scope.put("user", …)` in a filter, `ctx.value("user")` after it.
+- **What middleware leaves for the handler.** `ctx.put("user", …)` in a middleware, `ctx.value("user")` after it.
 - **Cookies.** `Cookies.get(request, name)` and `SetCookie` (path, domain, max age, `Secure`, `HttpOnly`,
   `SameSite`).
 - **Health.** `Health.answer`: 200, or 503 once the server drains.
@@ -86,10 +87,10 @@ impl Handler<Shop> for Item {
   504, or its connection is closed if part of the response had left. The time runs while a handler waits, not
   while it computes: one that never awaits is the supervisor's to stop.
 - **Access log.** `app.logTo(log)` tells an `AccessLog` of every request once it is answered (the request, its
-  scope with the connection and what the filters left, such as the trace id, the status, the microseconds), a 404
+  scope with the connection and what the middleware left, such as the trace id, the status, the microseconds), a 404
   or a timeout included. `ConsoleLog` writes a line a request to
   standard output; an application's own can count, sample, or write somewhere else.
-- **Trace context.** The filter `Trace` reads the caller's W3C `traceparent` or starts a trace, gives the request
+- **Trace context.** The middleware `Trace` reads the caller's W3C `traceparent` or starts a trace, gives the request
   a span id of its own, and leaves `"trace"`, `"span"`, `"parent"` and `"traceparent"` (the header to send on) for
   the handler; with `respond`, the response says them in `traceresponse`.
 - **Spans for a collector** (`otel/`, the package `httpserver_otel`, on CeeSafe.Web's `web_client`): `SpanLog` is an
@@ -97,7 +98,7 @@ impl Handler<Shop> for Item {
   posts them in batches as OTLP/JSON to a collector's `/v1/traces` over plain HTTP. A batch the collector does not
   take is dropped and counted; requests are never held up.
 - **Output cache.** A handler that answers through `OutputCache.send(request, exchange, status, type, body,
-  seconds)` has its response kept in memory; the filter `Cached` before it answers the next GET and HEAD requests
+  seconds)` has its response kept in memory; the middleware `Cached` before it answers the next GET and HEAD requests
   for the same path and query without running it, with `age`, and with 304 for a client that sends the `etag` back
   (`If-None-Match`). The table has a fixed number of places and a largest body, so its memory is bounded;
   `forget(target)` and `clear()` drop what changed. The key is the target and the request fields named with
@@ -189,7 +190,7 @@ answers the same routes (server GC). One machine and one run each: read the rati
   CosmoApiServer does; CosmoApiServer answers more in all because it uses four cores.
 - Several processes sharing the port (`CW_REUSEPORT=1`, Linux) pass it. With four, the load generator's four threads
   and the servers fill the machine, so that row is a floor.
-- The stock filters a public API would run together (security headers, CORS for any origin, the rate limit) cost
+- The stock middleware a public API would run together (security headers, CORS for any origin, the rate limit) cost
   about 15 % on the smallest response: 81 000 `/small` a second against 97 000 on one core, at 64 connections with an
   `Origin` on each request. They add seven response fields and read the clock once.
 - Compressing 64 KiB of JSON-like text for each request, one core answers 2 800 a second with Zstandard (level 3),
@@ -204,7 +205,7 @@ answers the same routes (server GC). One machine and one run each: read the rati
   about 20% (81 000) with standard output sent to `/dev/null`.
 - The output cache answers 4 KiB of JSON-like text 83 000 to 85 000 times a second against 33 000 when the handler
   makes it each time, and 64 KiB 45 000 times against 3 600 to 4 000.
-- The trace filter costs about 10% on `/small` (90 000 to 93 000 a second, against 98 000 to 105 000): four values
+- The trace middleware costs about 10% on `/small` (90 000 to 93 000 a second, against 98 000 to 105 000): four values
   left for the handler and one more response field.
 - With four workers and every request from one address (so every request changes the same shared word), a limit
   counted in `SharedWords` answers 240 000 to 259 000 `/small` a second, one each worker counts for itself 261 000,
@@ -238,7 +239,7 @@ python3 tools/ws_check.py         # the hub, with WebSocket clients written from
 python3 tools/ws_check.py --workers 4   # the same over four workers and the bus (add --inherit on macOS)
 ```
 
-The compiler: ceesafec 0.67.0 or later (CeeSafe.Web at the pinned revision needs 0.62.2; `App.handle` hands its context to the dispatcher, which 0.67.0 accepts). The supervisor is POSIX only.
+The compiler: ceesafec 0.68.0 or later (CeeSafe.Web at the pinned revision needs 0.62.2; the stock middleware are impls for every application state, which 0.68.0 accepts). The supervisor is POSIX only.
 
 ## License
 

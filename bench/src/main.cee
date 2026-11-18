@@ -504,14 +504,16 @@ fn idle() -> Result<Box<dyn Middleware<St> + Send + Share>, RouteError> {
 }
 
 /// A boxed filter, or `OutOfMemory`.
-fn stock<F: Filter + Send + Share>(f: Result<F, AllocError>) -> Result<Box<dyn Filter + Send + Share>, RouteError> {
+fn stock<F: Middleware<St> + Send + Share>(
+    f: Result<F, AllocError>,
+) -> Result<Box<dyn Middleware<St> + Send + Share>, RouteError> {
     let filter = match (f) {
         Ok(v) => v,
         Err(_) => { return Err(RouteError.OutOfMemory); },
     };
     match (Box.create(filter)) {
         Ok(b) => {
-            let d: Box<dyn Filter + Send + Share> = b;
+            let d: Box<dyn Middleware<St> + Send + Share> = b;
             return Ok(d);
         }
         Err(_) => { return Err(RouteError.OutOfMemory); }
@@ -573,21 +575,21 @@ fn application(worker: u32, wiring: Wiring) -> Result<App<St>, RouteError> {
         app.use(idle()?)?;
     }
     if (setting("CW_STOCK", 0) == 1) {
-        app.filter(stock(SecurityHeaders.defaults())?)?;
-        app.filter(stock(corsForAll())?)?;
-        app.filter(stock(RateLimit.create(0xFFFFFFFF, 60000, 4096))?)?;
+        app.use(stock(SecurityHeaders.defaults())?)?;
+        app.use(stock(corsForAll())?)?;
+        app.use(stock(RateLimit.create(0xFFFFFFFF, 60000, 4096))?)?;
     }
     let limit = setting("CW_LIMIT", 0);
     if (limit > 0) {
         // An hour's window: a check that counts requests does not meet its end.
         match (words) {
-            Some(w) => { app.filter(stock(RateLimit.shared(truncate<u32>(limit), 3600000, w))?)?; }
-            null => { app.filter(stock(RateLimit.create(truncate<u32>(limit), 3600000, 4096))?)?; }
+            Some(w) => { app.use(stock(RateLimit.shared(truncate<u32>(limit), 3600000, w))?)?; }
+            null => { app.use(stock(RateLimit.create(truncate<u32>(limit), 3600000, 4096))?)?; }
         }
     }
     if (setting("CW_TRACE", 0) == 1) {
         let made: Result<Trace, AllocError> = Ok(Trace.create(true));
-        app.filter(stock(made)?)?;
+        app.use(stock(made)?)?;
     }
     app.timeout(setting("CW_TIMEOUT_MS", 0));
     match (setting("CW_LOG", 0)) {
@@ -643,7 +645,7 @@ fn application(worker: u32, wiring: Wiring) -> Result<App<St>, RouteError> {
     app.get("/forget/{n:int}", handler(Box.create(OnBus { what: 2 }))?)?;
     let kept = app.group("/kept")?;
     let answering: Result<Cached, AllocError> = Ok(Cached.create(cache.clone()));
-    app.filterIn(kept, stock(answering)?)?;
+    app.useIn(kept, stock(answering)?)?;
     app.routeIn(kept, Method.Get, "/{n:int}", handler(Box.create(Stored { cache: cache }))?)?;
     app.get("/users/{id:int}", handler(Box.create(User {}))?)?;
     let api = app.group("/api")?;

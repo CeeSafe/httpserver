@@ -33,10 +33,10 @@ public struct FixedHeaders {
     }
 }
 
-impl Filter for FixedHeaders {
+impl<S: Send + Share> Middleware<S> for FixedHeaders {
     async fn before(
         borrow this,
-        scope: borrow mut Scope,
+        ctx: borrow mut Context<S>,
         request: borrow Request,
         exchange: borrow mut Exchange,
     ) -> Result<Flow, HandlerError> =>
@@ -98,10 +98,10 @@ public struct HttpsRedirect {
     public fn create(httpsPort: u16) -> HttpsRedirect => HttpsRedirect { port: httpsPort };
 }
 
-impl Filter for HttpsRedirect {
+impl<S: Send + Share> Middleware<S> for HttpsRedirect {
     async fn before(
         borrow this,
-        scope: borrow mut Scope,
+        ctx: borrow mut Context<S>,
         request: borrow Request,
         exchange: borrow mut Exchange,
     ) -> Result<Flow, HandlerError> {

@@ -27,11 +27,11 @@ impl Handler<St> for Answers {
 
 fn application(spans: Arc<Spans>) -> Result<App<St>, RouteError> {
     var app = App<St>.create(St {}, Limits.defaults())?;
-    let trace: Box<dyn Filter + Send + Share> = match (Box.create(Trace.create(true))) {
+    let trace: Box<dyn Middleware<St> + Send + Share> = match (Box.create(Trace.create(true))) {
         Ok(b) => b,
         Err(_) => { return Err(RouteError.OutOfMemory); },
     };
-    app.filter(trace)?;
+    app.use(trace)?;
     let log: Box<dyn AccessLog + Send + Share> = match (Box.create(SpanLog.create(spans))) {
         Ok(b) => b,
         Err(_) => { return Err(RouteError.OutOfMemory); },
