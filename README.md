@@ -238,7 +238,7 @@ python3 tools/ws_check.py         # the hub, with WebSocket clients written from
 python3 tools/ws_check.py --workers 4   # the same over four workers and the bus (add --inherit on macOS)
 ```
 
-The compiler: ceesafec 0.62.2 or later. The supervisor is POSIX only.
+The compiler: ceesafec 0.65.1 or later (CeeSafe.Web at the pinned revision needs 0.62.2; the sources are formatted by 0.65.1). The supervisor is POSIX only.
 
 ## License
 

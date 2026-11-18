@@ -4,7 +4,7 @@ version = "0.1.0"
 kind = "library"
 sources = ["src"]
 tests = ["tests"]
-ceesafec = ">=0.62.2"        # what CeeSafe.Web at this revision asks for
+ceesafec = ">=0.65.1"        # its formatter (interface methods wrap); CeeSafe.Web at this revision asks for 0.62.2
 
 [dependencies]
 web_core = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "4bb64c6712d9c876a78d33d0214ea8b875f222ff", dir = "packages/web_core" }

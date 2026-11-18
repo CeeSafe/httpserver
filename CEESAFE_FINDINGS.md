@@ -1,6 +1,6 @@
 # CeeSafe findings
 
-Bugs and gaps in CeeSafe and CeeSafe.Web met while writing httpserver, with ceesafec 0.62.2 and CeeSafe.Web at
+Bugs and gaps in CeeSafe and CeeSafe.Web met while writing httpserver, with ceesafec 0.62.2 (now built with 0.65.1) and CeeSafe.Web at
 `4bb64c6`. Each has what was seen, a reduction where there is one, and what httpserver does instead.
 
 | | What | Where | Status |

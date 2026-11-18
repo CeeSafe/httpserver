@@ -6,7 +6,12 @@ import web_http;
 /// lent per request as `ctx.state()`.
 public interface Handler<S> {
     /// Reads the request's body and writes its response through `exchange`.
-    async fn handle(borrow this, ctx: borrow mut Context<S>, request: borrow Request, exchange: borrow mut Exchange,) -> Result<void, HandlerError>;
+    async fn handle(
+        borrow this,
+        ctx: borrow mut Context<S>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError>;
 }
 
 /// Whether a middleware's `before` let the request through.
@@ -21,7 +26,12 @@ public enum Flow {
 /// a group runs for that group's routes, after the application's.
 public interface Middleware<S> {
     /// Before the handler, in the order added. Response fields can be set here (`exchange.header`).
-    async fn before(borrow this, ctx: borrow mut Context<S>, request: borrow Request, exchange: borrow mut Exchange,) -> Result<Flow, HandlerError>;
+    async fn before(
+        borrow this,
+        ctx: borrow mut Context<S>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<Flow, HandlerError>;
 
     /// Just before the response head is sent, in reverse order; may add fields. It is called for the application's
     /// middleware only: a group's sets its fields in `before`.
@@ -117,7 +127,12 @@ public struct Scope<region r> {
 /// headers, rate limiting, authentication. It runs in the same chains as `Middleware<S>`, in the order added.
 public interface Filter {
     /// Before the handler. Response fields can be set here (`exchange.header`).
-    async fn before(borrow this, scope: borrow mut Scope, request: borrow Request, exchange: borrow mut Exchange,) -> Result<Flow, HandlerError>;
+    async fn before(
+        borrow this,
+        scope: borrow mut Scope,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<Flow, HandlerError>;
 
     /// Just before the response head is sent; for the application's filters only, as `Middleware.after`.
     async fn after(borrow this, request: borrow Request, head: borrow mut ResponseHead) -> Result<void, HandlerError>;
