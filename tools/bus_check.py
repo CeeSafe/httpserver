@@ -6,7 +6,8 @@ Without the bus only the worker asked hears and forgets.
 
 usage: python3 tools/bus_check.py [--port 18493] [--inherit]   (after `ceesafec build` in bench/)
 """
-import argparse, http.client, os, pathlib, subprocess, sys, time
+import argparse
+import errno, http.client, os, pathlib, subprocess, sys, time
 
 HERE = pathlib.Path(__file__).resolve().parent.parent
 args = argparse.ArgumentParser()
@@ -15,8 +16,17 @@ args.add_argument("--inherit", action="store_true", help="the workers accept fro
 a = args.parse_args()
 
 def get(path):
-    c = http.client.HTTPConnection("127.0.0.1", a.port, timeout=20)  # a connection each: any worker's
-    c.request("GET", path)
+    for attempt in range(10):
+        c = http.client.HTTPConnection("127.0.0.1", a.port, timeout=20)  # a connection each: any worker's
+        try:
+            c.request("GET", path)
+            break
+        except OSError as e:
+            # No port free for a new connection (those just closed are still waiting): not the server's doing.
+            if e.errno != errno.EADDRNOTAVAIL or attempt == 9:
+                raise
+            c.close()
+            time.sleep(1.0)
     r = c.getresponse()
     data = r.read()
     c.close()
@@ -35,8 +45,10 @@ def heard(tries=400, deadline=8.0):
         asked += 1
         if len(seen) == 4 and asked > 40:
             break
-        if asked >= tries and time.time() - started > deadline:
-            break
+        if asked >= tries:
+            if time.time() - started > deadline:
+                break
+            time.sleep(0.01)    # each request is a connection, and the system has only so many ports
     return seen
 
 def misses(expected, count=400, deadline=8.0):
@@ -50,6 +62,8 @@ def misses(expected, count=400, deadline=8.0):
         if get("/kept/4096")[0].getheader("age") is None:
             ran += 1
         asked += 1
+        if asked >= count:
+            time.sleep(0.01)    # as in `heard`
     return ran
 
 def run(bus):
