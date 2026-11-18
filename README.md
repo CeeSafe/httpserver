@@ -1,5 +1,7 @@
 # httpserver
 
+[![ci](https://github.com/CeeSafe/httpserver/actions/workflows/ci.yml/badge.svg)](https://github.com/CeeSafe/httpserver/actions/workflows/ci.yml)
+
 An HTTP application server written in [CeeSafe](https://ceesafe.github.io/CeeSafe/), a memory-safe systems language
 that compiles ahead of time to C: routing, route groups, middleware, replies, request timeouts and memory budgets,
 an output cache, scheduled jobs, WebSockets, static files, tokens and sessions, compression, tracing, and a

@@ -1,0 +1,102 @@
+# httpserver CI: check, format and tests of the six packages, the core's also with ASan and UBSan, the builds of the
+# example, the benchmark server and the collector demo, and the checks that run several processes (tools/), on macOS
+# and Linux.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CEESAFE_VERSION: v0.71.0 # the release the packages were last tested with and are formatted by; their manifests ask for 0.71.0 or later
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, ubuntu-24.04]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ceesafec
+        run: |
+          curl -fsSL https://ceesafe.github.io/CeeSafe/install.sh | sh
+          echo "$HOME/.ceesafe/bin" >> "$GITHUB_PATH"
+
+      - name: Toolchain
+        run: ceesafec --version
+
+      # auth/ links OpenSSL's libcrypto; compress/ and bench/ link libzstd and libbrotli.
+      - name: C libraries (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev libzstd-dev libbrotli-dev
+
+      - name: C libraries (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          for f in openssl@3 zstd brotli; do
+            brew list "$f" > /dev/null 2>&1 || brew install "$f"
+          done
+
+      - name: Check and format
+        run: |
+          set -e
+          for p in . auth static ws compress otel otel/demo examples/hello bench; do
+            echo "== $p"
+            (cd "$p" && ceesafec fetch && git diff --exit-code -- ceesafe.lock && ceesafec check && ceesafec fmt --check)
+          done
+
+      - name: Tests
+        run: |
+          set -e
+          for p in . auth static ws compress otel; do
+            echo "== $p"
+            (cd "$p" && ceesafec test)
+          done
+
+      - name: Core tests with ASan and UBSan
+        run: ceesafec test --cflag -fsanitize=address,undefined
+
+      - name: Example, benchmark server and collector demo builds
+        run: |
+          set -e
+          for p in examples/hello bench otel/demo; do
+            echo "== $p"
+            (cd "$p" && ceesafec build)
+          done
+
+      # On macOS the kernel gives every connection to one of the processes that bind a port, so the workers accept
+      # from one socket the supervisor bound.
+      - name: Mode of the workers' listener
+        run: |
+          if [ "$RUNNER_OS" = macOS ]; then echo "INHERIT=--inherit" >> "$GITHUB_ENV"; else echo "INHERIT=" >> "$GITHUB_ENV"; fi
+
+      - name: The supervisor
+        run: python3 tools/supervisor_check.py $INHERIT --budget-mb 16
+
+      - name: Compressed responses
+        run: python3 tools/gzip_check.py
+
+      - name: One rate limit for the workers
+        run: python3 tools/ratelimit_check.py $INHERIT
+
+      - name: The bus between the workers
+        run: python3 tools/bus_check.py $INHERIT
+
+      - name: WebSockets, in one process and across workers
+        run: |
+          set -e
+          python3 tools/ws_check.py
+          python3 tools/ws_check.py --workers 3 $INHERIT
+
+      - name: Spans to a collector
+        run: python3 tools/otel_check.py
