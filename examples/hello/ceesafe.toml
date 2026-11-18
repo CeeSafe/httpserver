@@ -1,0 +1,12 @@
+[package]
+name = "hello"
+version = "0.1.0"
+kind = "executable"
+sources = ["src"]
+ceesafec = ">=0.71.0"
+
+[dependencies]
+httpserver = { path = "../.." }
+web_core = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "4bb64c6712d9c876a78d33d0214ea8b875f222ff", dir = "packages/web_core" }
+web_transport = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "4bb64c6712d9c876a78d33d0214ea8b875f222ff", dir = "packages/web_transport" }
+web_http = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "4bb64c6712d9c876a78d33d0214ea8b875f222ff", dir = "packages/web_http" }

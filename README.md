@@ -1,17 +1,83 @@
 # httpserver
 
-An HTTP application server in [CeeSafe](https://ceesafe.github.io/CeeSafe/): routing, route groups, middleware and
-replies, on [CeeSafe.Web](https://github.com/CeeSafe/CeeSafe.Web)'s connection server and its HTTP/1.1 and HTTP/2
-drivers. It is a port of CosmoApiServer (.NET) by what it does, not line by line: the protocol work is CeeSafe.Web's,
-and this package is what an application is written against.
+An HTTP application server written in [CeeSafe](https://ceesafe.github.io/CeeSafe/), a memory-safe systems language
+that compiles ahead of time to C: routing, route groups, middleware, replies, request timeouts and memory budgets,
+an output cache, scheduled jobs, WebSockets, static files, tokens and sessions, compression, tracing, and a
+supervisor that runs one worker process a core.
+
+It stands on [CeeSafe.Web](https://github.com/CeeSafe/CeeSafe.Web)'s connection server and its HTTP/1.1 and HTTP/2
+drivers: the protocol work is CeeSafe.Web's, and this package is what an application is written against. It is a
+port of CosmoApiServer (.NET) by what it does, not line by line. There is no garbage collector and no runtime to
+install: a server is one native program, which answers about 100 000 small requests a second on one core in 8 to
+22 MB of memory ([Measured](#measured)).
+
+**Status:** version 0.1.0. The API is not settled, and the language under it is young: what was met while writing
+this is in [CEESAFE_FINDINGS.md](CEESAFE_FINDINGS.md). Linux and macOS; the supervisor is POSIX only.
+
+## Contents
+
+- [Quick start](#quick-start)
+- [Using it in a program](#using-it-in-a-program)
+- [The packages](#the-packages)
+- [What is here](#what-is-here)
+- [One process per core, supervised](#one-process-per-core-supervised)
+- [What is not here yet](#what-is-not-here-yet)
+- [Measured](#measured)
+- [The benchmark server](#the-benchmark-server)
+- [Working on it](#working-on-it)
+- [License](#license)
+
+## Quick start
+
+You need:
+
+- `ceesafec` 0.71.0 or later ([releases](https://github.com/CeeSafe/CeeSafe/releases), or the
+  [guide](https://ceesafe.github.io/CeeSafe/)'s installation page) and a C compiler (`cc`);
+- for `auth/` only, OpenSSL's libcrypto; for `compress/` only, libzstd and libbrotli
+  (`brew install zstd brotli`; `apt install libzstd-dev libbrotli-dev`). The core package needs no C library.
+
+```sh
+git clone https://github.com/CeeSafe/httpserver.git
+cd httpserver/examples/hello
+ceesafec build          # fetches CeeSafe.Web at the pinned revision, compiles through C to out/hello
+out/hello               # hello: listening on http://127.0.0.1:8080
+```
+
+```sh
+$ curl http://127.0.0.1:8080/
+hello
+$ curl http://127.0.0.1:8080/api/items/42
+{"id":42,"visits":1}
+$ curl -i http://127.0.0.1:8080/api/items/x      # {id:int} does not match
+HTTP/1.1 404 Not Found
+```
+
+That program, whole ([examples/hello/src/main.cee](examples/hello/src/main.cee)):
 
 ```ceesafe
+// The smallest server: two routes, a group with a parameter, state shared by every request.
+//
+//   ceesafec build && out/hello        then:  curl -i http://127.0.0.1:8080/api/items/42
 import web_core;
 import web_transport;
 import web_http;
 import httpserver;
 
-struct Shop { visits: AtomicU64; }
+/// What every request can reach: `ctx.state()`.
+struct Shop {
+    visits: AtomicU64;
+}
+
+struct Home {}
+
+impl Handler<Shop> for Home {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut Context<Shop>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> => await Reply.text(exchange, Status.ok(), "hello\n");
+}
 
 struct Item {}
 
@@ -22,22 +88,129 @@ impl Handler<Shop> for Item {
         request: borrow Request,
         exchange: borrow mut Exchange,
     ) -> Result<void, HandlerError> {
-        ctx.state().visits.fetchAdd(1);
-        let id = ctx.paramInt("id") ?? { return await Reply.problem(exchange, Status.badRequest(), "", "no id"); };
-        return await Reply.json(exchange, Status.ok(), "{\"ok\":true}".bytes());
+        let seen = ctx.state().visits.fetchAdd(1) + 1;
+        // The route says `{id:int}`, so a request that reaches this handler has one.
+        let id = ctx.paramInt("id") ?? { return await Reply.problem(exchange, Status.badRequest(), "No id", ""); };
+        var text = [0u8; 96];
+        var w = TextWriter.create(mut text[..]);
+        w.text("{\"id\":");
+        w.decimal(truncate<u64>(id));
+        w.text(",\"visits\":");
+        w.decimal(seen);
+        w.text("}\n");
+        return await Reply.json(exchange, Status.ok(), w.written());
     }
 }
 
-// var app = App<Shop>.create(Shop { visits: AtomicU64.create(0) }, Limits.defaults())?;
-// app.use(logging)?;                                           // for every request
-// let api = app.group("/api")?;
-// app.useIn(api, authentication)?;                             // for the group's routes
-// app.routeIn(api, Method.Get, "/items/{id:int}", item)?;      // GET /api/items/42
-// app.get("/health", health)?;
-// await app.run(listener, PlainAcceptor {}, ConnectionLimits.defaults(), drain)
+/// A handler as the application keeps it.
+fn boxed<H: Handler<Shop> + Send + Share>(handler: H) -> Result<Box<dyn Handler<Shop> + Send + Share>, RouteError> {
+    match (Box.create(handler)) {
+        Ok(b) => {
+            let d: Box<dyn Handler<Shop> + Send + Share> = b;
+            return Ok(d);
+        }
+        Err(_) => { return Err(RouteError.OutOfMemory); }
+    }
+}
+
+fn application() -> Result<App<Shop>, RouteError> {
+    var app = App<Shop>.create(Shop { visits: AtomicU64.create(0) }, Limits.defaults())?;
+    app.get("/", boxed(Home {})?)?;
+    let api = app.group("/api")?;
+    app.routeIn(api, Method.Get, "/items/{id:int}", boxed(Item {})?)?;
+    app.timeout(5000);       // a request that takes longer is answered 504
+    app.budget(8 * 1048576); // and one that would hold more than 8 MiB has its allocation fail
+    return Ok(app);
+}
+
+async fn serve(app: App<Shop>, listener: borrow Listener) -> Result<ServerReport, NetError> {
+    let drain = Drain.create()?;
+    let limits = ConnectionLimits.defaults();
+    return await app.run(listener, PlainAcceptor {}, limits, drain);
+}
+
+fn main() {
+    let app = match (application()) {
+        Ok(a) => a,
+        Err(_) => {
+            Console.writeLine("hello: could not build the routes");
+            Process.exit(1);
+        },
+    };
+    let options = ListenOptions { backlog: 0, reuseAddress: true, reusePort: false, v6Only: false };
+    let listener = match (Listener.bindWith(SocketAddresses.v4Loopback(8080), options)) {
+        Ok(l) => l,
+        Err(e) => {
+            Console.writeLine(NetErrors.describe(e));
+            Process.exit(1);
+        },
+    };
+    Console.writeLine("hello: listening on http://127.0.0.1:8080");
+    Console.flush();
+    match (Async.run(serve(app, listener))) {
+        Ok(_) => {}
+        Err(e) => {
+            Console.writeLine(NetErrors.describe(e));
+            Process.exit(1);
+        }
+    }
+}
 ```
 
-`bench/` is a whole program.
+What to notice:
+
+- **A handler is a struct** that implements `Handler<S>`, where `S` is the application's state. There is no
+  reflection and no container: what a handler needs is in its fields or in the state.
+- **`ctx`** has the state (`ctx.state()`), the route's parameters (`ctx.param`, `ctx.paramInt`), the connection, and
+  what middleware left for the handler (`ctx.value("user")`).
+- **Every failure is a value.** A route that cannot be added, an allocation that fails, a client that went away:
+  each is a `Result`, and `?` passes it on. A handler that returns `Err(HandlerError.Status(code))` is answered
+  with that status.
+- **`app.run` serves until the drain starts** (`drain.start()`, which `tend` does on SIGTERM under the supervisor):
+  it stops accepting, lets the requests in flight finish, and returns a report.
+
+[bench/src/main.cee](bench/src/main.cee) is a larger program: every feature below behind a route, the supervisor,
+the bus and the shared rate limit.
+
+## Using it in a program
+
+In the program's `ceesafe.toml`, name this repository and CeeSafe.Web's packages at the revision this one is built
+against (the one in [ceesafe.toml](ceesafe.toml)):
+
+```toml
+[package]
+name = "myserver"
+version = "0.1.0"
+kind = "executable"
+sources = ["src"]
+ceesafec = ">=0.71.0"
+
+[dependencies]
+httpserver = { git = "https://github.com/CeeSafe/httpserver.git", rev = "<a commit of this repository>" }
+web_core = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "4bb64c6712d9c876a78d33d0214ea8b875f222ff", dir = "packages/web_core" }
+web_transport = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "4bb64c6712d9c876a78d33d0214ea8b875f222ff", dir = "packages/web_transport" }
+web_http = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "4bb64c6712d9c876a78d33d0214ea8b875f222ff", dir = "packages/web_http" }
+```
+
+The other packages are directories of this repository: add `dir`, as in
+`httpserver_ws = { git = "https://github.com/CeeSafe/httpserver.git", rev = "…", dir = "ws" }`. `ceesafec fetch`
+resolves them and writes `ceesafe.lock`; `ceesafec build` does it when there is no lock.
+
+For TLS, give `app.run` `web_tls`'s acceptor in place of `PlainAcceptor {}` (HTTP/2 is then chosen by ALPN); for
+HTTP/3, give `applicationOf(app)` to `web_http3`'s server. Both are CeeSafe.Web's packages.
+
+## The packages
+
+| Directory | Package | What it is | C libraries |
+|---|---|---|---|
+| `.` | `httpserver` | The application, routes, groups, middleware, replies, cookies, forms and uploads, timeouts, budgets, the access log, the output cache, trace context, scheduled jobs, gzip, the supervisor, shared words and the bus | none |
+| `auth/` | `httpserver_auth` | JWT verification (HS256, RS256, EdDSA, ES256, JWKS), bearer authentication, claims, signed-cookie sessions, CSRF | OpenSSL's libcrypto |
+| `static/` | `httpserver_static` | A handler that serves the files under a root, with validators, conditional requests and ranges, and a single-page application's fallback page | none |
+| `ws/` | `httpserver_ws` | A WebSocket hub: sessions, groups, broadcast, delivery across workers over the bus | none |
+| `compress/` | `httpserver_compress` | Zstandard and Brotli responses by what the request accepts | libzstd, libbrotli |
+| `otel/` | `httpserver_otel` | Traced requests as spans, exported to a collector as OTLP/JSON | none |
+| `bench/` | `bench` | The benchmark server: a whole program | as `compress/` |
+| `examples/hello/` | `hello` | The quick start's program | none |
 
 ## What is here
 
@@ -114,6 +287,15 @@ impl Handler<Shop> for Item {
   job each second. Jobs run one at a time on the server's event loop; one that is late runs once, not once for each
   time it missed. `jobs.run` is raced against the server as `tend` is, and stops running jobs when the drain
   starts. Under the supervisor, start it in one worker (`worker.index() == 0`).
+- **Static files** (`static/`): `Files<S>.create(root, FilesOptions.defaults())` is a handler for GET and HEAD
+  that serves the regular files under `root`. The path is decoded once and checked lexically (a refused path, a
+  FIFO or a device is 404), the validators are read from the open file, conditional requests and one range are
+  honoured, and the body goes out with `sendfile`. `FilesOptions.singlePage(page)` answers every path that is not a
+  file with a single-page application's page.
+- **WebSockets** (`ws/`): a `Hub` keeps the sessions of a process. A session joins (`hub.join(sender)`), enters
+  groups (`membership.enter("room")`), and the hub sends to all (`broadcast`), to a group (`toGroup`) or to one
+  session (`to`). A session that does not read is not waited for: what it missed is counted. Under the supervisor,
+  `Hub.encode` and `Hub.deliverEncoded` carry a message to the sessions of the other workers over the bus.
 - **HTTP/1.1 and HTTP/2** on one port: `h2` by ALPN over TLS (`web_tls`'s acceptor), or by its preface in clear.
   `applicationOf(app)` gives the same application to `web_http3`'s server.
 
@@ -154,9 +336,15 @@ the benchmark server). Nothing blocks: a reader that falls a whole ring behind s
 another worker's session sent (`Hub.encode` makes it). The bus is one machine's; across machines a broker is
 needed.
 
-`python3 tools/supervisor_check.py [--inherit] [--memory-mb 512] [--budget-mb 16]` checks all of this against the benchmark server:
-five traps, a handler that never returns and one that takes memory until it fails, each followed by the server
-still answering.
+`python3 tools/supervisor_check.py [--inherit] [--memory-mb 512] [--budget-mb 16]` checks all of this against the
+benchmark server: five traps, a handler that never returns and one that takes memory until it fails, each followed
+by the server still answering. On macOS add `--inherit`: without it the kernel gives every connection to one
+worker.
+
+The shared memory is ceesafec's `SharedMemory`, made under a name that is taken away at once, so a supervisor that
+is killed leaves nothing behind. The supervisor itself forks its workers, through `fork`, `waitpid` and `kill`
+declared from C: CEESAFE_FINDINGS.md says what the language would need for it to start them as new programs
+instead.
 
 ## What is not here yet
 
@@ -223,7 +411,46 @@ answers the same routes (server GC). One machine and one run each: read the rati
 - CosmoApiServer answered 56 and 16 of about 1.3 million `/users/42` requests with a status that was not 2xx; not
   looked into.
 
+## The benchmark server
+
+`bench/` answers the routes of CeeSafe.Web's comparison contract, so its `conform.py` checks this server and the
+same load compares it with the others, and it has a route for every feature above. It reads its settings from the
+environment:
+
+| Variable | What it does |
+|---|---|
+| `CW_PORT` | The port on 127.0.0.1 (8090) |
+| `CW_PROCS=n` | n worker processes under the supervisor; unset, one process and no supervisor |
+| `CW_INHERIT=1` | The workers accept from one socket the supervisor bound, instead of each binding the port |
+| `CW_REUSEPORT=1` | One process that binds the port with `reusePort`, to run several by hand (Linux) |
+| `CW_WORKERS` | The most connections served at once (256) |
+| `CW_STALL_MS` | How long a worker may go without beating before it is killed (2000) |
+| `CW_MEMORY_MB` | A limit on each worker's address space (Linux) |
+| `CW_BUDGET_MB` | A memory budget for each request |
+| `CW_TIMEOUT_MS` | A time limit for each request |
+| `CW_LIMIT=n` | A rate limit of n requests an hour for each client address; with `CW_SHARED=1` the workers count together |
+| `CW_BUS=1` | A bus between the workers: `/bus/say/{n}`, `/bus/heard`, `/forget/{n}`, and `/chat` across workers |
+| `CW_TRACE=1` | The trace-context middleware |
+| `CW_LOG=1` or `2` | An access log that counts, or one that writes a line a request |
+| `CW_HOOKS=n` | n middleware that do nothing, to measure what one costs |
+| `CW_STOCK=1` | The stock middleware a public API would run: security headers, CORS, a rate limit |
+
+Its routes are listed at the top of [bench/src/main.cee](bench/src/main.cee): `/small`, `/json`, `/echo`,
+`/users/{id:int}`, `/stream`, `/kept/{n}` (the output cache), `/gz/{n}` and `/z/{n}` (compression), `/chat` (a
+WebSocket), and `/crash`, `/spin` and `/bloat`, which a server should survive.
+
+```sh
+(cd bench && ceesafec build)
+CW_PROCS=4 CW_BUDGET_MB=16 bench/out/bench &
+h2load --h1 -c 64 -t 4 -D 8 http://127.0.0.1:8090/small
+```
+
 ## Working on it
+
+The layout: each package has `ceesafe.toml`, `src/` and `tests/`; `tools/` has the checks that need several
+processes or a client written from the RFC, in Python with nothing to install. [AGENTS.md](AGENTS.md) is for coding
+agents: the commands, and the mistakes that code written from another language's habits makes in CeeSafe.
+
 
 ```sh
 ceesafec check && ceesafec fmt --check
@@ -234,6 +461,7 @@ ceesafec test --cflag -fsanitize=address,undefined
 (cd ws && ceesafec test)
 (cd compress && ceesafec test)   # needs libzstd and libbrotli
 (cd otel && ceesafec test)
+(cd examples/hello && ceesafec build)
 (cd bench && ceesafec build)      # then: python3 <CeeSafe.Web>/benchmarks/servers/conform.py --port 8090
 python3 tools/supervisor_check.py # the supervisor, against bench/out/bench
 python3 tools/gzip_check.py       # compressed responses, against Python's gzip
@@ -244,7 +472,10 @@ python3 tools/ws_check.py         # the hub, with WebSocket clients written from
 python3 tools/ws_check.py --workers 4   # the same over four workers and the bus (add --inherit on macOS)
 ```
 
-The compiler: ceesafec 0.71.0 or later (`SharedMemory`, under what the workers share; `Budget`, for a request's memory) (CeeSafe.Web at the pinned revision needs 0.62.2; the stock middleware are impls for every application state, which 0.68.0 accepts). The supervisor is POSIX only.
+The compiler: ceesafec 0.71.0 or later. It is the release that has `SharedMemory`, which the workers' shared words
+are made with; `Budget`, for a request's memory, came with 0.70.0, and the stock middleware are impls for every
+application state, which 0.68.0 accepts. CeeSafe.Web at the pinned revision needs 0.62.2. The supervisor is POSIX
+only.
 
 ## License
 

@@ -1,0 +1,100 @@
+// The smallest server: two routes, a group with a parameter, state shared by every request.
+//
+//   ceesafec build && out/hello        then:  curl -i http://127.0.0.1:8080/api/items/42
+import web_core;
+import web_transport;
+import web_http;
+import httpserver;
+
+/// What every request can reach: `ctx.state()`.
+struct Shop {
+    visits: AtomicU64;
+}
+
+struct Home {}
+
+impl Handler<Shop> for Home {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut Context<Shop>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> => await Reply.text(exchange, Status.ok(), "hello\n");
+}
+
+struct Item {}
+
+impl Handler<Shop> for Item {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut Context<Shop>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        let seen = ctx.state().visits.fetchAdd(1) + 1;
+        // The route says `{id:int}`, so a request that reaches this handler has one.
+        let id = ctx.paramInt("id") ?? { return await Reply.problem(exchange, Status.badRequest(), "No id", ""); };
+        var text = [0u8; 96];
+        var w = TextWriter.create(mut text[..]);
+        w.text("{\"id\":");
+        w.decimal(truncate<u64>(id));
+        w.text(",\"visits\":");
+        w.decimal(seen);
+        w.text("}\n");
+        return await Reply.json(exchange, Status.ok(), w.written());
+    }
+}
+
+/// A handler as the application keeps it.
+fn boxed<H: Handler<Shop> + Send + Share>(handler: H) -> Result<Box<dyn Handler<Shop> + Send + Share>, RouteError> {
+    match (Box.create(handler)) {
+        Ok(b) => {
+            let d: Box<dyn Handler<Shop> + Send + Share> = b;
+            return Ok(d);
+        }
+        Err(_) => { return Err(RouteError.OutOfMemory); }
+    }
+}
+
+fn application() -> Result<App<Shop>, RouteError> {
+    var app = App<Shop>.create(Shop { visits: AtomicU64.create(0) }, Limits.defaults())?;
+    app.get("/", boxed(Home {})?)?;
+    let api = app.group("/api")?;
+    app.routeIn(api, Method.Get, "/items/{id:int}", boxed(Item {})?)?;
+    app.timeout(5000);       // a request that takes longer is answered 504
+    app.budget(8 * 1048576); // and one that would hold more than 8 MiB has its allocation fail
+    return Ok(app);
+}
+
+async fn serve(app: App<Shop>, listener: borrow Listener) -> Result<ServerReport, NetError> {
+    let drain = Drain.create()?;
+    let limits = ConnectionLimits.defaults();
+    return await app.run(listener, PlainAcceptor {}, limits, drain);
+}
+
+fn main() {
+    let app = match (application()) {
+        Ok(a) => a,
+        Err(_) => {
+            Console.writeLine("hello: could not build the routes");
+            Process.exit(1);
+        },
+    };
+    let options = ListenOptions { backlog: 0, reuseAddress: true, reusePort: false, v6Only: false };
+    let listener = match (Listener.bindWith(SocketAddresses.v4Loopback(8080), options)) {
+        Ok(l) => l,
+        Err(e) => {
+            Console.writeLine(NetErrors.describe(e));
+            Process.exit(1);
+        },
+    };
+    Console.writeLine("hello: listening on http://127.0.0.1:8080");
+    Console.flush();
+    match (Async.run(serve(app, listener))) {
+        Ok(_) => {}
+        Err(e) => {
+            Console.writeLine(NetErrors.describe(e));
+            Process.exit(1);
+        }
+    }
+}
