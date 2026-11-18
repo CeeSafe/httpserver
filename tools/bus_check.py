@@ -39,9 +39,18 @@ def heard(tries=400, deadline=8.0):
             break
     return seen
 
-def misses(count=400):
-    """How many of `count` requests for /kept/4096 ran the handler (a kept response has `age`)."""
-    return sum(1 for _ in range(count) if get("/kept/4096")[0].getheader("age") is None)
+def misses(expected, count=400, deadline=8.0):
+    """How many requests for /kept/4096 ran the handler (a kept response has `age`): of `count` requests, and of
+    more, for at most `deadline` seconds, while fewer than `expected` did. A worker that has not had a connection
+    yet has not made its response yet (see `heard`)."""
+    ran = 0
+    asked = 0
+    started = time.time()
+    while asked < count or (ran < expected and time.time() - started < deadline):
+        if get("/kept/4096")[0].getheader("age") is None:
+            ran += 1
+        asked += 1
+    return ran
 
 def run(bus):
     env = dict(os.environ, CW_PORT=str(a.port), CW_PROCS="4")
@@ -59,11 +68,11 @@ def run(bus):
             time.sleep(0.1)
             seen = heard()
             results.append((said, len(seen), sum(1 for v in seen.values() if v == number)))
-        first = misses()        # each worker makes the response once
-        again = misses()        # and then answers from what it kept
+        first = misses(4)       # each worker makes the response once
+        again = misses(0)       # and then answers from what it kept
         get("/forget/4096")
         time.sleep(0.1)
-        after = misses()        # every worker that forgot makes it once more
+        after = misses(4 if bus else 0)   # every worker that forgot makes it once more
         # A worker that traps is started again in its place on the bus: it hears, and is heard.
         crashed = 0
         for _ in range(3):
