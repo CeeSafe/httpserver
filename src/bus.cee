@@ -17,7 +17,7 @@ const RECORD: u64 = 8;
 /// is in `publish`, and one to spare.
 const HEADER: usize = 32;
 
-/// The rings the workers publish in. Make it before `supervise`, and have each worker `join`. POSIX only.
+/// The rings the workers publish in. Make it before `supervise`, and have each worker `join`.
 public struct Bus {
     /// The mapping's address (a number: see `SharedWords`).
     private base: usize;
@@ -27,7 +27,6 @@ public struct Bus {
 
     /// Rings for `workers` workers of `ringBytes` each (rounded up to a power of two, at least 4096), or null if
     /// the system gives no shared memory. A message may be a quarter of a ring at most.
-    /// Safety: `mmap` is asked for a new anonymous mapping and its result is checked.
     public fn create(workers: u32, ringBytes: usize) -> Bus? {
         if (workers == 0 || workers > maxWorkers()) {
             return null;
@@ -37,11 +36,8 @@ public struct Bus {
             size *= 2;
         }
         let length = workers as usize * (HEADER + size);
-        let page = unsafe { mmap(0 as *mut void, length, PROT_READ + PROT_WRITE, MAP_SHARED + MAP_ANON, -1, 0) };
-        if (page == 0 as *mut void || page as usize == 0xFFFFFFFFFFFFFFFF) {
-            return null;
-        }
-        return Some(Bus { base: page as usize, rings: workers, size: size as u64 });
+        let base = sharedBytes(length) ?? { return null; };
+        return Some(Bus { base: base, rings: workers, size: size as u64 });
     }
 
     /// How many workers the bus is for.

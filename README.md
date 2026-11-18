@@ -244,7 +244,7 @@ python3 tools/ws_check.py         # the hub, with WebSocket clients written from
 python3 tools/ws_check.py --workers 4   # the same over four workers and the bus (add --inherit on macOS)
 ```
 
-The compiler: ceesafec 0.70.0 or later (`Budget`, for a request's memory) (CeeSafe.Web at the pinned revision needs 0.62.2; the stock middleware are impls for every application state, which 0.68.0 accepts). The supervisor is POSIX only.
+The compiler: ceesafec 0.71.0 or later (`SharedMemory`, under what the workers share; `Budget`, for a request's memory) (CeeSafe.Web at the pinned revision needs 0.62.2; the stock middleware are impls for every application state, which 0.68.0 accepts). The supervisor is POSIX only.
 
 ## License
 

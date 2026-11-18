@@ -235,7 +235,7 @@ captures of one closure. This is what refused `Async.timeout(ms, late, async () 
 …, exchange))` in `App.handle`. One guess was tried in the checker and was wrong (a captured local written "through"
 as a reference is, `collectWrites`): the cause is not known.
 
-## What ceesafec 0.65.1 to 0.70.0 changed
+## What ceesafec 0.65.1 to 0.71.0 changed
 
 Released 2026-11-18 from these findings and httpclient's. 0.65.1 fixed S1, S6 and S13. 0.67.0 carries three ADRs:
 0166 (S15: a generic type's arguments inferred in a static call), 0167 (S11: warning N0407) and 0168 (S14: a type
@@ -261,3 +261,18 @@ middleware for both (N0267). S2, S3, S8, S9, S10 and S12 are as they were.
   nothing for. Without them a spawned worker can bind with `reusePort` on Linux, not spread connections on macOS,
   and share no counters. The ADR says so (§4) and leaves named shared memory and descriptor passing to a later
   one; until then `fork` through `extern "C"` stays.
+
+0.71.0 carries ADR 0172, named shared memory: `SharedMemory.create(name, bytes)`, `open`, `remove`, words of
+`AtomicU64`. The three mappings here (`SharedWords`, `Bus`, the supervisor's page of heartbeats) are made with it
+and no longer declare `mmap`: each is created under a name of this process's own and the name is taken away at
+once, so the forked workers have the memory, nothing finds it by name, and a supervisor that is killed leaves
+nothing in `/dev/shm`. Two things met on the way:
+
+- **Nothing keeps a value without dropping it.** The mapping must outlive every copy of the address taken from it,
+  for the life of the process, and `SharedMemory`'s drop unmaps. `sharedBytes` pushes the value into a vector,
+  takes the vector apart (`Vector.intoRaw`) and rebuilds it empty (`Vector.fromRaw`, `unsafe`), which frees the
+  buffer and forgets the element. Leaving the buffer too is what `ceesafec test` reports as "leaked". A
+  `forget(value)` in lib/core, or a `SharedMemory` that can be told to stay, would say it in one line.
+- **The supervisor still forks**, and `fork`, `waitpid`, `kill` and `setrlimit` are still declared. Workers that
+  are spawned would open the memory by a name they are told, which is now possible, but on macOS they would also
+  need the listening socket handed to them, which is not (ADR 0172 §4).

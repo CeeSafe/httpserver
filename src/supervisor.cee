@@ -14,12 +14,8 @@
 // or the async runtime, so `fork` is safe in it at any time. POSIX only.
 import web_core;
 
-@header("signal.h", "sys/mman.h", "sys/wait.h", "sys/resource.h", "unistd.h")
+@header("signal.h", "sys/wait.h", "sys/resource.h", "unistd.h")
 extern "C" {
-    const MAP_SHARED: i32;
-    const MAP_ANON: i32;
-    const PROT_READ: i32;
-    const PROT_WRITE: i32;
     const SIGTERM: i32;
     const SIGINT: i32;
     const SIGKILL: i32;
@@ -39,8 +35,6 @@ extern "C" {
     fn kill(pid: i32, signal: i32) -> i32;
     @effects()
     fn usleep(micros: u32) -> i32;
-    @effects()
-    fn mmap(address: *mut void, length: usize, protection: i32, flags: i32, fd: i32, offset: i64) -> *mut void;
     @effects()
     fn signal(number: i32, handler: extern "C" fn(i32)) -> extern "C" fn(i32);
     @effects()
@@ -172,7 +166,7 @@ fn say(options: borrow SupervisorOptions, index: usize, pid: i32, what: StringVi
 
 /// Runs `options.workers` worker processes of `main` until the supervisor is asked to stop (SIGTERM or SIGINT) and
 /// the workers have ended. In a worker process this never returns: the process exits with `main.run`'s status.
-/// Safety: `mmap` gives a page that both sides keep for the life of their process, a word of it per worker; `fork`
+/// Safety: `sharedBytes` gives a page that both sides keep for the life of their process, a word of it per worker; `fork`
 /// is called from a process with one thread; `waitpid` writes one `i32`; `kill` is given only the process ids of
 /// children not yet waited for; `setrlimit` reads two `u64`, which is `struct rlimit` on LP64.
 public fn supervise<M: WorkerMain>(
@@ -182,10 +176,7 @@ public fn supervise<M: WorkerMain>(
     if (options.workers == 0 || options.workers > maxWorkers()) {
         return Err(SupervisorError.BadOptions);
     }
-    let page = unsafe { mmap(0 as *mut void, 4096, PROT_READ + PROT_WRITE, MAP_SHARED + MAP_ANON, -1, 0) };
-    if (page == 0 as *mut void || page as usize == 0xFFFFFFFFFFFFFFFF) {
-        return Err(SupervisorError.NoSharedMemory);
-    }
+    let page = sharedBytes(4096) ?? { return Err(SupervisorError.NoSharedMemory); };
     let beats = page as *mut u64;
     unsafe {
         signal(SIGTERM, stopAsked);
