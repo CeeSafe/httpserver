@@ -43,7 +43,7 @@ public struct FilesOptions {
 /// The files under a root, as a handler for any application state `S`. Mount it on a route that ends in `{*path}`
 /// (`app.get("/assets/{*path}", …)`, or `/{*path}` for a whole site), or on a single path, whose whole request path
 /// is then looked up.
-public struct Files<S> {
+public struct Files<S: Send + Share> {
     root: String;
     options: FilesOptions;
 

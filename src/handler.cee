@@ -4,7 +4,7 @@ import web_http;
 
 /// Handles requests for an application whose state is `S`. A handler is a struct with its own fields; the state is
 /// lent per request as `ctx.state()`.
-public interface Handler<S> {
+public interface Handler<S: Send + Share> {
     /// Reads the request's body and writes its response through `exchange`.
     async fn handle(
         borrow this,
@@ -24,7 +24,7 @@ public enum Flow {
 
 /// Hooks around handlers. A middleware added to the application runs for every request, routed or not; one added to
 /// a group runs for that group's routes, after the application's.
-public interface Middleware<S> {
+public interface Middleware<S: Send + Share> {
     /// Before the handler, in the order added. Response fields can be set here (`exchange.header`).
     async fn before(
         borrow this,
@@ -139,7 +139,7 @@ public interface Filter {
 }
 
 /// What a handler knows besides the request.
-public struct Context<region r, S> {
+public struct Context<region r, S: Send + Share> {
     private shared: Scope<r>;
     private appState: borrow(r) S;
     private routes: borrow(r) Router<S>;

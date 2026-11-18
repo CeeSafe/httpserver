@@ -119,7 +119,7 @@ public struct Range {
 }
 
 /// Routes requests to handlers of application state `S`.
-public struct Router<S> {
+public struct Router<S: Send + Share> {
     private nodes: Vector<Node>;
     private handlers: Vector<Box<dyn Handler<S> + Send + Share>>;
     /// Each route's group.
