@@ -8,8 +8,8 @@ Bugs and gaps in CeeSafe and CeeSafe.Web met while writing httpserver, with cees
 | S1 | An integer literal inside a parenthesised `if` expression does not take the type the outer `if` expects | ceesafec | fixed in ceesafec 0.65.1 |
 | S2 | A server runs on one thread: nothing serves one listener from several cores | CeeSafe.Web, runtime | measured; the supervisor's worker processes are the way round it |
 | S3 | A trap ends the process: a task cannot fail alone | ceesafec, by design (panic = abort) | the supervisor starts the worker again |
-| S4 | lib/std cannot start a process without waiting for it, signal one, or wait for any child | lib/std | `fork`, `waitpid`, `kill` declared through `extern "C"` |
-| S5 | No allocation budget for a task, and no allocator for `Vector` or `String` but the system's | runtime | a worker's `RLIMIT_AS`; open |
+| S4 | lib/std cannot start a process without waiting for it, signal one, or wait for any child | lib/std | `Process.spawn` in 0.70.0; the supervisor still forks (below) |
+| S5 | No allocation budget for a task, and no allocator for `Vector` or `String` but the system's | runtime | fixed in 0.70.0 (`Budget`): `app.budget(bytes)`; a worker's `RLIMIT_AS` is the backstop |
 | S6 | `ProcessSignals` does not survive `fork` | runtime | fixed in ceesafec 0.65.1: a forked child starts with no subscription |
 | S7 | A struct without type parameters cannot implement a generic interface for every argument (`impl<S> Middleware<S> for Cors`) | ceesafec (N0267) | fixed in ceesafec 0.68.0 (ADR 0165, for one state type a program): `Filter` is gone, and `Cors` and the others are `impl<S: Send + Share> Middleware<S>` |
 | S8 | A connection does not say whether it came over TLS | CeeSafe.Web | `HttpsRedirect` redirects everything; the application on the plain port uses it |
@@ -235,7 +235,7 @@ captures of one closure. This is what refused `Async.timeout(ms, late, async () 
 …, exchange))` in `App.handle`. One guess was tried in the checker and was wrong (a captured local written "through"
 as a reference is, `collectWrites`): the cause is not known.
 
-## What ceesafec 0.65.1 and 0.67.0 changed
+## What ceesafec 0.65.1 to 0.70.0 changed
 
 Released 2026-11-18 from these findings and httpclient's. 0.65.1 fixed S1, S6 and S13. 0.67.0 carries three ADRs:
 0166 (S15: a generic type's arguments inferred in a static call), 0167 (S11: warning N0407) and 0168 (S14: a type
@@ -245,5 +245,19 @@ the access log has what the filters left for every request: a request whose time
 its trace id. 0.68.0 carries ADR 0165 (S7), for one argument list a type: an impl whose parameter the interface chooses. With it
 the second interface, `Filter`, and the application's second list are gone: each stock middleware is one
 `impl<S: Send + Share> Middleware<S>`. A program whose applications have two state types cannot use one such
-middleware for both (N0267). Two more ADRs are accepted and not implemented: 0169 (S4, child processes in lib/std)
-and 0170 (S5, an allocation budget). S2, S3, S8, S9, S10 and S12 are as they were.
+middleware for both (N0267). S2, S3, S8, S9, S10 and S12 are as they were.
+
+0.70.0 carries the last two ADRs.
+
+- **0170 (S5), an allocation budget**, as a guard: `Budget.enter(bytes)`, not the `Async.budget(bytes, body)` the
+  ADR had. `App.handle` enters one for each request where `app.budget` or `app.budgetIn` set a bound, before the
+  time limit's child task is made, so that task is under it. Measured with the benchmark server's `/bloat`, which
+  takes a MiB at a time until an allocation fails: under a budget of 16 MiB it gets 15 and is answered, on macOS
+  and on Linux, and on Linux well short of the worker's 512 MiB (`tools/supervisor_check.py --budget-mb 16`). A
+  budget for every request cost nothing that two runs of the same thing do not differ by (ADR 0170 §6).
+- **0169 (S4), child processes**: `Process.spawn`, `ChildProcess`, `Process.id`, `Process.executable`. **The
+  supervisor does not use it yet.** It still forks: a forked worker inherits the listening socket and the shared
+  mappings (`SharedWords`, `Bus`), and a spawned one would have to be handed them by name, which lib/std has
+  nothing for. Without them a spawned worker can bind with `reusePort` on Linux, not spread connections on macOS,
+  and share no counters. The ADR says so (§4) and leaves named shared memory and descriptor passing to a later
+  one; until then `fork` through `extern "C"` stays.

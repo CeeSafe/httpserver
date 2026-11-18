@@ -2,7 +2,7 @@
 """Checks the supervisor with the benchmark server: workers that crash, stall or run out of memory are replaced, the
 others keep answering, and a SIGTERM to the supervisor ends them all.
 
-usage: python3 tools/supervisor_check.py [--port 18490] [--procs 3] [--memory-mb 0]   (after `ceesafec build` in bench/)
+usage: python3 tools/supervisor_check.py [--port 18490] [--procs 3] [--memory-mb 0] [--budget-mb 0]   (after `ceesafec build` in bench/)
 """
 import argparse, http.client, os, pathlib, signal, subprocess, sys, time
 
@@ -11,6 +11,7 @@ args = argparse.ArgumentParser()
 args.add_argument("--port", type=int, default=18490)
 args.add_argument("--procs", type=int, default=3)
 args.add_argument("--memory-mb", type=int, default=0)
+args.add_argument("--budget-mb", type=int, default=0)
 args.add_argument("--inherit", action="store_true")
 a = args.parse_args()
 
@@ -41,6 +42,8 @@ if a.inherit:
     env["CW_INHERIT"] = "1"
 if a.memory_mb:
     env["CW_MEMORY_MB"] = str(a.memory_mb)
+if a.budget_mb:
+    env["CW_BUDGET_MB"] = str(a.budget_mb)
 log = open("/tmp/supervisor_check.log", "w")
 proc = subprocess.Popen([str(HERE / "bench" / "out" / "bench")], env=env, stdout=log, stderr=subprocess.STDOUT)
 try:
@@ -64,6 +67,14 @@ try:
         expect(f"bloat: the allocation fails inside the request, which is answered ({r})",
                r is not None and r[0] == 200 and 0 < int(r[1]) <= a.memory_mb)
         expect("bloat: the server still answers", answering() == 40)
+
+    if a.budget_mb:
+        # The request's own budget stops it, on any system and well short of a worker's limit.
+        for n in range(3):
+            r = get("/bloat", timeout=20.0)
+            expect(f"budget {n + 1}: the allocation fails at the request's budget, and it is answered ({r})",
+                   r is not None and r[0] == 200 and a.budget_mb - 2 <= int(r[1]) < a.budget_mb)
+        expect("budget: the server still answers", answering() == 40)
 
     time.sleep(1.0)
     expect("every request is answered at the end", answering() == 40)

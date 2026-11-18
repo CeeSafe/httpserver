@@ -15,6 +15,8 @@ struct Group {
     chain: Vector<u32>;
     /// The longest a request to one of its routes may take; 0: as its parent's.
     timeoutMs: u64;
+    /// The most memory a request to one of its routes may hold at once; 0: as its parent's.
+    budgetBytes: usize;
 }
 
 /// What an application tells of each request it has answered: `App.logTo`.
@@ -41,7 +43,7 @@ public struct App<S: Send + Share> {
         let routes = Router<S>.create()?;
         var groups = Vector<Group>.create();
         match (groups.push(
-            Group { prefix: Vector<u8>.create(), parent: 0, chain: Vector<u32>.create(), timeoutMs: 0 },
+            Group { prefix: Vector<u8>.create(), parent: 0, chain: Vector<u32>.create(), timeoutMs: 0, budgetBytes: 0 },
         )) {
             Ok() => {}
             Err(_) => { return Err(RouteError.OutOfMemory); }
@@ -183,6 +185,36 @@ public struct App<S: Send + Share> {
         }
     }
 
+    /// Bounds the memory every request may hold at once (ceesafec's `Budget`): an allocation of its middleware or
+    /// handler, or of a task they start, that would take the request past `bytes` fails as an allocation fails
+    /// when the system has no memory, and the code that asked answers for it (413, 503, a shorter result). 0, the
+    /// default, is no bound. The request's own blocks are counted, as the C library sizes them; what C libraries
+    /// take for themselves is not. A worker's address-space limit (`ServeOptions.memoryBytes`) stays the backstop.
+    public fn budget(borrow mut this, bytes: usize) {
+        this.groups[0].budgetBytes = bytes;
+    }
+
+    /// `budget` for the routes of `group` and of the groups under it that set none: more for uploads.
+    public fn budgetIn(borrow mut this, group: u32, bytes: usize) -> Result<void, RouteError> {
+        if (group as usize >= this.groups.length) {
+            return Err(RouteError.NoSuchGroup);
+        }
+        this.groups[group as usize].budgetBytes = bytes;
+        return Ok();
+    }
+
+    /// The bound on the memory of a request to a route of `group`.
+    fn budgetOf(borrow this, group: u32) -> usize {
+        var at = group;
+        loop {
+            let bytes = this.groups[at as usize].budgetBytes;
+            if (bytes != 0 || at == 0) {
+                return bytes;
+            }
+            at = this.groups[at as usize].parent;
+        }
+    }
+
     /// Tells `log` of every request once it is answered, one that found no route or timed out included.
     public fn logTo(borrow mut this, log: Box<dyn AccessLog + Send + Share>) {
         this.log = Some(log);
@@ -229,7 +261,13 @@ public struct App<S: Send + Share> {
         if (p.length > 0 && (p[0] != 47 || p[p.length - 1] == 47)) {
             return Err(RouteError.BadPattern);
         }
-        var g = Group { prefix: Vector<u8>.create(), parent: parent, chain: Vector<u32>.create(), timeoutMs: 0 };
+        var g = Group {
+            prefix: Vector<u8>.create(),
+            parent: parent,
+            chain: Vector<u32>.create(),
+            timeoutMs: 0,
+            budgetBytes: 0,
+        };
         copyInto(mut g.prefix, this.groups[parent as usize].prefix.view())?;
         copyInto(mut g.prefix, p)?;
         if (parent != 0) {
@@ -467,15 +505,27 @@ impl<S: Send + Share> Application for App<S> {
         // for a request whose time was up.
         var ctx = Context<S>.create(this.appState, connection, this.routes, request.path(), params);
         var r: Result<void, HandlerError> = Ok();
-        if (ms == 0) {
-            r = await this.dispatch(found, mut ctx, request, exchange);
-        } else {
-            let late = StatusCode.of(504) ?? Status.notFound();
-            r = await Async.timeout(
-                ms,
-                HandlerError.Status(late),
-                async () => await this.dispatch(found, mut ctx, request, exchange),
-            );
+        {
+            // The request's budget is this task's while the guard lives, and the timeout's child task is made
+            // under it. A request that cannot have its budget is not run without one.
+            let bytes = this.budgetOf(group);
+            var budget: Budget? = null;
+            if (bytes != 0) {
+                match (Budget.enter(bytes)) {
+                    Ok(b) => { budget = Some(b); }
+                    Err(_) => { return Err(HandlerError.Internal); }
+                }
+            }
+            if (ms == 0) {
+                r = await this.dispatch(found, mut ctx, request, exchange);
+            } else {
+                let late = StatusCode.of(504) ?? Status.notFound();
+                r = await Async.timeout(
+                    ms,
+                    HandlerError.Status(late),
+                    async () => await this.dispatch(found, mut ctx, request, exchange),
+                );
+            }
         }
         match (borrow this.log) {
             Some(log) => {

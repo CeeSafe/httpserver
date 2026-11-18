@@ -82,6 +82,10 @@ impl Handler<Shop> for Item {
 - **Uploads as they arrive.** `Upload` reads a multipart/form-data body through the exchange, part by part and
   piece by piece through a buffer of a fixed size, so a handler writes a file to disk or hashes it without holding
   it; `Multipart` remains for bodies that fit in memory.
+- **Request memory budgets.** `app.budget(bytes)` bounds what every request may hold at once and
+  `app.budgetIn(group, bytes)` a group's: an allocation that would take the request past it fails as any failed
+  allocation does, and the handler answers for it. The request that grows is the one that is refused, not its
+  neighbours. Counted: the request's own blocks, and those of the tasks it starts; not what C libraries take.
 - **Request timeouts.** `app.timeout(ms)` bounds every request and `app.timeoutIn(group, ms)` a group's (longer for
   uploads, shorter for an API): a request whose middleware and handler have not returned is cancelled and answered
   504, or its connection is closed if part of the response had left. The time runs while a handler waits, not
@@ -130,7 +134,8 @@ impl WorkerMain for Server {
 
 - A worker that ends, however it ends, is started again, after a growing pause if it keeps ending at once.
 - A worker whose loop stops turning (a computation that never awaits) stops beating and is killed after `stallMs`.
-- `memoryBytes` limits a worker's address space (Linux), so one that grows fails its own allocations.
+- `memoryBytes` limits a worker's address space (Linux), so one that grows fails its own allocations. It is the
+  backstop for `app.budget`, which bounds each request on every system.
 - SIGTERM or SIGINT to the parent is passed on; the workers drain (`tend`), and those still there after `graceMs`
   are killed.
 - The workers either inherit one listening socket from the parent, so connections waiting to be accepted outlive a
@@ -149,7 +154,7 @@ the benchmark server). Nothing blocks: a reader that falls a whole ring behind s
 another worker's session sent (`Hub.encode` makes it). The bus is one machine's; across machines a broker is
 needed.
 
-`python3 tools/supervisor_check.py [--inherit] [--memory-mb 512]` checks all of this against the benchmark server:
+`python3 tools/supervisor_check.py [--inherit] [--memory-mb 512] [--budget-mb 16]` checks all of this against the benchmark server:
 five traps, a handler that never returns and one that takes memory until it fails, each followed by the server
 still answering.
 
@@ -239,7 +244,7 @@ python3 tools/ws_check.py         # the hub, with WebSocket clients written from
 python3 tools/ws_check.py --workers 4   # the same over four workers and the bus (add --inherit on macOS)
 ```
 
-The compiler: ceesafec 0.68.0 or later (CeeSafe.Web at the pinned revision needs 0.62.2; the stock middleware are impls for every application state, which 0.68.0 accepts). The supervisor is POSIX only.
+The compiler: ceesafec 0.70.0 or later (`Budget`, for a request's memory) (CeeSafe.Web at the pinned revision needs 0.62.2; the stock middleware are impls for every application state, which 0.68.0 accepts). The supervisor is POSIX only.
 
 ## License
 

@@ -21,7 +21,7 @@
 //   GET  /bloat          allocates until an allocation fails, then answers how many MiB it got
 //
 // CW_PROCS=n runs n worker processes under the supervisor (src/supervisor.cee), which starts a worker again when it
-// ends and kills one whose loop has stopped; CW_MEMORY_MB limits each worker's address space; CW_INHERIT=1 has the
+// ends and kills one whose loop has stopped; CW_MEMORY_MB limits each worker's address space; CW_BUDGET_MB each request's memory; CW_INHERIT=1 has the
 // workers accept from one socket the supervisor bound, instead of each binding the shared port.
 //
 // CW_BUS=1 gives the workers a bus: `/bus/say/{n}` says n to all of them, `/bus/heard` answers the worker and the
@@ -592,6 +592,7 @@ fn application(worker: u32, wiring: Wiring) -> Result<App<St>, RouteError> {
         app.use(stock(made)?)?;
     }
     app.timeout(setting("CW_TIMEOUT_MS", 0));
+    app.budget(truncate<usize>(setting("CW_BUDGET_MB", 0) * 1048576));
     match (setting("CW_LOG", 0)) {
         1 => {
             let log: Box<dyn AccessLog + Send + Share> = match (Box.create(Counted { requests: AtomicU64.create(0) })) {
