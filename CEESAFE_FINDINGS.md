@@ -5,21 +5,22 @@ Bugs and gaps in CeeSafe and CeeSafe.Web met while writing httpserver, with cees
 
 | | What | Where | Status |
 |---|---|---|---|
-| S1 | An integer literal inside a parenthesised `if` expression does not take the type the outer `if` expects | ceesafec | worked around |
+| S1 | An integer literal inside a parenthesised `if` expression does not take the type the outer `if` expects | ceesafec | fixed in ceesafec 0.65.1 |
 | S2 | A server runs on one thread: nothing serves one listener from several cores | CeeSafe.Web, runtime | measured; the supervisor's worker processes are the way round it |
 | S3 | A trap ends the process: a task cannot fail alone | ceesafec, by design (panic = abort) | the supervisor starts the worker again |
 | S4 | lib/std cannot start a process without waiting for it, signal one, or wait for any child | lib/std | `fork`, `waitpid`, `kill` declared through `extern "C"` |
 | S5 | No allocation budget for a task, and no allocator for `Vector` or `String` but the system's | runtime | a worker's `RLIMIT_AS`; open |
-| S6 | `ProcessSignals` does not survive `fork` | runtime | the supervisor installs its own handler and never subscribes |
+| S6 | `ProcessSignals` does not survive `fork` | runtime | fixed in ceesafec 0.65.1: a forked child starts with no subscription |
 | S7 | A struct without type parameters cannot implement a generic interface for every argument (`impl<S> Middleware<S> for Cors`) | ceesafec (N0267) | a second interface without the parameter (`Filter`) |
 | S8 | A connection does not say whether it came over TLS | CeeSafe.Web | `HttpsRedirect` redirects everything; the application on the plain port uses it |
 | S9 | `Application.beforeHead` gets the request and the head, not the handler's context | CeeSafe.Web | a group's middleware has no `after`; the access log and the timeout are in `App.handle`, around the whole chain |
 | S10 | Nothing can change a response's body after the handler sends it | CeeSafe.Web | compression is a call the handler makes (`Compression.send`), not a middleware |
 | S11 | `for (x in it)` over an iterator that is Copy walks a copy, and says nothing | ceesafec | `Multipart` is `@noncopy` |
 | S12 | A struct that holds a raw pointer is not Send or Share, and `@threadSafe` is for trusted packages only | ceesafec, by design | the address is kept as a `usize` and cast where it is used |
-| S13 | An array literal of borrows is refused with a message about the borrowed type not being Copy | ceesafec | the two calls are written out |
-| S14 | An async closure that captures a value holding borrows (`Context`) and a `borrow mut` parameter (`exchange`) is refused as if the first flowed into the second (N0272); so is a method that takes the context by `borrow mut` and calls a `dyn Handler` with it | ceesafec | the function that makes the context calls the handler, and the closure captures only the parameters |
+| S13 | An array literal of borrows is refused with a message about the borrowed type not being Copy | ceesafec | fixed in ceesafec 0.65.1: it is N0246, an array of references |
+| S14 | A method that is given the context by `borrow mut` cannot call a `dyn Handler<S>` with it (N0272) | ceesafec, by design: the handler and `Context<S>` share the flow name `S`, whatever its bounds (§25.6) | the function that makes the context calls the handler; ADR 0168 proposes that a `Send` parameter be no flow name |
 | S15 | A cancelled task's function runs on to its end, and cannot tell without asking (`AsyncControl<E>.checkpoint`) | runtime, by design | the dispatcher asks before it tells the access log |
+| S16 | A closure that stores into a captured local and also captures part of a `borrow mut` parameter is refused as if it stored into the parameter (N0272) | ceesafec, looks like a fault of the checker; reduced, not understood | the closure captures only the parameters; a cancelled request's log entry lacks what the filters left |
 
 ## S1: a nested `if` expression's literals are `i32`
 
@@ -177,6 +178,17 @@ same refusal: a method `dispatch(borrow this, ctx: borrow mut Context<S>, …)` 
 value into what 'ctx' refers to"), while the same call in the function that owns `ctx` is accepted. A region
 parameter on the method did not help, and `borrow(r) this` is not accepted in a method's parameters.
 
+Looked into for 0.65.1, the two forms are two things.
+
+The second form (the method that is handed `ctx`) is the language's rule, not a fault (type-system.md §25.6, ADR
+0131): in `interface Handler<S>` the receiver has the interface's type parameter as a flow name, and so has a
+parameter of type `Context<S>`, so a call of `handle` may store a loan of the handler into the context. Reduced:
+the same method with a context type that does not mention `S` is accepted, and bounding `S` by `Send + Share`
+changes nothing, though a value of such a type holds no loan. ADR 0168 (proposed) is that a type parameter bounded
+by `Send` or `Share` be no flow name.
+
+The first form (the closure) is S16.
+
 So `App.dispatch` makes the context, calls the handler and tells the access log itself; the closure captures only
 `handle`'s parameters. The cost: a request that was cancelled is told to the log by `handle`, which has no context,
 so its log entry lacks what the filters left (the trace id).
@@ -188,3 +200,37 @@ runs on with them. The dispatcher saw the handler return `Err(Internal)` (its `T
 the access log 500 for a request the client got 504 for. Nothing in the result says "cancelled";
 `AsyncControl<HandlerError>.checkpoint(…)` does, and the dispatcher asks it before logging. (The call needs its
 type argument written: `AsyncControl.checkpoint(e)` is N0265, though `E` is the argument's type.)
+
+## S16: a closure that stores into a captured local
+
+```ceesafe
+struct Out<region r> { sink: borrow(r) Vector<u8>; n: u32; }
+struct Ctx<region r, S> { state: borrow(r) S; seen: u32; }
+interface App { fn serve(borrow this, out: borrow mut Out) -> u32; }
+struct Server<S: Send + Share> { state: S; }
+
+impl<S: Send + Share> Server<S> {
+    fn dispatch(borrow this, ctx: borrow mut Ctx<S>) -> u32 { ctx.seen += 1; return ctx.seen; }
+    fn plain(borrow this, seen: borrow mut u32) -> u32 { seen += 1; return seen; }
+}
+
+fn twice(f: borrow mut fn() -> u32) -> u32 => f() + f();
+
+impl<S: Send + Share> App for Server<S> {
+    fn serve(borrow this, out: borrow mut Out) -> u32 {
+        var ctx = Ctx { state: borrow this.state, seen: 0 };
+        return twice(() => {
+            out.n += 1;
+            return this.dispatch(mut ctx);      // N0272: this stores a value borrowed from 'out.n' into
+        });                                     //        what 'out' refers to, which outlives this call
+    }
+}
+```
+
+The closure stores nothing into `out`: it adds one to a number in it. Three changes each make the program
+accepted (ceesafec 0.65.1): calling `this.plain(mut ctx.seen)`, which has no flow into the context; leaving
+`out.n += 1` out, so `out` is not captured; or writing the two statements in `serve` without a closure. So the
+store that `dispatch` may make into `ctx` (its receiver shares `S` with it, S14) is charged to `out` when both are
+captures of one closure. This is what refused `Async.timeout(ms, late, async () => await this.dispatch(…, mut ctx,
+…, exchange))` in `App.handle`. One guess was tried in the checker and was wrong (a captured local written "through"
+as a reference is, `collectWrites`): the cause is not known.
