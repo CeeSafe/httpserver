@@ -78,6 +78,15 @@ public struct Compression {
         return Ok(true);
     }
 
+    /// For checks of isolation only (tests/poisoned.cee, tools/supervisor_check.py `--isolated`): traps while
+    /// holding the encoder's lock, half way through compressing `data`, as a request whose isolated task trapped in
+    /// the encoder would. The lock is left poisoned and the encoder's tables hold places of `data` it never finished;
+    /// the next `gzip` makes the encoder new.
+    public fn trapHoldingLock(borrow this, data: Slice<u8>) -> never {
+        var guard = this.deflater.tryLock() ?? { panic("the encoder's lock is held"); };
+        guard.data().trapMidMessage(data);
+    }
+
     /// Answers `status` with `body` as `contentType`, compressed if the request's `Accept-Encoding` takes gzip, the
     /// body has `minBytes` or more, and gzip makes it smaller. A body that could have been compressed is marked
     /// `vary: accept-encoding` either way, so a cache keeps the two forms apart.

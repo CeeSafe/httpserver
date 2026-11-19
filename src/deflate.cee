@@ -124,6 +124,20 @@ public struct Deflater {
         this.base = 0;
     }
 
+    /// For `Compression.trapHoldingLock`: enters the places of `input` in the tables as `piece` does, then traps
+    /// before `base` moves past them, as a trap inside `piece` leaves the tables.
+    fn trapMidMessage(borrow mut this, input: Slice<u8>) -> never {
+        let base = this.base;
+        var i: usize = 0;
+        while (i + MIN_MATCH <= input.length) {
+            let h = hash(input, i);
+            this.prev[i & WINDOW_MASK] = this.head[h];
+            this.head[h] = base + truncate<u32>(i) + 1;
+            i += 1;
+        }
+        panic("trapped inside the encoder");
+    }
+
     /// Appends `input` compressed to `out` as permessage-deflate sends a message (RFC 7692 §7.2.1): a block that is
     /// not the last, then an empty stored block without its last four bytes (`00 00 ff ff`), which the reader puts
     /// back. The result ends on a byte.

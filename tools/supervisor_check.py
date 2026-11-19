@@ -6,9 +6,11 @@ usage: python3 tools/supervisor_check.py [--port 18490] [--procs 3] [--memory-mb
        (after `ceesafec build` in bench/)
 
 --isolated serves each connection in an isolated task (CW_ISOLATED=1): a trap then costs its connection and no
-worker, and a worker whose tasks have trapped twice (CW_RECYCLE_CRASHES=2) drains and is started again.
+worker, and a worker whose tasks have trapped twice (CW_RECYCLE_CRASHES=2) drains and is started again. Two of its
+traps hold a lock: the output cache's, then the gzip encoder's. The next uses repair and heal them, the cache's from
+the bus's `carry` (CW_BUS=1), outside any isolated task, where a panic would end the worker.
 """
-import argparse, http.client, os, pathlib, signal, subprocess, sys, time
+import argparse, gzip, http.client, os, pathlib, signal, subprocess, sys, time
 
 HERE = pathlib.Path(__file__).resolve().parent.parent
 args = argparse.ArgumentParser()
@@ -32,6 +34,20 @@ def get(path, timeout=3.0):
     except (OSError, http.client.HTTPException):
         return None
 
+def gzipped(path, timeout=3.0):
+    """The body of `path` asked for as gzip, inflated; None if it was not answered with a gzip member."""
+    try:
+        c = http.client.HTTPConnection("127.0.0.1", a.port, timeout=timeout)
+        c.request("GET", path, headers={"accept-encoding": "gzip"})
+        r = c.getresponse()
+        body = r.read()
+        c.close()
+        if r.status != 200 or r.getheader("content-encoding") != "gzip":
+            return None
+        return gzip.decompress(body)
+    except (OSError, http.client.HTTPException, EOFError, gzip.BadGzipFile):
+        return None
+
 def answering(tries=40):
     """How many of `tries` requests for /small are answered."""
     return sum(1 for _ in range(tries) if get("/small") == (200, b"hello, world\n"))
@@ -52,6 +68,7 @@ if a.budget_mb:
 if a.isolated:
     env["CW_ISOLATED"] = "1"
     env["CW_RECYCLE_CRASHES"] = "2"
+    env["CW_BUS"] = "1"
 log = open("/tmp/supervisor_check.log", "w")
 proc = subprocess.Popen([str(HERE / "bench" / "out" / "bench")], env=env, stdout=log, stderr=subprocess.STDOUT)
 try:
@@ -59,6 +76,33 @@ try:
     expect("every request is answered at the start", answering() == 40)
     workers = {get("/worker")[1] for _ in range(200)}
     print(f"     workers seen: {sorted(workers)}")
+
+    if a.isolated:
+        # A trap holding the cache's lock. `/bus/forget/7`, answered by another worker, reaches the one whose lock
+        # is poisoned through the bus, outside any isolated task: it empties the table and heals the lock, where a
+        # panic would end that worker. Then `/forget/7` forgets in the request too.
+        kept = [get("/kept/7") for _ in range(30)]
+        expect("kept: /kept/7 is answered", all(r is not None and r[0] == 200 for r in kept))
+        expect("lock 1: the request that traps holding the cache's lock gets no answer", get("/crash/kept") is None)
+        published = []
+        for _ in range(30):
+            published.append(get("/bus/forget/7"))
+            time.sleep(0.02)
+        expect("lock 1: /bus/forget/7 is answered and published", all(r == (200, b"ok") for r in published))
+        time.sleep(0.3)
+        expect("lock 1: /forget/7 is answered and published",
+               all(get("/forget/7") == (200, b"ok") for _ in range(10)))
+        time.sleep(0.3)
+        kept = [get("/kept/7") for _ in range(30)]
+        expect("lock 1: /kept/7 is still answered", all(r is not None and r[0] == 200 for r in kept))
+        # A trap holding the encoder's lock, half way through a body: the next gzip makes the encoder new.
+        expected = get("/gz/20000")
+        expect("lock 2: the request that traps holding the encoder's lock gets no answer",
+               get("/crash/gz/60000") is None)
+        bodies = [gzipped("/gz/20000") for _ in range(40)]
+        expect(f"lock 2: every gzip after it inflates to the body ({sum(1 for b in bodies if b is not None)} of 40)",
+               expected is not None and all(b == expected[1] for b in bodies))
+        expect("lock 1 and 2: the server still answers", answering() == 40)
 
     for n in range(5):
         expect(f"crash {n + 1}: the request that traps gets no answer", get("/crash") is None)
@@ -99,10 +143,11 @@ print(text.strip())
 lines = text.split("\n")
 report = lines[lines.index("bench: started, crashed, stalled, killed") + 1:][:4] if "bench: started, crashed, stalled, killed" in lines else []
 if a.isolated:
-    # Five traps over three workers: at least one worker took two and was replaced, and none crashed.
+    # Seven traps over three workers (two of them holding a lock): at least one worker took two and was replaced,
+    # and none crashed, not even in the bus's `carry`.
     recycled = text.count("passed the bound: draining, to be replaced")
     expect(f"the report counts no crash and 1 stall ({report})", len(report) == 4 and report[1] == "0" and report[2] == "1")
-    expect(f"each trap ended alone ({text.count('ended alone)')} of 5)", text.count("ended alone)") == 5)
+    expect(f"each trap ended alone ({text.count('ended alone)')} of 7)", text.count("ended alone)") == 7)
     expect(f"a worker whose tasks trapped twice was replaced ({recycled})", recycled >= 1 and int(report[0]) >= 5)
 else:
     expect(f"the report counts 5 crashes and 1 stall ({report})", len(report) == 4 and report[1] == "5" and report[2] == "1")

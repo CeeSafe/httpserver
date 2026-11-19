@@ -1,0 +1,118 @@
+// A lock that an isolated task held when it trapped (ADR 0175): the cache and the compressor repair what the task
+// left, heal the lock and go on, where `tryLock` would panic for every use after the trap.
+import web_http;
+
+enum Iso {
+    Crashed,
+    NoMemory,
+}
+
+/// Runs `cache.trapHoldingLock()` in an isolated task; whether it trapped and ended alone.
+async fn trapInCache(cache: Arc<OutputCache>) -> bool {
+    let r = await Async.tasks(1, Iso.NoMemory, async (set) => {
+        let c = cache.clone();
+        let _ = await set.spawnIsolated(Iso.Crashed, async move () => {
+            c.get().trapHoldingLock();
+        })?;
+        return Ok();
+    });
+    return match (r) {
+        Err(Iso.Crashed) => true,
+        _ => false,
+    };
+}
+
+/// Runs `compression.trapHoldingLock(data)` in an isolated task; whether it trapped and ended alone.
+async fn trapInEncoder(compression: Arc<Compression>, data: Arc<Vector<u8>>) -> bool {
+    let r = await Async.tasks(1, Iso.NoMemory, async (set) => {
+        let c = compression.clone();
+        let d = data.clone();
+        let _ = await set.spawnIsolated(Iso.Crashed, async move () => {
+            c.get().trapHoldingLock(d.get().view());
+        })?;
+        return Ok();
+    });
+    return match (r) {
+        Err(Iso.Crashed) => true,
+        _ => false,
+    };
+}
+
+/// Keeps `body` for `target` for a minute.
+fn keepFor(cache: borrow OutputCache, target: StringView, body: StringView) -> Result<void, TestFailure> {
+    let kept = cache.keep(target.bytes(), "".bytes(), Status.ok(), "text/plain", body.bytes(), "".bytes(), 60);
+    return Check.isTrue(kept, "kept");
+}
+
+fn has(cache: borrow OutputCache, target: StringView) -> bool =>
+    cache.kept(target.bytes(), "".bytes(), nowMs()).isSome();
+
+/// `forget` after the trap empties the table, as the poisoned lock asks, heals the lock, and the cache works on.
+@test
+async fn cacheForgetsAfterATrap() -> Result<void, TestFailure> {
+    let cache = alloc(Arc<OutputCache>.create(alloc(OutputCache.create(16, 64))?))?;
+    keepFor(cache.get(), "/a", "a")?;
+    keepFor(cache.get(), "/b", "b")?;
+    Check.isTrue(has(cache.get(), "/a") && has(cache.get(), "/b"), "both kept before the trap")?;
+
+    Check.isTrue(await trapInCache(cache.clone()), "the task trapped and ended alone")?;
+
+    // `forget` takes the poisoned lock: the table is emptied, not only `/a`, and the lock healed.
+    cache.get().forget("/a");
+    Check.isTrue(!has(cache.get(), "/b"), "the table was emptied")?;
+    // Healed: the cache keeps and finds again, and a second trap is repaired the same way.
+    keepFor(cache.get(), "/c", "c")?;
+    Check.isTrue(has(cache.get(), "/c"), "kept after the trap")?;
+    Check.isTrue(await trapInCache(cache.clone()), "a second trap ended alone")?;
+    Check.isTrue(!has(cache.get(), "/c"), "the lookup emptied the table too")?;
+    return Ok();
+}
+
+/// `clear` after the trap empties the table and heals the lock.
+@test
+async fn cacheClearsAfterATrap() -> Result<void, TestFailure> {
+    let cache = alloc(Arc<OutputCache>.create(alloc(OutputCache.create(16, 64))?))?;
+    keepFor(cache.get(), "/a", "a")?;
+    Check.isTrue(await trapInCache(cache.clone()), "the task trapped and ended alone")?;
+    cache.get().clear();
+    Check.isTrue(!has(cache.get(), "/a"), "nothing is kept")?;
+    keepFor(cache.get(), "/a", "a2")?;
+    Check.isTrue(has(cache.get(), "/a"), "kept after the trap")?;
+    return Ok();
+}
+
+/// Text with repeats, so the encoder's tables fill: `n` lines naming their number.
+fn lines(n: usize, word: StringView) -> Result<Vector<u8>, TestFailure> {
+    var v = Vector<u8>.create();
+    for (i in 0..n) {
+        alloc(v.extend(word.bytes()))?;
+        alloc(v.push(truncate<u8>(48 + i % 10)))?;
+        alloc(v.push(10))?;
+    }
+    return Ok(v);
+}
+
+/// After a trap inside the encoder, `gzip` makes it new: its output is a fresh compressor's, byte for byte, and it
+/// goes on working.
+@test
+async fn gzipAfterATrap() -> Result<void, TestFailure> {
+    let compression = alloc(Arc<Compression>.create(alloc(Compression.create(1024))?))?;
+    let first = alloc(Arc<Vector<u8>>.create(lines(2000, "the first message, line ")?))?;
+    Check.isTrue(await trapInEncoder(compression.clone(), first.clone()), "the task trapped and ended alone")?;
+
+    let second = lines(300, "another, ")?;
+    var after = Vector<u8>.create();
+    Check.isTrue(alloc(compression.get().gzip(second.view(), mut after))?, "gzip after the trap")?;
+    let fresh = alloc(Compression.create(1024))?;
+    var expected = Vector<u8>.create();
+    Check.isTrue(alloc(fresh.gzip(second.view(), mut expected))?, "gzip on a fresh compressor")?;
+    Check.equalBytes(expected.view(), after.view())?;
+
+    // And again, so the lock was healed and the encoder goes on as a fresh one does.
+    var again = Vector<u8>.create();
+    var expectedAgain = Vector<u8>.create();
+    Check.isTrue(alloc(compression.get().gzip(second.view(), mut again))?, "gzip once more")?;
+    Check.isTrue(alloc(fresh.gzip(second.view(), mut expectedAgain))?, "fresh once more")?;
+    Check.equalBytes(expectedAgain.view(), again.view())?;
+    return Ok();
+}

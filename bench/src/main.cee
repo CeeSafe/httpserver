@@ -12,6 +12,8 @@
 //   POST /stop           starts the drain
 //   GET  /worker         which worker process answered
 //   GET  /crash          traps (an index out of bounds), which ends the process, or with CW_ISOLATED=1 its connection
+//   GET  /crash/kept     traps holding the output cache's lock, which the next use of the cache repairs (CW_ISOLATED=1)
+//   GET  /crash/gz/{n:int} traps holding `/gz`'s encoder's lock, half way through n bytes, which the next `/gz` repairs
 //   GET  /spin           computes without end, which stops the event loop
 //   GET  /kept/{n:int}   the same text through the output cache, kept for a minute
 //   GET  /gz/{n:int}     n bytes of JSON-like text through `Compression`: gzip for a client that accepts it
@@ -28,7 +30,8 @@
 // worker, and a worker is replaced after CW_RECYCLE_CRASHES crashes (100 by default).
 //
 // CW_BUS=1 gives the workers a bus: `/bus/say/{n}` says n to all of them, `/bus/heard` answers the worker and the
-// last number it heard, and `/forget/{n}` has every worker forget `/kept/{n}`.
+// last number it heard, `/forget/{n}` has every worker forget `/kept/{n}`, and `/bus/forget/{n}` only the others,
+// through the bus.
 //
 // CW_LIMIT=n adds a rate limit of n requests an hour for each client address; with CW_SHARED=1 the supervisor's
 // workers count in shared memory, so the limit is all of theirs together. CW_TRACE=1 adds the trace-context filter. CW_TIMEOUT_MS=n bounds every request (`App.timeout`); CW_LOG=1 adds an access log that only counts, CW_LOG=2 the
@@ -86,8 +89,8 @@ impl BusSink for Ears {
     }
 }
 
-/// `/bus/say/{n}` says n to every worker, `/bus/heard` answers `<worker> <last number heard>`, and `/forget/{n}`
-/// has every worker forget `/kept/{n}`.
+/// `/bus/say/{n}` says n to every worker, `/bus/heard` answers `<worker> <last number heard>`, `/forget/{n}` has
+/// every worker forget `/kept/{n}`, and `/bus/forget/{n}` every worker but the one that answers.
 struct OnBus {
     what: u32;
 }
@@ -123,9 +126,11 @@ impl Handler<St> for OnBus {
         } else {
             w.text("/kept/");
             w.decimal(truncate<u64>(n));
-            match (StringView.fromUtf8(w.written())) {
-                Some(target) => { wiring.cache.get().forget(target); }
-                null => {}
+            if (this.what == 2) {
+                match (StringView.fromUtf8(w.written())) {
+                    Some(target) => { wiring.cache.get().forget(target); }
+                    null => {}
+                }
             }
             match (wiring.sender) {
                 Some(s) => { published = s.publish(2, w.written()); }
@@ -341,7 +346,7 @@ impl Handler<St> for Bloat {
 
 /// `n` bytes of text that reads like JSON: a few words in an order a generator gives, the same for the same `n`.
 struct Packed {
-    compression: Compression;
+    compression: Arc<Compression>;
 }
 
 fn word(k: u32) -> StringView => match (k) {
@@ -387,7 +392,30 @@ impl Handler<St> for Packed {
         exchange: borrow mut Exchange,
     ) -> Result<void, HandlerError> {
         let body = jsonLike(asked(ctx))?;
-        return await this.compression.send(request, exchange, Status.ok(), "application/json", body.view());
+        return await this.compression.get().send(request, exchange, Status.ok(), "application/json", body.view());
+    }
+}
+
+/// Traps holding a lock: the output cache's (`/crash/kept`) or the encoder's of `/gz` (`/crash/gz/{n}`). Under
+/// CW_ISOLATED=1 it costs the connection, and the lock is left poisoned for the next request to repair.
+struct TrapHolding {
+    cache: Arc<OutputCache>;
+    compression: Arc<Compression>;
+    inEncoder: bool;
+}
+
+impl Handler<St> for TrapHolding {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut Context<St>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        if (this.inEncoder) {
+            let body = jsonLike(asked(ctx))?;
+            this.compression.get().trapHoldingLock(body.view());
+        }
+        this.cache.get().trapHoldingLock();
     }
 }
 
@@ -640,13 +668,25 @@ fn application(worker: u32, wiring: Wiring) -> Result<App<St>, RouteError> {
     };
     app.get("/z/{n:int}", handler(Box.create(Coded { codings: codings }))?)?;
     let compression = match (Compression.create(1024)) {
-        Ok(c) => c,
+        Ok(c) => match (Arc<Compression>.create(c)) {
+            Ok(a) => a,
+            Err(_) => { return Err(RouteError.OutOfMemory); },
+        },
         Err(_) => { return Err(RouteError.OutOfMemory); },
     };
-    app.get("/gz/{n:int}", handler(Box.create(Packed { compression: compression }))?)?;
+    app.get("/gz/{n:int}", handler(Box.create(Packed { compression: compression.clone() }))?)?;
+    app.get(
+        "/crash/kept",
+        handler(Box.create(TrapHolding { cache: cache.clone(), compression: compression.clone(), inEncoder: false }))?,
+    )?;
+    app.get(
+        "/crash/gz/{n:int}",
+        handler(Box.create(TrapHolding { cache: cache.clone(), compression: compression, inEncoder: true }))?,
+    )?;
     app.get("/bus/heard", handler(Box.create(OnBus { what: 0 }))?)?;
     app.get("/bus/say/{n:int}", handler(Box.create(OnBus { what: 1 }))?)?;
     app.get("/forget/{n:int}", handler(Box.create(OnBus { what: 2 }))?)?;
+    app.get("/bus/forget/{n:int}", handler(Box.create(OnBus { what: 3 }))?)?;
     let kept = app.group("/kept")?;
     let answering: Result<Cached, AllocError> = Ok(Cached.create(cache.clone()));
     app.useIn(kept, stock(answering)?)?;
