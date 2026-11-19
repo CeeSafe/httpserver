@@ -1,13 +1,13 @@
 # CeeSafe findings
 
-Bugs and gaps in CeeSafe and CeeSafe.Web met while writing httpserver, with ceesafec 0.62.2 (now built with 0.68.0) and CeeSafe.Web at
-`4bb64c6`. Each has what was seen, a reduction where there is one, and what httpserver does instead.
+Bugs and gaps in CeeSafe and CeeSafe.Web met while writing httpserver, with ceesafec 0.62.2 (now built with 0.75.0) and CeeSafe.Web at
+`4bb64c6` (now `2886ca3`, with Web ADR 0016's isolated connections). Each has what was seen, a reduction where there is one, and what httpserver does instead.
 
 | | What | Where | Status |
 |---|---|---|---|
 | S1 | An integer literal inside a parenthesised `if` expression does not take the type the outer `if` expects | ceesafec | fixed in ceesafec 0.65.1 |
 | S2 | A server runs on one thread: nothing serves one listener from several cores | CeeSafe.Web, runtime | measured; the supervisor's worker processes are the way round it |
-| S3 | A trap ends the process: a task cannot fail alone | ceesafec, by design (panic = abort) | the supervisor starts the worker again |
+| S3 | A trap ends the process: a task cannot fail alone | ceesafec, by design (panic = abort) | ceesafec 0.75.0 (ADR 0175) and CeeSafe.Web's Web ADR 0016: under `app.runIsolated` a trap costs its connection; the supervisor still replaces a worker that ends, and recycles one past `recycleCrashes` |
 | S4 | lib/std cannot start a process without waiting for it, signal one, or wait for any child | lib/std | fixed in 0.70.0 and 0.73.1 (ADRs 0169, 0173): the supervisor spawns its workers and hands them what they share (below) |
 | S5 | No allocation budget for a task, and no allocator for `Vector` or `String` but the system's | runtime | fixed in 0.70.0 (`Budget`): `app.budget(bytes)`; a worker's `RLIMIT_AS` is the backstop |
 | S6 | `ProcessSignals` does not survive `fork` | runtime | fixed in ceesafec 0.65.1: a forked child starts with no subscription |
@@ -302,5 +302,19 @@ arm64 (2026-11-19). Three things met on the way:
   `cee_exec_loop`'s jump point for isolated tasks (ADR 0175). Read, not tested: `outer` is set before the
   `setjmp` and not changed before a `longjmp` can come back to it, which C11 §7.13.2.1 says keeps its value, so the
   warning looks like gcc's known false positive for a variable that lives across loop iterations. Declaring it
-  (and `outer_jump`, `outer_depth`) `volatile` would quiet it at no cost worth measuring. httpserver uses no
-  isolated task yet, so the jump point is never set here.
+  (and `outer_jump`, `outer_depth`) `volatile` would quiet it at no cost worth measuring. Built against CeeSafe.Web
+  with `runIsolated`, gcc also names `t` (`:3105`), the task being resumed, which is likewise set before the
+  `setjmp`.
+
+0.75.0 carries ADR 0175, isolated tasks, and CeeSafe.Web's Web ADR 0016 (accepted 2026-11-19) builds
+`ConnectionServer.runIsolated` on it. httpserver has `app.runIsolated`, and `tend` drains a worker past
+`SupervisorOptions.recycleCrashes` or `recycleLeakedBytes`, read from `Isolation.report()`.
+`tools/supervisor_check.py --isolated` (benchmark server with `CW_ISOLATED=1`, `CW_RECYCLE_CRASHES=2`) passes on macOS
+(`--inherit --budget-mb 16`) and Linux (`--memory-mb 512 --budget-mb 16`). Five traps cost five requests and no
+worker, the report counts no crash, two workers were replaced after their second crash, and the stall is still
+caught. CeeSafe.Web's own list (`docs/ceesafe-upstream-work.md`) has what this met in CeeSafe:
+
+- U25, no `trySpawnIsolated`, so HTTP/2 and HTTP/3 streams are not isolated one by one;
+- B21, on macOS a closer cannot end a connection whose peer has already half-closed;
+- B22, `ceesafec test` reports a test whose isolated task trapped as panicked;
+- B23, the interpreter leaks a watched channel made inside its task set's body.

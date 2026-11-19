@@ -33,7 +33,7 @@ this is in [CEESAFE_FINDINGS.md](CEESAFE_FINDINGS.md). Linux and macOS; the supe
 
 You need:
 
-- `ceesafec` 0.73.1 or later ([releases](https://github.com/CeeSafe/CeeSafe/releases), or the
+- `ceesafec` 0.75.0 or later ([releases](https://github.com/CeeSafe/CeeSafe/releases), or the
   [guide](https://ceesafe.github.io/CeeSafe/)'s installation page) and a C compiler (`cc`);
 - for `auth/` only, OpenSSL's libcrypto; for `compress/` only, libzstd and libbrotli
   (`brew install zstd brotli`; `apt install libzstd-dev libbrotli-dev`). The core package needs no C library.
@@ -186,13 +186,13 @@ name = "myserver"
 version = "0.1.0"
 kind = "executable"
 sources = ["src"]
-ceesafec = ">=0.73.1"
+ceesafec = ">=0.75.0"
 
 [dependencies]
 httpserver = { git = "https://github.com/CeeSafe/httpserver.git", rev = "<a commit of this repository>" }
-web_core = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "4bb64c6712d9c876a78d33d0214ea8b875f222ff", dir = "packages/web_core" }
-web_transport = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "4bb64c6712d9c876a78d33d0214ea8b875f222ff", dir = "packages/web_transport" }
-web_http = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "4bb64c6712d9c876a78d33d0214ea8b875f222ff", dir = "packages/web_http" }
+web_core = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "2886ca33bc49dc39b23c7279efd24e72dc205211", dir = "packages/web_core" }
+web_transport = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "2886ca33bc49dc39b23c7279efd24e72dc205211", dir = "packages/web_transport" }
+web_http = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "2886ca33bc49dc39b23c7279efd24e72dc205211", dir = "packages/web_http" }
 ```
 
 The other packages are directories of this repository: add `dir`, as in
@@ -338,6 +338,15 @@ in the parent.
   waiting to be accepted outlive a worker, or each bind the shared port (`reusePort`, Linux), which spreads
   connections evenly.
 
+**A trap can cost one connection instead of a worker.** `app.runIsolated(incoming, acceptor, limits, drain)` serves
+each connection in an isolated task (ceesafec ADR 0175, CeeSafe.Web's `ConnectionServer.runIsolated`, Web ADR 0016).
+A handler that traps ends its connection, whose socket the server shuts, and the worker goes on with the rest. What
+the connection held, memory and its socket, is leaked, and `Isolation.report()` counts it. So `tend` drains a worker
+whose isolated tasks have trapped `recycleCrashes` times (100 by default) or leaked `recycleLeakedBytes` (64 MiB),
+and the supervisor starts it again. A trap under a C library's callback, or inside a `Critical`, still ends the
+worker, as does a computation that never awaits. HTTP/2 streams are not isolated one by one yet: CeeSafe.Web waits
+for a non-waiting isolated spawn from CeeSafe (its U25).
+
 What it costs: the requests in flight on a worker that ends get no answer, and the workers share no memory, so a
 counter or a cache is per worker unless it is put somewhere they share. `SharedWords` is such a place for numbers:
 words the parent maps and hands to every worker, changed only atomically, with no locks and no pointers in them, so
@@ -351,10 +360,11 @@ the benchmark server). Nothing blocks: a reader that falls a whole ring behind s
 another worker's session sent (`Hub.encode` makes it). The bus is one machine's; across machines a broker is
 needed.
 
-`python3 tools/supervisor_check.py [--inherit] [--memory-mb 512] [--budget-mb 16]` checks all of this against the
-benchmark server: five traps, a handler that never returns and one that takes memory until it fails, each followed
-by the server still answering. On macOS add `--inherit`: without it the kernel gives every connection to one
-worker.
+`python3 tools/supervisor_check.py [--inherit] [--memory-mb 512] [--budget-mb 16] [--isolated]` checks all of this
+against the benchmark server: five traps, a handler that never returns and one that takes memory until it fails,
+each followed by the server still answering. With `--isolated` the traps cost their requests and no worker, and a
+worker whose tasks trapped twice is replaced. On macOS add `--inherit`: without it the kernel gives every connection
+to one worker.
 
 The shared memory is ceesafec's `SharedMemory` with no name (`SharedMemory.anonymous`), which a process reaches
 only by being handed it, so a supervisor that is killed leaves nothing behind. The supervisor starts, watches and
@@ -487,11 +497,11 @@ python3 tools/ws_check.py         # the hub, with WebSocket clients written from
 python3 tools/ws_check.py --workers 4   # the same over four workers and the bus (add --inherit on macOS)
 ```
 
-The compiler: ceesafec 0.73.1 or later. It is the release that has `Process.spawnWith` and
-`SharedMemory.anonymous` (ADR 0173), with which the supervisor starts its workers and hands them what they share;
-`Budget`, for a request's memory, came with 0.70.0, and the stock middleware are impls for every application state,
-which 0.68.0 accepts. CeeSafe.Web at the pinned revision needs 0.62.2. CI runs 0.75.0. The supervisor is POSIX only:
-it declares `setrlimit` from `sys/resource.h` for `memoryBytes`.
+The compiler: ceesafec 0.75.0 or later. It is the release that has isolated tasks (ADR 0175), which
+`app.runIsolated` serves connections in; `Process.spawnWith` and `SharedMemory.anonymous` (ADR 0173, 0.73.1) start the
+workers and hand them what they share, `Budget`, for a request's memory, came with 0.70.0, and the stock middleware
+are impls for every application state, which 0.68.0 accepts. CeeSafe.Web at the pinned revision needs 0.75.0 too.
+The supervisor is POSIX only: it declares `setrlimit` from `sys/resource.h` for `memoryBytes`.
 
 ## License
 

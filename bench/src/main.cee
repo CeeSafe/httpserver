@@ -11,7 +11,7 @@
 //                        more middleware)
 //   POST /stop           starts the drain
 //   GET  /worker         which worker process answered
-//   GET  /crash          traps (an index out of bounds), which ends the process
+//   GET  /crash          traps (an index out of bounds), which ends the process, or with CW_ISOLATED=1 its connection
 //   GET  /spin           computes without end, which stops the event loop
 //   GET  /kept/{n:int}   the same text through the output cache, kept for a minute
 //   GET  /gz/{n:int}     n bytes of JSON-like text through `Compression`: gzip for a client that accepts it
@@ -23,6 +23,9 @@
 // CW_PROCS=n runs n worker processes under the supervisor (src/supervisor.cee), which starts a worker again when it
 // ends and kills one whose loop has stopped; CW_MEMORY_MB limits each worker's address space; CW_BUDGET_MB each request's memory; CW_INHERIT=1 has the
 // workers accept from one socket the supervisor bound, instead of each binding the shared port.
+//
+// CW_ISOLATED=1 serves each connection in an isolated task (`App.runIsolated`): a trap costs its connection, not the
+// worker, and a worker is replaced after CW_RECYCLE_CRASHES crashes (100 by default).
 //
 // CW_BUS=1 gives the workers a bus: `/bus/say/{n}` says n to all of them, `/bus/heard` answers the worker and the
 // last number it heard, and `/forget/{n}` has every worker forget `/kept/{n}`.
@@ -717,8 +720,18 @@ async fn serve(
     // The server owns the application, so its child moves it; the rest is lent to both.
     let bounds = borrow limits;
     let draining = borrow drain;
+    let isolated = setting("CW_ISOLATED", 0) == 1;
     let r: Result<Raced<ServerReport>, NetError> = await Async.race(
-        async move () => await app.run(listener, PlainAcceptor {}, bounds, draining),
+        async move () => {
+            if (isolated) {
+                let acceptor: Box<dyn Acceptor + Send + Share> = match (Box.create(PlainAcceptor {})) {
+                    Ok(b) => b,
+                    Err(_) => { return Err(NetError.OutOfMemory); },
+                };
+                return await app.runIsolated(listener, acceptor, bounds, draining);
+            }
+            return await app.run(listener, PlainAcceptor {}, bounds, draining);
+        },
         async move () => await housekeeping(worker, draining, port, ears),
     );
     return match (r) {
@@ -855,6 +868,7 @@ fn main() {
     options.stallMs = setting("CW_STALL_MS", 2000);
     options.graceMs = 3000;
     options.memoryBytes = setting("CW_MEMORY_MB", 0) * 1048576;
+    options.recycleCrashes = setting("CW_RECYCLE_CRASHES", 100);
     // This program runs again in each worker, which makes the same calls in the same order and is handed what the
     // parent made.
     var supervisor = match (Supervisor.create(options)) {

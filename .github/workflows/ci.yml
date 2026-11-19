@@ -13,7 +13,7 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
-  CEESAFE_VERSION: v0.75.0 # the release the packages were last tested with and are formatted by; their manifests ask for 0.73.1 or later
+  CEESAFE_VERSION: v0.75.0 # the release the packages were last tested with and are formatted by; their manifests ask for 0.75.0 or later
 
 jobs:
   test:
@@ -81,7 +81,10 @@ jobs:
           if [ "$RUNNER_OS" = macOS ]; then echo "INHERIT=--inherit" >> "$GITHUB_ENV"; else echo "INHERIT=" >> "$GITHUB_ENV"; fi
 
       - name: The supervisor
-        run: python3 tools/supervisor_check.py $INHERIT --budget-mb 16
+        run: |
+          set -e
+          python3 tools/supervisor_check.py $INHERIT --budget-mb 16
+          python3 tools/supervisor_check.py $INHERIT --budget-mb 16 --isolated --port 18491
 
       - name: Compressed responses
         run: python3 tools/gzip_check.py

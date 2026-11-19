@@ -51,10 +51,24 @@ public struct SupervisorOptions {
     public memoryBytes: u64;
     /// Whether to say on standard output when a worker starts, ends or is killed.
     public log: bool;
+    /// Under `App.runIsolated`, a worker whose isolated tasks have trapped this many times drains and ends, and is
+    /// started again (`tend` watches `Isolation.report()`): each crash leaks what its connection held, its socket
+    /// among it. 0 for no such bound.
+    public recycleCrashes: u64;
+    /// The same for the bytes the crashes leaked. 0 for no such bound.
+    public recycleLeakedBytes: u64;
 
-    /// `workers` workers, a 5 s watch, a 10 s grace, no memory limit, and the log.
-    public fn defaults(workers: u32) -> SupervisorOptions =>
-        SupervisorOptions { workers: workers, stallMs: 5000, graceMs: 10000, memoryBytes: 0, log: true };
+    /// `workers` workers, a 5 s watch, a 10 s grace, no memory limit, the log, and a worker replaced after 100
+    /// crashes or 64 MiB leaked by them.
+    public fn defaults(workers: u32) -> SupervisorOptions => SupervisorOptions {
+        workers: workers,
+        stallMs: 5000,
+        graceMs: 10000,
+        memoryBytes: 0,
+        log: true,
+        recycleCrashes: 100,
+        recycleLeakedBytes: 64 * 1048576,
+    };
 }
 
 /// What happened while the supervisor ran.
@@ -93,9 +107,24 @@ public struct Worker {
     private place: u32;
     /// The address of its word of the page of beats; 0 without a supervisor.
     private slot: usize;
+    /// `SupervisorOptions.recycleCrashes` and `recycleLeakedBytes`; 0 for none.
+    private crashLimit: u64;
+    private leakLimit: u64;
 
-    /// A worker without a supervisor: the whole server in one process. Its beat goes nowhere.
-    public fn alone() -> Worker => Worker { place: 0, slot: 0 };
+    /// A worker without a supervisor: the whole server in one process. Its beat goes nowhere, and it is never
+    /// recycled.
+    public fn alone() -> Worker => Worker { place: 0, slot: 0, crashLimit: 0, leakLimit: 0 };
+
+    /// Whether the isolated tasks of this process have cost it more than the supervisor allows: then it should drain
+    /// and end, to be started again.
+    public fn spent(borrow this) -> bool {
+        if (this.crashLimit == 0 && this.leakLimit == 0) {
+            return false;
+        }
+        let report = Isolation.report();
+        return (this.crashLimit != 0 && report.crashes >= this.crashLimit) ||
+            (this.leakLimit != 0 && report.leakedBytes >= this.leakLimit);
+    }
 
     /// Which worker this is: 0 to the count less one.
     public fn index(borrow this) -> u32 => this.place;
@@ -307,7 +336,12 @@ public struct Supervisor {
                     unsafe { setrlimit(RLIMIT_AS, borrow limit[0] as *u64 as *rlimit); }
                 }
                 let slot = this.beats + i as usize * 8;
-                Process.exit(main.run(Worker { place: i, slot: slot }));
+                Process.exit(main.run(Worker {
+                    place: i,
+                    slot: slot,
+                    crashLimit: this.options.recycleCrashes,
+                    leakLimit: this.options.recycleLeakedBytes,
+                }));
             }
             null => {}
         }
@@ -591,16 +625,25 @@ async fn watch(
 }
 
 /// A worker's housekeeping, to race against its server (`Async.race(server, tend<ServerReport>(…))`): beats every
-/// `everyMs`, and starts `drain` when the process is asked to stop (SIGTERM or SIGINT), so the server finishes what
-/// is in flight and returns. It returns only an error.
+/// `everyMs`, and starts `drain` when the process is asked to stop (SIGTERM or SIGINT), or when its isolated tasks
+/// have cost it more than the supervisor allows (`Worker.spent`), so the server finishes what is in flight and
+/// returns; the supervisor then starts the worker again. It returns only an error.
 public async fn tend<T>(worker: Worker, drain: borrow Drain, everyMs: u64) -> Result<T, NetError> {
     // A subscription that fails (another holds it) leaves the signals to their holder.
     let signals = match (ProcessSignals.subscribe()) {
         Ok(s) => Some(s),
         Err(_) => null,
     };
+    var recycling = false;
     loop {
         worker.beat();
+        if (!recycling && worker.spent()) {
+            recycling = true;
+            let _ = await AsyncConsole.writeLine(
+                "worker: its isolated tasks' crashes passed the bound: draining, to be replaced",
+            );
+            drain.start();
+        }
         match (borrow signals) {
             Some(s) => {
                 if (s.poll().isSome()) {

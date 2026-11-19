@@ -395,6 +395,38 @@ public struct App<S: Send + Share> {
         let service = Service { app: app, httpLimits: httpLimits };
         return await ConnectionServer.run(incoming, acceptor, service, limits, drain);
     }
+
+    /// `run`, with each connection in an isolated task (CeeSafe.Web's `ConnectionServer.runIsolated`, Web ADR 0016;
+    /// ceesafec ADR 0175): a handler that traps ends its connection, whose socket is shut, and the server goes on. What
+    /// the connection held is leaked; `Isolation.report()` counts it, and a supervised worker is replaced past the bound
+    /// its options set (`SupervisorOptions.recycleCrashes`, `recycleLeakedBytes`). A trap in a C library's callback, or
+    /// in a `Critical`, still ends the process.
+    public async fn runIsolated(
+        this,
+        incoming: borrow dyn Incoming,
+        acceptor: Box<dyn Acceptor + Send + Share>,
+        limits: borrow ConnectionLimits,
+        drain: borrow Drain,
+    ) -> Result<ServerReport, NetError> {
+        let httpLimits = this.httpLimits;
+        let app = applicationOf(this)?;
+        let boxed: Box<dyn ConnectionHandler + Send + Share> = match (Box.create(Service {
+            app: app,
+            httpLimits: httpLimits,
+        })) {
+            Ok(b) => b,
+            Err(_) => { return Err(NetError.OutOfMemory); },
+        };
+        let handler = match (Arc<Box<dyn ConnectionHandler + Send + Share>>.create(boxed)) {
+            Ok(h) => h,
+            Err(_) => { return Err(NetError.OutOfMemory); },
+        };
+        let accepting = match (Arc<Box<dyn Acceptor + Send + Share>>.create(acceptor)) {
+            Ok(a) => a,
+            Err(_) => { return Err(NetError.OutOfMemory); },
+        };
+        return await ConnectionServer.runIsolated(incoming, accepting, handler, limits, drain);
+    }
 }
 
 /// `app` as a shared `web_http` application, which it owns from now on: what `run` serves over TCP, and what
