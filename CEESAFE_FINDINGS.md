@@ -8,7 +8,7 @@ Bugs and gaps in CeeSafe and CeeSafe.Web met while writing httpserver, with cees
 | S1 | An integer literal inside a parenthesised `if` expression does not take the type the outer `if` expects | ceesafec | fixed in ceesafec 0.65.1 |
 | S2 | A server runs on one thread: nothing serves one listener from several cores | CeeSafe.Web, runtime | measured; the supervisor's worker processes are the way round it |
 | S3 | A trap ends the process: a task cannot fail alone | ceesafec, by design (panic = abort) | the supervisor starts the worker again |
-| S4 | lib/std cannot start a process without waiting for it, signal one, or wait for any child | lib/std | `Process.spawn` in 0.70.0; the supervisor still forks (below) |
+| S4 | lib/std cannot start a process without waiting for it, signal one, or wait for any child | lib/std | fixed in 0.70.0 and 0.73.1 (ADRs 0169, 0173): the supervisor spawns its workers and hands them what they share (below) |
 | S5 | No allocation budget for a task, and no allocator for `Vector` or `String` but the system's | runtime | fixed in 0.70.0 (`Budget`): `app.budget(bytes)`; a worker's `RLIMIT_AS` is the backstop |
 | S6 | `ProcessSignals` does not survive `fork` | runtime | fixed in ceesafec 0.65.1: a forked child starts with no subscription |
 | S7 | A struct without type parameters cannot implement a generic interface for every argument (`impl<S> Middleware<S> for Cors`) | ceesafec (N0267) | fixed in ceesafec 0.68.0 (ADR 0165, for one state type a program): `Filter` is gone, and `Cors` and the others are `impl<S: Send + Share> Middleware<S>` |
@@ -276,3 +276,31 @@ nothing in `/dev/shm`. Two things met on the way:
 - **The supervisor still forks**, and `fork`, `waitpid`, `kill` and `setrlimit` are still declared. Workers that
   are spawned would open the memory by a name they are told, which is now possible, but on macOS they would also
   need the listening socket handed to them, which is not (ADR 0172 §4).
+
+0.73.1 carries ADR 0173, what a child is handed: `Handover`, `Process.spawnWith`, `Process.inherited()` and
+`SharedMemory.anonymous`. With it the supervisor no longer forks (`src/supervisor.cee`, checked with 0.75.0). A
+worker is the program started again (`Process.executable()`, its arguments and `--httpserver-worker=<index>`); it
+runs `main`, makes the same `Supervisor`, and takes back, place by place, what the parent made through it: the page
+of beats, the shared words, the bus and the listening socket. The parent's loop is an `Async.run` that polls each
+`ChildProcess` and a `ProcessSignals` subscription on a 20 ms timer, and ends a worker with `terminate` or `kill`.
+`fork`, `waitpid`, `kill`, `signal`, `usleep` and the `@callback` are gone; `setrlimit` stays, for `memoryBytes`,
+which the worker now sets on itself before it serves. `tools/supervisor_check.py --inherit --budget-mb 16`,
+`ratelimit_check.py --inherit`, `bus_check.py --inherit` and `ws_check.py --workers 3 --inherit` pass on macOS
+arm64 (2026-11-19). Three things met on the way:
+
+- **`Process.executable()` may block** (N0295 in the parent's async loop: `ceesafe_host_executable` is
+  `@effects(sleep)`), so the supervisor reads the path once before its loop. `spawnWith` and `poll` do not block.
+- **web_transport's `Listener` cannot be handed over or made from a socket that was**: its `AsyncTcpListener` is
+  private, and `Handover.listener` takes an `AsyncTcpListener`. httpserver has `SharedListener`, its own `Incoming`
+  over an `AsyncTcpListener`, which does what `Listener.accept` does (TCP_NODELAY on). A `Listener.adopt(l)` and a
+  `listener.socket()` in web_transport would let a program use the one type.
+- **A worker is told which one it is by an argument**, since `ChildOptions` has no environment of its own for a
+  child. The program then sees one argument more than it was given. An environment variable for one child, or a
+  number in the handover, would leave the arguments alone.
+- **gcc 13.3 warns about the 0.75.0 runtime** (`-Wclobbered`) when the benchmark server is built on Linux
+  (Ubuntu 24.04): `ceesafe_rt_async.c:3126: variable 'outer' might be clobbered by 'longjmp'`, in
+  `cee_exec_loop`'s jump point for isolated tasks (ADR 0175). Read, not tested: `outer` is set before the
+  `setjmp` and not changed before a `longjmp` can come back to it, which C11 §7.13.2.1 says keeps its value, so the
+  warning looks like gcc's known false positive for a variable that lives across loop iterations. Declaring it
+  (and `outer_jump`, `outer_depth`) `volatile` would quiet it at no cost worth measuring. httpserver uses no
+  isolated task yet, so the jump point is never set here.

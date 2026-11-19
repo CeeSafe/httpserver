@@ -33,7 +33,7 @@ this is in [CEESAFE_FINDINGS.md](CEESAFE_FINDINGS.md). Linux and macOS; the supe
 
 You need:
 
-- `ceesafec` 0.71.0 or later ([releases](https://github.com/CeeSafe/CeeSafe/releases), or the
+- `ceesafec` 0.73.1 or later ([releases](https://github.com/CeeSafe/CeeSafe/releases), or the
   [guide](https://ceesafe.github.io/CeeSafe/)'s installation page) and a C compiler (`cc`);
 - for `auth/` only, OpenSSL's libcrypto; for `compress/` only, libzstd and libbrotli
   (`brew install zstd brotli`; `apt install libzstd-dev libbrotli-dev`). The core package needs no C library.
@@ -186,7 +186,7 @@ name = "myserver"
 version = "0.1.0"
 kind = "executable"
 sources = ["src"]
-ceesafec = ">=0.71.0"
+ceesafec = ">=0.73.1"
 
 [dependencies]
 httpserver = { git = "https://github.com/CeeSafe/httpserver.git", rev = "<a commit of this repository>" }
@@ -304,18 +304,29 @@ HTTP/3, give `applicationOf(app)` to `web_http3`'s server. Both are CeeSafe.Web'
 
 ## One process per core, supervised
 
-A trap in CeeSafe ends its process (CEESAFE_FINDINGS.md, S3), and an event loop is one thread. `supervise` runs the
-server as worker processes, each with its own memory, loop and core, under a parent that does nothing but watch:
+A trap in CeeSafe ends its process (CEESAFE_FINDINGS.md, S3), and an event loop is one thread. A `Supervisor` runs
+the server as worker processes, each with its own memory, loop and core, under a parent that does nothing but watch.
+A worker is the same program started again (`Process.spawnWith`), so `main` runs in every process, makes the same
+`Supervisor`, and asks it for what the workers share in the same order; the parent makes each thing and hands it to
+the workers, and a worker takes it back:
 
 ```ceesafe
-struct Server { listener: Listener?; }
+struct Server { listener: SharedListener; words: SharedWords; }
 
 impl WorkerMain for Server {
     fn run(borrow this, worker: Worker) -> i32 { /* Async.run of the server; see bench/src/main.cee */ }
 }
 
-// supervise(Server { listener: Some(bound) }, SupervisorOptions.defaults(4))
+fn supervised() -> Result<SupervisorReport, SupervisorError> {
+    var supervisor = Supervisor.create(SupervisorOptions.defaults(4))?;
+    let words = supervisor.words(4096)?;                           // made in the parent, taken in a worker
+    let listener = supervisor.listener(address, listenOptions)?;   // bound in the parent, taken in a worker
+    return supervisor.run(Server { listener: listener, words: words });   // in a worker, never returns
+}
 ```
+
+A worker is told which one it is by its last argument, `--httpserver-worker=<index>`; `supervisor.worker()` is null
+in the parent.
 
 - A worker that ends, however it ends, is started again, after a growing pause if it keeps ending at once.
 - A worker whose loop stops turning (a computation that never awaits) stops beating and is killed after `stallMs`.
@@ -323,13 +334,14 @@ impl WorkerMain for Server {
   backstop for `app.budget`, which bounds each request on every system.
 - SIGTERM or SIGINT to the parent is passed on; the workers drain (`tend`), and those still there after `graceMs`
   are killed.
-- The workers either inherit one listening socket from the parent, so connections waiting to be accepted outlive a
-  worker, or each bind the shared port (`reusePort`, Linux), which spreads connections evenly.
+- The workers either accept from one listening socket the parent bound (`supervisor.listener`), so connections
+  waiting to be accepted outlive a worker, or each bind the shared port (`reusePort`, Linux), which spreads
+  connections evenly.
 
 What it costs: the requests in flight on a worker that ends get no answer, and the workers share no memory, so a
 counter or a cache is per worker unless it is put somewhere they share. `SharedWords` is such a place for numbers:
-words mapped before the workers are forked and changed only atomically, with no locks and no pointers in them, so a
-worker that traps cannot leave the others anything half written. `RateLimit.shared` counts there.
+words the parent maps and hands to every worker, changed only atomically, with no locks and no pointers in them, so
+a worker that traps cannot leave the others anything half written. `RateLimit.shared` counts there.
 
 For events there is `Bus`: each worker publishes into a ring of its own in shared memory and the others read it on
 a timer (`carry`, raced against the server as `tend` is), so a message reaches them within that interval (5 ms in
@@ -344,10 +356,10 @@ benchmark server: five traps, a handler that never returns and one that takes me
 by the server still answering. On macOS add `--inherit`: without it the kernel gives every connection to one
 worker.
 
-The shared memory is ceesafec's `SharedMemory`, made under a name that is taken away at once, so a supervisor that
-is killed leaves nothing behind. The supervisor itself forks its workers, through `fork`, `waitpid` and `kill`
-declared from C: CEESAFE_FINDINGS.md says what the language would need for it to start them as new programs
-instead.
+The shared memory is ceesafec's `SharedMemory` with no name (`SharedMemory.anonymous`), which a process reaches
+only by being handed it, so a supervisor that is killed leaves nothing behind. The supervisor starts, watches and
+stops its workers with lib/std's `Process.spawnWith`, `ChildProcess` and `ProcessSignals`; the one thing it still
+declares from C is `setrlimit`, for `memoryBytes`.
 
 ## What is not here yet
 
@@ -475,10 +487,11 @@ python3 tools/ws_check.py         # the hub, with WebSocket clients written from
 python3 tools/ws_check.py --workers 4   # the same over four workers and the bus (add --inherit on macOS)
 ```
 
-The compiler: ceesafec 0.71.0 or later. It is the release that has `SharedMemory`, which the workers' shared words
-are made with; `Budget`, for a request's memory, came with 0.70.0, and the stock middleware are impls for every
-application state, which 0.68.0 accepts. CeeSafe.Web at the pinned revision needs 0.62.2. The supervisor is POSIX
-only.
+The compiler: ceesafec 0.73.1 or later. It is the release that has `Process.spawnWith` and
+`SharedMemory.anonymous` (ADR 0173), with which the supervisor starts its workers and hands them what they share;
+`Budget`, for a request's memory, came with 0.70.0, and the stock middleware are impls for every application state,
+which 0.68.0 accepts. CeeSafe.Web at the pinned revision needs 0.62.2. CI runs 0.75.0. The supervisor is POSIX only:
+it declares `setrlimit` from `sys/resource.h` for `memoryBytes`.
 
 ## License
 

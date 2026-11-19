@@ -1,41 +1,16 @@
 // Memory the supervisor's workers share: words, each changed atomically.
 //
-// It is mapped before the workers are forked, so every worker has it at the same place. The memory is ceesafec's
-// `SharedMemory` (0.71.0), with its name taken away at once: the workers have it by being forked, nothing finds it
-// by name, and a supervisor that is killed leaves nothing behind. Only words go in it: no
-// locks, no pointers, nothing that is allocated. A worker that traps half way through a change has then changed one
-// word or not, and cannot leave the others something half written to trust or a lock nobody will release.
+// It is ceesafec's `SharedMemory` with no name (`SharedMemory.anonymous`, ADR 0173): the supervisor makes it in the
+// parent and hands it to each worker it starts (`Supervisor.words`), so nothing else finds it, and a supervisor that
+// is killed leaves nothing behind. Only words go in it: no locks, no pointers, nothing that is allocated. A worker
+// that traps half way through a change has then changed one word or not, and cannot leave the others something
+// half written to trust or a lock nobody will release.
 import web_core;
 
-/// Counts the mappings this process has made, for their names.
-static MAPPINGS: AtomicU64 = AtomicU64.constant(0);
-
-/// The address of `bytes` bytes of zeroed memory shared with the processes forked from this one, kept for the life
-/// of the process; null if the system gives none.
-/// Safety: the vector that held the mapping's value is rebuilt empty from its own pointer and capacity, so its
-/// buffer is freed and the value is never dropped or read again.
-fn sharedBytes(bytes: usize) -> usize? {
-    // A name of this process's own: "hs-<process id>-<which>". One left by a process that was killed between the
-    // two calls below, and had this id, is taken away and the name tried again.
-    var text = [0u8; 30];
-    var w = TextWriter.create(mut text[..]);
-    w.text("hs-");
-    w.decimal(Process.id());
-    w.text("-");
-    w.decimal(MAPPINGS.fetchAdd(1));
-    let name = StringView.fromUtf8(w.written()) ?? { return null; };
-    let memory = match (SharedMemory.create(name, bytes)) {
-        Ok(m) => m,
-        Err(IoError.AlreadyExists) => {
-            let _ = SharedMemory.remove(name);
-            match (SharedMemory.create(name, bytes)) {
-                Ok(m) => m,
-                Err(_) => { return null; },
-            }
-        },
-        Err(_) => { return null; },
-    };
-    let _ = SharedMemory.remove(name);
+/// The address of `memory`, which stays mapped for the life of the process; null if there is no memory to keep it.
+/// Safety: the vector that held the value is rebuilt empty from its own pointer and capacity, so its buffer is freed
+/// and the value is never dropped or read again.
+fn kept(memory: SharedMemory) -> usize? {
     let base = memory.address() as usize;
     // Never unmapped: the value goes into a vector that is taken apart, so it is not dropped, and the vector's
     // buffer is given back as that of an empty one.
@@ -49,23 +24,42 @@ fn sharedBytes(bytes: usize) -> usize? {
     return Some(base);
 }
 
-/// So many 64-bit words shared by this process and the processes forked from it, all zero at first. Make it before
-/// `supervise`; it stays mapped for the life of the process.
+/// The address of `bytes` bytes of zeroed memory of this process's own, kept for the life of the process; null if
+/// the system gives none.
+fn sharedBytes(bytes: usize) -> usize? {
+    match (SharedMemory.anonymous(bytes)) {
+        Ok(m) => { return kept(m); }
+        Err(_) => { return null; }
+    }
+}
+
+/// So many 64-bit words, all zero at first, changed only atomically: shared by the supervisor's workers when made by
+/// `Supervisor.words`, this process's own when made by `create`. It stays mapped for the life of the process.
 public struct SharedWords {
     /// The mapping's address. A number, not a pointer: a struct that holds a raw pointer is not Send, and this one
     /// is for every thread and process to use.
     private base: usize;
     private count: usize;
 
-    /// `count` words (rounded up to a power of two, at least 64), or null if the system gives no shared memory.
+    /// `count` words (rounded up to a power of two, at least 64) of this process's own, or null if the system
+    /// gives no memory. For workers to share, `Supervisor.words`.
     public fn create(count: usize) -> SharedWords? {
+        let size = SharedWords.sizeFor(count);
+        let base = sharedBytes(size * 8) ?? { return null; };
+        return Some(SharedWords { base: base, count: size });
+    }
+
+    /// How many words `count` is rounded up to.
+    fn sizeFor(count: usize) -> usize {
         var size: usize = 64;
         while (size < count) {
             size *= 2;
         }
-        let base = sharedBytes(size * 8) ?? { return null; };
-        return Some(SharedWords { base: base, count: size });
+        return size;
     }
+
+    /// The words at `base`, which is `size` words kept for the life of the process.
+    fn at(base: usize, size: usize) -> SharedWords => SharedWords { base: base, count: size };
 
     /// How many words there are: a power of two.
     public fn length(this) -> usize => this.count;

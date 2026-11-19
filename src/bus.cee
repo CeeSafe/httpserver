@@ -1,6 +1,6 @@
 // A bus between the supervisor's workers: what one publishes, the others receive.
 //
-// Each worker has a ring of bytes in memory mapped before the workers are forked. Only its worker writes a ring;
+// Each worker has a ring of bytes in memory the supervisor hands every worker (`Supervisor.bus`). Only its worker writes a ring;
 // the others read it, each from a place of its own. Nothing waits for anything: a writer never blocks on a reader,
 // and a reader that falls a whole ring behind skips to the newest and counts that it missed something. A worker
 // that traps while writing leaves a message nobody was told of; the worker started in its place goes on from the
@@ -17,7 +17,7 @@ const RECORD: u64 = 8;
 /// is in `publish`, and one to spare.
 const HEADER: usize = 32;
 
-/// The rings the workers publish in. Make it before `supervise`, and have each worker `join`.
+/// The rings the workers publish in: `Supervisor.bus`, and each worker `join`s.
 public struct Bus {
     /// The mapping's address (a number: see `SharedWords`).
     private base: usize;
@@ -25,20 +25,32 @@ public struct Bus {
     /// A ring's bytes: a power of two.
     private size: u64;
 
-    /// Rings for `workers` workers of `ringBytes` each (rounded up to a power of two, at least 4096), or null if
-    /// the system gives no shared memory. A message may be a quarter of a ring at most.
+    /// Rings for `workers` workers of `ringBytes` each (rounded up to a power of two, at least 4096), in memory of
+    /// this process's own, or null if the system gives none: for tests. For workers to share, `Supervisor.bus`. A
+    /// message may be a quarter of a ring at most.
     public fn create(workers: u32, ringBytes: usize) -> Bus? {
         if (workers == 0 || workers > maxWorkers()) {
             return null;
         }
+        let size = Bus.ringFor(ringBytes);
+        let base = sharedBytes(Bus.bytesFor(workers, size)) ?? { return null; };
+        return Some(Bus.at(base, workers, size));
+    }
+
+    /// The size of a ring of `ringBytes`: a power of two, at least 4096.
+    fn ringFor(ringBytes: usize) -> usize {
         var size: usize = 4096;
         while (size < ringBytes) {
             size *= 2;
         }
-        let length = workers as usize * (HEADER + size);
-        let base = sharedBytes(length) ?? { return null; };
-        return Some(Bus { base: base, rings: workers, size: size as u64 });
+        return size;
     }
+
+    /// The bytes of `workers` rings of `size`.
+    fn bytesFor(workers: u32, size: usize) -> usize => workers as usize * (HEADER + size);
+
+    /// The rings at `base`, which is `bytesFor(workers, size)` bytes kept for the life of the process.
+    fn at(base: usize, workers: u32, size: usize) -> Bus => Bus { base: base, rings: workers, size: size as u64 };
 
     /// How many workers the bus is for.
     public fn workers(this) -> u32 => this.rings;

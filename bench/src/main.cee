@@ -665,11 +665,14 @@ async fn say(text: StringView) -> Result<void, NetError> {
 }
 
 /// The listener for `CW_PORT`; `shared`: other processes may bind the same port (SO_REUSEPORT).
-fn listening(shared: bool) -> Result<Listener, NetError> {
+fn listening(shared: bool) -> Result<Listener, NetError> =>
+    Listener.bindWith(address(), ListenOptions { backlog: 0, reuseAddress: true, reusePort: shared, v6Only: false });
+
+/// `CW_PORT` on the loopback address.
+fn address() -> SocketAddress {
     let p = setting("CW_PORT", 8090);
     let port = if (p > 0 && p < 65536) truncate<u16>(p) else 8090;
-    let options = ListenOptions { backlog: 0, reuseAddress: true, reusePort: shared, v6Only: false };
-    return Listener.bindWith(SocketAddresses.v4Loopback(port), options);
+    return SocketAddresses.v4Loopback(port);
 }
 
 /// A worker's housekeeping: `tend`, and with a port the reading of the bus beside it.
@@ -700,7 +703,7 @@ async fn housekeeping(
 async fn serve(
     app: App<St>,
     worker: Worker,
-    listener: borrow Listener,
+    listener: borrow dyn web_transport.Incoming,
     port: BusPort?,
     ears: Ears,
 ) -> Result<ServerReport, NetError> {
@@ -769,7 +772,7 @@ fn wired(worker: Worker, words: SharedWords?, bus: Bus?) -> Parts? {
 }
 
 /// One process's server on `listener`; the status it exits with.
-fn serveOn(worker: Worker, listener: borrow Listener, words: SharedWords?, bus: Bus?) -> i32 {
+fn serveOn(worker: Worker, listener: borrow dyn web_transport.Incoming, words: SharedWords?, bus: Bus?) -> i32 {
     let made = wired(worker, words, bus);
     let parts = made ?? {
         Console.writeLine("bench: no memory");
@@ -800,7 +803,7 @@ fn serveOn(worker: Worker, listener: borrow Listener, words: SharedWords?, bus: 
 /// connection waiting to be accepted outlives a worker that ends; without, each binds its own to the shared port, and
 /// the kernel gives each connection to one of them (Linux), which spreads the load evenly.
 struct Bench {
-    listener: Listener?;
+    listener: SharedListener?;
     /// The counters the workers' rate limit shares (CW_SHARED=1).
     words: SharedWords?;
     /// The workers' bus (CW_BUS=1).
@@ -823,6 +826,20 @@ impl WorkerMain for Bench {
     }
 }
 
+/// Why the supervisor could not run, on standard output, and the end of the process.
+fn failed(e: SupervisorError) -> never {
+    Console.writeLine(match (e) {
+        SupervisorError.BadOptions => "bench: CW_PROCS is not 1 to 256",
+        SupervisorError.NoSharedMemory => "bench: no shared memory",
+        SupervisorError.CannotHand => "bench: the workers cannot be handed what they share",
+        SupervisorError.NotHanded => "bench: this worker was not handed what it shares",
+        SupervisorError.CannotListen => "bench: cannot listen on CW_PORT",
+        SupervisorError.CannotStart => "bench: cannot start a worker",
+        SupervisorError.CannotWatch => "bench: the supervisor could not run",
+    });
+    Process.exit(1);
+}
+
 fn main() {
     let procs = setting("CW_PROCS", 0);
     if (procs == 0) {
@@ -838,25 +855,37 @@ fn main() {
     options.stallMs = setting("CW_STALL_MS", 2000);
     options.graceMs = 3000;
     options.memoryBytes = setting("CW_MEMORY_MB", 0) * 1048576;
-    Console.writeLine("bench: supervising");
-    // CW_INHERIT=1: the supervisor binds the port and the workers inherit the socket.
+    // This program runs again in each worker, which makes the same calls in the same order and is handed what the
+    // parent made.
+    var supervisor = match (Supervisor.create(options)) {
+        Ok(s) => s,
+        Err(e) => { failed(e); },
+    };
+    if (supervisor.worker().isNull()) {
+        Console.writeLine("bench: supervising");
+    }
     var bench = Bench { listener: null, words: null, bus: null };
     if (setting("CW_BUS", 0) == 1) {
-        bench.bus = Bus.create(truncate<u32>(procs), 65536);
-    }
-    if (setting("CW_SHARED", 0) == 1) {
-        bench.words = SharedWords.create(4096);
-    }
-    if (setting("CW_INHERIT", 0) == 1) {
-        match (listening(false)) {
-            Ok(l) => { bench.listener = Some(l); }
-            Err(e) => {
-                Console.writeLine(NetErrors.describe(e));
-                Process.exit(1);
-            }
+        match (supervisor.bus(65536)) {
+            Ok(b) => { bench.bus = Some(b); }
+            Err(e) => { failed(e); }
         }
     }
-    match (supervise(bench, options)) {
+    if (setting("CW_SHARED", 0) == 1) {
+        match (supervisor.words(4096)) {
+            Ok(w) => { bench.words = Some(w); }
+            Err(e) => { failed(e); }
+        }
+    }
+    // CW_INHERIT=1: the supervisor binds the port and the workers accept from its socket.
+    if (setting("CW_INHERIT", 0) == 1) {
+        let shared = ListenOptions { backlog: 0, reuseAddress: true, reusePort: false, v6Only: false };
+        match (supervisor.listener(address(), shared)) {
+            Ok(l) => { bench.listener = Some(l); }
+            Err(e) => { failed(e); }
+        }
+    }
+    match (supervisor.run(bench)) {
         Ok(report) => {
             Console.writeLine("bench: started, crashed, stalled, killed");
             Console.writeLine(report.started);
@@ -864,9 +893,6 @@ fn main() {
             Console.writeLine(report.stalled);
             Console.writeLine(report.killed);
         }
-        Err(_) => {
-            Console.writeLine("bench: the supervisor could not run");
-            Process.exit(1);
-        }
+        Err(e) => { failed(e); }
     }
 }

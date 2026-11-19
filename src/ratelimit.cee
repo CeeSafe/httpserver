@@ -42,7 +42,7 @@ public struct RateLimit {
         });
     }
 
-    /// The same limit counted by every worker of a supervisor together, in `words` (made before `supervise`; a word a
+    /// The same limit counted by every worker of a supervisor together, in `words` (`Supervisor.words`; a word a
     /// counter). Windows are the same for all: they start at multiples of `windowMs` on the monotonic clock, which
     /// the processes of one machine share. A word holds 16 bits of the key, 16 of the window and the count.
     public fn shared(limit: u32, windowMs: u64, words: SharedWords) -> Result<RateLimit, AllocError> {
