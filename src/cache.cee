@@ -330,14 +330,17 @@ public struct OutputCache {
         }
     }
 
-    /// For checks of isolation only (tests/poisoned.cee, tools/supervisor_check.py `--isolated`): traps while
-    /// holding the table's lock, half way through a change to it, as a request whose isolated task trapped inside the
-    /// cache would. The lock is left poisoned, which the next use of the cache repairs.
-    public fn trapHoldingLock(borrow this) -> never {
-        var guard = this.places.tryLock() ?? { panic("the cache's lock is held"); };
-        let table = guard.data();
-        table[0] = null;
-        panic("trapped holding the cache's lock");
+    /// For checks of isolation only (tests/poisoned.cee, tools/supervisor_check.py `--isolated`): in a build that
+    /// defines the C macro `HTTPSERVER_TRAP_HOOKS`, traps while holding the table's lock, half way through a change
+    /// to it, as a request whose isolated task trapped inside the cache would. The lock is left poisoned, which the
+    /// next use of the cache repairs. In any other build (and in the interpreter) it does nothing.
+    public fn trapHoldingLock(borrow this) {
+        if (cfg("HTTPSERVER_TRAP_HOOKS")) {
+            var guard = this.places.tryLock() ?? { panic("the cache's lock is held"); };
+            let table = guard.data();
+            table[0] = null;
+            panic("trapped holding the cache's lock");
+        }
     }
 
     /// Forgets everything.

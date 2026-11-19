@@ -1,5 +1,8 @@
 // A lock that an isolated task held when it trapped (ADR 0175): the cache and the compressor repair what the task
 // left, heal the lock and go on, where `tryLock` would panic for every use after the trap.
+//
+// The traps are hooks a build has only with `--cflag -DHTTPSERVER_TRAP_HOOKS=1` (as CI runs these tests): without
+// it they do nothing, and these tests fail.
 import web_http;
 
 enum Iso {
@@ -13,6 +16,7 @@ async fn trapInCache(cache: Arc<OutputCache>) -> bool {
         let c = cache.clone();
         let _ = await set.spawnIsolated(Iso.Crashed, async move () => {
             c.get().trapHoldingLock();
+            return Ok(); // only a build without HTTPSERVER_TRAP_HOOKS gets here
         })?;
         return Ok();
     });
@@ -29,6 +33,7 @@ async fn trapInEncoder(compression: Arc<Compression>, data: Arc<Vector<u8>>) -> 
         let d = data.clone();
         let _ = await set.spawnIsolated(Iso.Crashed, async move () => {
             c.get().trapHoldingLock(d.get().view());
+            return Ok(); // only a build without HTTPSERVER_TRAP_HOOKS gets here
         })?;
         return Ok();
     });

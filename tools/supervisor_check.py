@@ -8,7 +8,9 @@ usage: python3 tools/supervisor_check.py [--port 18490] [--procs 3] [--memory-mb
 --isolated serves each connection in an isolated task (CW_ISOLATED=1): a trap then costs its connection and no
 worker, and a worker whose tasks have trapped twice (CW_RECYCLE_CRASHES=2) drains and is started again. Two of its
 traps hold a lock: the output cache's, then the gzip encoder's. The next uses repair and heal them, the cache's from
-the bus's `carry` (CW_BUS=1), outside any isolated task, where a panic would end the worker.
+the bus's `carry` (CW_BUS=1), outside any isolated task, where a panic would end the worker. Those two traps are
+hooks only a build with the C macro HTTPSERVER_TRAP_HOOKS has, so --isolated runs bench/out/bench-traps:
+       (cd bench && ceesafec build --cflag -DHTTPSERVER_TRAP_HOOKS=1 -o out/bench-traps)
 """
 import argparse, gzip, http.client, os, pathlib, signal, subprocess, sys, time
 
@@ -70,7 +72,8 @@ if a.isolated:
     env["CW_RECYCLE_CRASHES"] = "2"
     env["CW_BUS"] = "1"
 log = open("/tmp/supervisor_check.log", "w")
-proc = subprocess.Popen([str(HERE / "bench" / "out" / "bench")], env=env, stdout=log, stderr=subprocess.STDOUT)
+binary = HERE / "bench" / "out" / ("bench-traps" if a.isolated else "bench")
+proc = subprocess.Popen([str(binary)], env=env, stdout=log, stderr=subprocess.STDOUT)
 try:
     time.sleep(1.0)
     expect("every request is answered at the start", answering() == 40)

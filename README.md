@@ -363,7 +363,9 @@ needed.
 `python3 tools/supervisor_check.py [--inherit] [--memory-mb 512] [--budget-mb 16] [--isolated]` checks all of this
 against the benchmark server: five traps, a handler that never returns and one that takes memory until it fails,
 each followed by the server still answering. With `--isolated` the traps cost their requests and no worker, and a
-worker whose tasks trapped twice is replaced. On macOS add `--inherit`: without it the kernel gives every connection
+worker whose tasks trapped twice is replaced; two more traps hold the output cache's lock and the gzip encoder's,
+which the next uses repair, the cache's from the bus. Those two need the trap hooks, which only a build with
+`--cflag -DHTTPSERVER_TRAP_HOOKS=1` has: `--isolated` runs `bench/out/bench-traps`, built so. On macOS add `--inherit`: without it the kernel gives every connection
 to one worker.
 
 The shared memory is ceesafec's `SharedMemory` with no name (`SharedMemory.anonymous`), which a process reaches
@@ -479,8 +481,8 @@ agents: the commands, and the mistakes that code written from another language's
 
 ```sh
 ceesafec check && ceesafec fmt --check
-ceesafec test
-ceesafec test --cflag -fsanitize=address,undefined
+ceesafec test --cflag -DHTTPSERVER_TRAP_HOOKS=1   # the macro gives tests/poisoned.cee its traps
+ceesafec test --cflag -DHTTPSERVER_TRAP_HOOKS=1 --cflag -fsanitize=address,undefined
 (cd auth && ceesafec test)
 (cd static && ceesafec test)
 (cd ws && ceesafec test)
@@ -489,6 +491,8 @@ ceesafec test --cflag -fsanitize=address,undefined
 (cd examples/hello && ceesafec build)
 (cd bench && ceesafec build)      # then: python3 <CeeSafe.Web>/benchmarks/servers/conform.py --port 8090
 python3 tools/supervisor_check.py # the supervisor, against bench/out/bench
+(cd bench && ceesafec build --cflag -DHTTPSERVER_TRAP_HOOKS=1 -o out/bench-traps)
+python3 tools/supervisor_check.py --isolated   # isolated connections, against bench/out/bench-traps
 python3 tools/gzip_check.py       # compressed responses, against Python's gzip
 python3 tools/ratelimit_check.py  # one rate limit for four workers (add --inherit on macOS)
 python3 tools/bus_check.py        # the bus between four workers (add --inherit on macOS)

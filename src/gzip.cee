@@ -78,13 +78,16 @@ public struct Compression {
         return Ok(true);
     }
 
-    /// For checks of isolation only (tests/poisoned.cee, tools/supervisor_check.py `--isolated`): traps while
-    /// holding the encoder's lock, half way through compressing `data`, as a request whose isolated task trapped in
-    /// the encoder would. The lock is left poisoned and the encoder's tables hold places of `data` it never finished;
-    /// the next `gzip` makes the encoder new.
-    public fn trapHoldingLock(borrow this, data: Slice<u8>) -> never {
-        var guard = this.deflater.tryLock() ?? { panic("the encoder's lock is held"); };
-        guard.data().trapMidMessage(data);
+    /// For checks of isolation only (tests/poisoned.cee, tools/supervisor_check.py `--isolated`): in a build that
+    /// defines the C macro `HTTPSERVER_TRAP_HOOKS`, traps while holding the encoder's lock, half way through
+    /// compressing `data`, as a request whose isolated task trapped in the encoder would. The lock is left poisoned
+    /// and the encoder's tables hold places of `data` it never finished; the next `gzip` makes the encoder new. In
+    /// any other build (and in the interpreter) it does nothing.
+    public fn trapHoldingLock(borrow this, data: Slice<u8>) {
+        if (cfg("HTTPSERVER_TRAP_HOOKS")) {
+            var guard = this.deflater.tryLock() ?? { panic("the encoder's lock is held"); };
+            guard.data().trapMidMessage(data);
+        }
     }
 
     /// Answers `status` with `body` as `contentType`, compressed if the request's `Accept-Encoding` takes gzip, the

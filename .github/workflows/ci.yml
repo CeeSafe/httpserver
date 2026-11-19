@@ -55,16 +55,19 @@ jobs:
             (cd "$p" && ceesafec fetch && git diff --exit-code -- ceesafe.lock && ceesafec check && ceesafec fmt --check)
           done
 
+      # HTTPSERVER_TRAP_HOOKS gives the core's tests/poisoned.cee the hooks that trap holding a lock; a build without
+      # it has hooks that do nothing.
       - name: Tests
         run: |
           set -e
-          for p in . auth static ws compress otel; do
+          ceesafec test --cflag -DHTTPSERVER_TRAP_HOOKS=1
+          for p in auth static ws compress otel; do
             echo "== $p"
             (cd "$p" && ceesafec test)
           done
 
       - name: Core tests with ASan and UBSan
-        run: ceesafec test --cflag -fsanitize=address,undefined
+        run: ceesafec test --cflag -DHTTPSERVER_TRAP_HOOKS=1 --cflag -fsanitize=address,undefined
 
       - name: Example, benchmark server and collector demo builds
         run: |
@@ -84,6 +87,7 @@ jobs:
         run: |
           set -e
           python3 tools/supervisor_check.py $INHERIT --budget-mb 16
+          (cd bench && ceesafec build --cflag -DHTTPSERVER_TRAP_HOOKS=1 -o out/bench-traps)
           python3 tools/supervisor_check.py $INHERIT --budget-mb 16 --isolated --port 18491
 
       - name: Compressed responses

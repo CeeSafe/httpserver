@@ -12,8 +12,10 @@
 //   POST /stop           starts the drain
 //   GET  /worker         which worker process answered
 //   GET  /crash          traps (an index out of bounds), which ends the process, or with CW_ISOLATED=1 its connection
-//   GET  /crash/kept     traps holding the output cache's lock, which the next use of the cache repairs (CW_ISOLATED=1)
+//   GET  /crash/kept     traps holding the output cache's lock, which the next use of the cache repairs (CW_ISOLATED=1);
+//                        only in a build with `--cflag -DHTTPSERVER_TRAP_HOOKS=1`, else a 404
 //   GET  /crash/gz/{n:int} traps holding `/gz`'s encoder's lock, half way through n bytes, which the next `/gz` repairs
+//                        (the same build)
 //   GET  /spin           computes without end, which stops the event loop
 //   GET  /kept/{n:int}   the same text through the output cache, kept for a minute
 //   GET  /gz/{n:int}     n bytes of JSON-like text through `Compression`: gzip for a client that accepts it
@@ -414,8 +416,11 @@ impl Handler<St> for TrapHolding {
         if (this.inEncoder) {
             let body = jsonLike(asked(ctx))?;
             this.compression.get().trapHoldingLock(body.view());
+        } else {
+            this.cache.get().trapHoldingLock();
         }
-        this.cache.get().trapHoldingLock();
+        // Only a build without the hooks gets here.
+        return await exchange.send(Status.notFound(), "no trap hooks in this build".bytes());
     }
 }
 
