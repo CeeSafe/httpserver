@@ -112,6 +112,18 @@ public struct Deflater {
         });
     }
 
+    /// Forgets what earlier messages left, as `create` makes it: after a message that did not finish (a request that
+    /// trapped inside the encoder, in an isolated task), whose places may still be in the tables.
+    public fn reset(borrow mut this) {
+        for (i in 0..this.head.length) {
+            this.head[i] = 0;
+        }
+        for (i in 0..this.prev.length) {
+            this.prev[i] = 0;
+        }
+        this.base = 0;
+    }
+
     /// Appends `input` compressed to `out` as permessage-deflate sends a message (RFC 7692 §7.2.1): a block that is
     /// not the last, then an empty stored block without its last four bytes (`00 00 ff ff`), which the reader puts
     /// back. The result ends on a byte.

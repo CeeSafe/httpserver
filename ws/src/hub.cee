@@ -35,7 +35,7 @@ public struct Hub {
     /// Adds a session by its sender (`ws.sender()`); its id, or null if out of memory. The membership leaves the
     /// hub when it is dropped, however the handler ends.
     public fn join(borrow this, sender: WebSocketSender) -> Membership? {
-        var guard = this.members.tryLock() ?? { return null; };
+        var guard = this.locked() ?? { return null; };
         let m = guard.data();
         let id = m.next;
         match (m.list.push(Member { id: id, sender: sender, groups: Vector<Vector<u8>>.create(), missed: 0 })) {
@@ -46,15 +46,27 @@ public struct Hub {
         return Some(Membership { hub: this, number: id });
     }
 
+    /// The members, locked; null if another thread holds it. A crash inside the hub's own code (an isolated task,
+    /// ADR 0175) poisons the lock; each member is whole on its own, so the lock is healed: `tryLock` would panic
+    /// instead, and `deliverEncoded` runs in the bus's `carry`, outside any isolated task, where a panic ends the
+    /// worker.
+    fn locked(borrow this) -> MutexGuard<Members>? {
+        let guard = this.members.tryRecover() ?? { return null; };
+        if (guard.poisoned()) {
+            guard.heal();
+        }
+        return Some(guard);
+    }
+
     /// How many sessions the hub has.
     public fn count(borrow this) -> usize {
-        var guard = this.members.tryLock() ?? { return 0; };
+        var guard = this.locked() ?? { return 0; };
         return guard.data().list.length;
     }
 
     /// How many messages were not queued for member `id` because its queue was full; null if it is not a member.
     public fn missed(borrow this, id: u64) -> u64? {
-        var guard = this.members.tryLock() ?? { return null; };
+        var guard = this.locked() ?? { return null; };
         let m = guard.data();
         for (i in 0..m.list.length) {
             if (m.list[i].id == id) {
@@ -106,7 +118,7 @@ public struct Hub {
 
     /// Queues a Close with `code` for every member (1001, "going away", before a shutdown); how many.
     public fn closeAll(borrow this, code: u16) -> usize {
-        var guard = this.members.tryLock() ?? { return 0; };
+        var guard = this.locked() ?? { return 0; };
         let m = guard.data();
         var sent: usize = 0;
         for (i in 0..m.list.length) {
@@ -119,7 +131,7 @@ public struct Hub {
 
     /// Queues the message for the members that are in `group` (if not empty) and are `only` (if not 0).
     fn deliver(borrow this, binary: bool, bytes: Slice<u8>, group: StringView, only: u64) -> usize {
-        var guard = this.members.tryLock() ?? { return 0; };
+        var guard = this.locked() ?? { return 0; };
         let m = guard.data();
         var sent: usize = 0;
         for (i in 0..m.list.length) {
@@ -148,7 +160,7 @@ public struct Hub {
     }
 
     fn leave(borrow this, id: u64) {
-        var guard = this.members.tryLock() ?? { return; };
+        var guard = this.locked() ?? { return; };
         let m = guard.data();
         for (i in 0..m.list.length) {
             if (m.list[i].id == id) {
@@ -159,7 +171,7 @@ public struct Hub {
     }
 
     fn enter(borrow this, id: u64, group: Slice<u8>, entering: bool) -> bool {
-        var guard = this.members.tryLock() ?? { return false; };
+        var guard = this.locked() ?? { return false; };
         let m = guard.data();
         for (i in 0..m.list.length) {
             if (m.list[i].id != id) {

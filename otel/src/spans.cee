@@ -83,6 +83,22 @@ public struct Spans {
             sent: AtomicU64.create(0),
         });
 
+    /// The queue, locked; null if another thread holds it. A queue a crashed request (an isolated task, ADR 0175) left
+    /// half changed is emptied, its spans counted as lost, and the lock healed: `tryLock` would panic instead, and
+    /// `encode` runs in `export`, outside any isolated task, where a panic ends the worker.
+    fn locked(borrow this) -> MutexGuard<Vector<Span>>? {
+        var guard = this.queue.tryRecover() ?? { return null; };
+        if (guard.poisoned()) {
+            {
+                let queue = guard.data();
+                this.lost.store(this.lost.load() + queue.length as u64);
+                queue.clear();
+            }
+            guard.heal();
+        }
+        return Some(guard);
+    }
+
     /// Spans dropped because the queue was full or memory was short.
     public fn dropped(borrow this) -> u64 => this.lost.load();
 
@@ -94,7 +110,7 @@ public struct Spans {
 
     /// How many spans wait.
     public fn waiting(borrow this) -> usize {
-        var guard = this.queue.tryLock() ?? { return 0; };
+        var guard = this.locked() ?? { return 0; };
         return guard.data().length;
     }
 
@@ -139,7 +155,7 @@ public struct Spans {
             this.lost.store(this.lost.load() + 1);
             return;
         }
-        var guard = this.queue.tryLock() ?? {
+        var guard = this.locked() ?? {
             this.lost.store(this.lost.load() + 1);
             return;
         };
@@ -155,7 +171,7 @@ public struct Spans {
         out.clear();
         var batch = Vector<Span>.create();
         {
-            var guard = this.queue.tryLock() ?? { return 0; };
+            var guard = this.locked() ?? { return 0; };
             let queue = guard.data();
             if (queue.length == 0) {
                 return 0;

@@ -150,7 +150,7 @@ public struct OutputCache {
     /// What is kept for `target` and still good at `nowMs`.
     fn kept(borrow this, target: Slice<u8>, variant: Slice<u8>, nowMs: u64) -> Arc<Kept>? {
         // One event loop a process: the lock is free. If it is not (another thread of the application), a miss.
-        var guard = this.places.tryLock() ?? { return null; };
+        var guard = this.locked() ?? { return null; };
         let table = guard.data();
         let slot = OutputCache.place(target, variant, table.length);
         match (borrow table[slot]) {
@@ -252,7 +252,7 @@ public struct OutputCache {
             Ok(a) => a,
             Err(_) => { return false; },
         };
-        var guard = this.places.tryLock() ?? { return false; };
+        var guard = this.locked() ?? { return false; };
         let table = guard.data();
         let slot = OutputCache.place(target, variant, table.length);
         table[slot] = Some(shared);
@@ -297,10 +297,27 @@ public struct OutputCache {
         return await exchange.send(status, body);
     }
 
+    /// The table, locked; null if another thread holds it. A table a crashed request (an isolated task, ADR 0175) left
+    /// half changed is emptied and the lock healed: `tryLock` would panic instead, and `forget` runs in the bus's
+    /// `carry`, outside any isolated task, where a panic ends the worker.
+    fn locked(borrow this) -> MutexGuard<Vector<Arc<Kept>?>>? {
+        var guard = this.places.tryRecover() ?? { return null; };
+        if (guard.poisoned()) {
+            {
+                let table = guard.data();
+                for (i in 0..table.length) {
+                    table[i] = null;
+                }
+            }
+            guard.heal();
+        }
+        return Some(guard);
+    }
+
     /// Forgets what is kept for `target` (the path and query as requested), every variant of it: what changed it
     /// was just done. It looks at every place.
     public fn forget(borrow this, target: StringView) {
-        var guard = this.places.tryLock() ?? { return; };
+        var guard = this.locked() ?? { return; };
         let table = guard.data();
         for (i in 0..table.length) {
             let same = match (borrow table[i]) {
@@ -315,7 +332,7 @@ public struct OutputCache {
 
     /// Forgets everything.
     public fn clear(borrow this) {
-        var guard = this.places.tryLock() ?? { return; };
+        var guard = this.locked() ?? { return; };
         let table = guard.data();
         for (i in 0..table.length) {
             table[i] = null;

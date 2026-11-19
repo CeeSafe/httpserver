@@ -79,7 +79,12 @@ public struct RateLimit {
             null => {}
         }
         // One event loop a process: the lock is free. If it is not (another thread of the application), let through.
-        var guard = this.table.tryLock() ?? { return Hit { count: 0, leftMs: 0 }; };
+        // `tryRecover`: each counter is written whole, so a lock a crashed request poisoned (ADR 0175) is healed, not
+        // a panic for every request after it.
+        var guard = this.table.tryRecover() ?? { return Hit { count: 0, leftMs: 0 }; };
+        if (guard.poisoned()) {
+            guard.heal();
+        }
         let counters = guard.data();
         let slot = (key as usize) & (counters.length - 1);
         let c = counters[slot];

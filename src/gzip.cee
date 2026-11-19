@@ -55,7 +55,13 @@ public struct Compression {
     /// Appends `data` as one gzip member to `out`. False, with `out` as it was, if the compressor is in use by
     /// another thread; one event loop never finds it so.
     public fn gzip(borrow this, data: Slice<u8>, out: borrow mut Vector<u8>) -> Result<bool, AllocError> {
-        var guard = this.deflater.tryLock() ?? { return Ok(false); };
+        // `tryRecover`, not `tryLock`: a request that trapped in the encoder (an isolated task, ADR 0175) poisons the
+        // lock, and `tryLock` would then panic for every request after it. The encoder is made new instead.
+        var guard = this.deflater.tryRecover() ?? { return Ok(false); };
+        if (guard.poisoned()) {
+            guard.data().reset();
+            guard.heal();
+        }
         // The header: the magic, deflate, no flags, no time, no extra flags, an unknown system.
         var header = [0x1Fu8, 0x8Bu8, 8u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 255u8];
         out.extend(header[..])?;
