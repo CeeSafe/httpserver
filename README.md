@@ -33,7 +33,7 @@ this is in [CEESAFE_FINDINGS.md](CEESAFE_FINDINGS.md). Linux and macOS; the supe
 
 You need:
 
-- `ceesafec` 0.75.0 or later ([releases](https://github.com/CeeSafe/CeeSafe/releases), or the
+- `ceesafec` 0.77.2 or later ([releases](https://github.com/CeeSafe/CeeSafe/releases), or the
   [guide](https://ceesafe.github.io/CeeSafe/)'s installation page) and a C compiler (`cc`);
 - for `auth/` only, OpenSSL's libcrypto; for `compress/` only, libzstd and libbrotli
   (`brew install zstd brotli`; `apt install libzstd-dev libbrotli-dev`). The core package needs no C library.
@@ -186,13 +186,13 @@ name = "myserver"
 version = "0.1.0"
 kind = "executable"
 sources = ["src"]
-ceesafec = ">=0.75.0"
+ceesafec = ">=0.77.2"
 
 [dependencies]
 httpserver = { git = "https://github.com/CeeSafe/httpserver.git", rev = "<a commit of this repository>" }
-web_core = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "2886ca33bc49dc39b23c7279efd24e72dc205211", dir = "packages/web_core" }
-web_transport = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "2886ca33bc49dc39b23c7279efd24e72dc205211", dir = "packages/web_transport" }
-web_http = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "2886ca33bc49dc39b23c7279efd24e72dc205211", dir = "packages/web_http" }
+web_core = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "79ae13870e2d454bd590747b9b3ce3d2c5a026df", dir = "packages/web_core" }
+web_transport = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "79ae13870e2d454bd590747b9b3ce3d2c5a026df", dir = "packages/web_transport" }
+web_http = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "79ae13870e2d454bd590747b9b3ce3d2c5a026df", dir = "packages/web_http" }
 ```
 
 The other packages are directories of this repository: add `dir`, as in
@@ -497,10 +497,12 @@ python3 tools/ws_check.py         # the hub, with WebSocket clients written from
 python3 tools/ws_check.py --workers 4   # the same over four workers and the bus (add --inherit on macOS)
 ```
 
-The compiler: ceesafec 0.75.0 or later. It is the release that has isolated tasks (ADR 0175), which
-`app.runIsolated` serves connections in; `Process.spawnWith` and `SharedMemory.anonymous` (ADR 0173, 0.73.1) start the
-workers and hand them what they share, `Budget`, for a request's memory, came with 0.70.0, and the stock middleware
-are impls for every application state, which 0.68.0 accepts. CeeSafe.Web at the pinned revision needs 0.75.0 too.
+The compiler: ceesafec 0.77.2 or later. Isolated tasks (ADR 0175), which `app.runIsolated` serves connections in,
+came with 0.75.0; `Process.spawnWith` and `SharedMemory.anonymous` (ADR 0173, 0.73.1) start the workers and hand them
+what they share; `Budget`, for a request's memory, came with 0.70.0; and the stock middleware are impls for every
+application state, which 0.68.0 accepts. CeeSafe.Web at the pinned revision, whose HTTP/2 and HTTP/3 streams are
+isolated one by one, needs 0.77.2: `trySpawnIsolated` (0.77.0), and the leak counts of a crashed task in tests and
+under LeakSanitizer (0.77.1, 0.77.2).
 The supervisor is POSIX only: it declares `setrlimit` from `sys/resource.h` for `memoryBytes`.
 
 ## License

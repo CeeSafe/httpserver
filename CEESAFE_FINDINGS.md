@@ -1,7 +1,7 @@
 # CeeSafe findings
 
-Bugs and gaps in CeeSafe and CeeSafe.Web met while writing httpserver, with ceesafec 0.62.2 (now built with 0.75.0) and CeeSafe.Web at
-`4bb64c6` (now `2886ca3`, with Web ADR 0016's isolated connections). Each has what was seen, a reduction where there is one, and what httpserver does instead.
+Bugs and gaps in CeeSafe and CeeSafe.Web met while writing httpserver, with ceesafec 0.62.2 (now built with 0.77.2) and CeeSafe.Web at
+`4bb64c6` (now `79ae138`, with Web ADR 0016's isolated connections and streams). Each has what was seen, a reduction where there is one, and what httpserver does instead.
 
 | | What | Where | Status |
 |---|---|---|---|
@@ -318,3 +318,14 @@ caught. CeeSafe.Web's own list (`docs/ceesafe-upstream-work.md`) has what this m
 - B21, on macOS a closer cannot end a connection whose peer has already half-closed;
 - B22, `ceesafec test` reports a test whose isolated task trapped as panicked;
 - B23, the interpreter leaks a watched channel made inside its task set's body.
+
+All four were fixed in 0.77.0 (CeeSafe ADR 0175 amendment 1), and CeeSafe.Web then isolated HTTP/2 and HTTP/3
+streams one by one (Web ADR 0016 §2.3, merged as `79ae138`). Two more came with that, both fixed:
+
+- B24, `ceesafec test` reported what a crashed isolated task captured as the test's leak (0.77.1, amendment 2);
+- B25, LeakSanitizer reported what a crashed isolated task left, so a sanitized program whose task trapped exited
+  with status 1 and every trap test failed CI's sanitizer jobs (0.77.2, amendment 3: the runtime marks the dead
+  unit's roots with `__lsan_ignore_object`, and every other leak is still reported). It applies here too: a
+  sanitized build of the benchmark server under `CW_ISOLATED=1` needs 0.77.2 for a trap not to fail its exit.
+
+httpserver asks for 0.77.2 and pins CeeSafe.Web at `79ae138`.

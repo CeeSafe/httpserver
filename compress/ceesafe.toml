@@ -4,7 +4,7 @@ version = "0.1.0"
 kind = "library"
 sources = ["src"]
 tests = ["tests"]
-ceesafec = ">=0.75.0"
+ceesafec = ">=0.77.2"
 # Zstandard and Brotli are the reference C libraries, called directly (src/ffi.cee declares what it calls; no header
 # is needed). libbrotlidec is linked for the tests, which inflate what was compressed.
 links = ["zstd", "brotlienc", "brotlidec"]
@@ -16,7 +16,7 @@ lib-dirs = ["/opt/homebrew/opt/zstd/lib", "/opt/homebrew/opt/brotli/lib"]
 
 [dependencies]
 httpserver = { path = ".." }
-web_core = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "2886ca33bc49dc39b23c7279efd24e72dc205211", dir = "packages/web_core" }
-web_transport = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "2886ca33bc49dc39b23c7279efd24e72dc205211", dir = "packages/web_transport" }   # the tests' mock connection
-web_http = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "2886ca33bc49dc39b23c7279efd24e72dc205211", dir = "packages/web_http" }
-web_http1 = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "2886ca33bc49dc39b23c7279efd24e72dc205211", dir = "packages/web_http1" }
+web_core = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "79ae13870e2d454bd590747b9b3ce3d2c5a026df", dir = "packages/web_core" }
+web_transport = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "79ae13870e2d454bd590747b9b3ce3d2c5a026df", dir = "packages/web_transport" }   # the tests' mock connection
+web_http = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "79ae13870e2d454bd590747b9b3ce3d2c5a026df", dir = "packages/web_http" }
+web_http1 = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "79ae13870e2d454bd590747b9b3ce3d2c5a026df", dir = "packages/web_http1" }

@@ -3,15 +3,15 @@ name = "bench"
 version = "0.1.0"
 kind = "executable"
 sources = ["src"]
-ceesafec = ">=0.75.0"
+ceesafec = ">=0.77.2"
 
 [dependencies]
 httpserver = { path = ".." }
 httpserver_ws = { path = "../ws" }
 httpserver_compress = { path = "../compress" }
-web_ws = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "2886ca33bc49dc39b23c7279efd24e72dc205211", dir = "packages/web_ws" }
-web_core = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "2886ca33bc49dc39b23c7279efd24e72dc205211", dir = "packages/web_core" }
-web_transport = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "2886ca33bc49dc39b23c7279efd24e72dc205211", dir = "packages/web_transport" }
-web_http = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "2886ca33bc49dc39b23c7279efd24e72dc205211", dir = "packages/web_http" }
+web_ws = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "79ae13870e2d454bd590747b9b3ce3d2c5a026df", dir = "packages/web_ws" }
+web_core = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "79ae13870e2d454bd590747b9b3ce3d2c5a026df", dir = "packages/web_core" }
+web_transport = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "79ae13870e2d454bd590747b9b3ce3d2c5a026df", dir = "packages/web_transport" }
+web_http = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "79ae13870e2d454bd590747b9b3ce3d2c5a026df", dir = "packages/web_http" }
 # /json's writer, as CeeSafe.Web's own benchmark server uses
 json = { git = "https://github.com/CeeSafe/CeeSafeLibs.git", rev = "ca0a13fec248bbe192f0b61b930c8b8259175eed", dir = "json" }
