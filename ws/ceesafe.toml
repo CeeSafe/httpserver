@@ -4,7 +4,7 @@ version = "0.1.0"
 kind = "library"
 sources = ["src"]
 tests = ["tests"]
-ceesafec = ">=0.80.0"
+ceesafec = ">=0.81.0"
 
 [dependencies]
 web_core = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "91ef1130750de03511bf2c70c1314633a5c3fce9", dir = "packages/web_core" }

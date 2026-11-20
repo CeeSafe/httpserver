@@ -18,6 +18,7 @@
 //                        (the same build)
 //   GET  /spin           computes without end: past the bound it costs its connection; without polls it stops the loop
 //   GET  /spin/{ms:int}  computes for ms milliseconds without waiting (at most a minute), then answers "spun"
+//   GET  /pauses         how many tasks this worker paused past their slice (`Async.pauses()`)
 //   GET  /kept/{n:int}   the same text through the output cache, kept for a minute
 //   GET  /gz/{n:int}     n bytes of JSON-like text through `Compression`: gzip for a client that accepts it
 //   GET  /z/{n:int}      the same text through `Codings`: zstd or Brotli, or gzip for a client that takes neither
@@ -37,11 +38,14 @@
 // worker is replaced after CW_RECYCLE_CRASHES crashes (100 by default): another is started in its place at once, and
 // it drains. CW_ISOLATED=0 serves them in plain tasks (`App.runShared`), where a trap ends the worker.
 //
-// CW_RUN_BOUND_MS=n is the application's bound on how long a task may compute without waiting (`App.bound`, 1 000 ms by
-// default, 0 for none; `Async.runBound`, ceesafec ADR 0186), in a build with polls (this package's `polls = true`): a
-// request that computes past it traps with `Overran` and costs its connection, where without it the event loop stops
-// until the supervisor kills the worker. Under CW_ISOLATED=0 a task past it is counted, not ended (`RunBound.Count`). A
-// build without polls (`--no-polls`) says so once a worker and runs unbounded.
+// CW_RUN_SLICE_MS=n is the application's slice (`App.slice`, 10 ms by default, 0 for none; `Async.runSlice`, ceesafec
+// ADR 0189): a request that has computed that long without waiting is paused and the worker's other requests run
+// before it goes on. CW_RUN_BOUND_MS=n is its bound on one resume of a task (`App.bound`; 30 000 ms by default with
+// the slice, 1 000 ms without; 0 for none; `Async.runBound`, ADR 0186): a request that computes past it traps with
+// `Overran` and costs its connection, where without it the event loop stops until the supervisor kills the worker.
+// Under CW_ISOLATED=0 no task is paused, and one past the bound is counted, not ended (`RunBound.Count`). Both need a
+// build with polls (this package's `polls = true`); one without (`--no-polls`) says so once a worker and runs
+// unbounded.
 //
 // The worker's housekeeping runs under a `Services` supervisor (src/services.cee): the reading of the bus and, with
 // CW_JOBS=1, a scheduler whose job runs every second. Each start of one is an isolated task, so a trap in it ends
@@ -380,6 +384,23 @@ impl Handler<St> for Spin {
 /// CW_RUN_BOUND_MS it is answered, longer it is ended.
 struct SpinFor {}
 
+/// How many times this worker paused a task past its slice (`Async.pauses()`, ceesafec ADR 0189), in decimal.
+struct Pauses {}
+
+impl Handler<St> for Pauses {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut Context<St>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        var buffer = [0u8; 24];
+        var w = TextWriter.create(mut buffer[..]);
+        w.decimal(Async.pauses());
+        return await exchange.send(Status.ok(), w.written());
+    }
+}
+
 impl Handler<St> for SpinFor {
     async fn handle(
         borrow this,
@@ -673,6 +694,12 @@ impl AccessLog for Counted {
     }
 }
 
+/// The number the environment names `name`, if it does.
+fn given(name: StringView) -> u64? {
+    let text = Environment.variable(name) ?? { return null; };
+    return Ascii.parseDecimal(text.bytes());
+}
+
 fn setting(name: StringView, otherwise: u64) -> u64 {
     let text = match (Environment.variable(name)) {
         Some(t) => t,
@@ -750,6 +777,7 @@ fn application(worker: u32, wiring: Wiring) -> Result<App<St>, RouteError> {
     app.get("/crash", handler(Box.create(Crash {}))?)?;
     app.get("/spin", handler(Box.create(Spin {}))?)?;
     app.get("/spin/{ms:int}", handler(Box.create(SpinFor {}))?)?;
+    app.get("/pauses", handler(Box.create(Pauses {}))?)?;
     app.get("/bloat", handler(Box.create(Bloat {}))?)?;
     app.get("/job", handler(Box.create(Jobs { trap: false }))?)?;
     app.get("/job/trap/{n:int}", handler(Box.create(Jobs { trap: true }))?)?;
@@ -991,8 +1019,16 @@ fn serveOn(worker: Worker, listener: borrow dyn web_transport.Incoming, words: S
             return 1;
         },
     };
-    // The application's bound (1 000 ms by default), which `run` sets; 0 for none.
-    app.bound(setting("CW_RUN_BOUND_MS", 1000));
+    // The application's slice and bound, which `run` sets: `App`'s defaults (10 ms, and 30 000 ms with the slice or
+    // 1 000 ms without) unless the environment names them; 0 for none.
+    match (given("CW_RUN_SLICE_MS")) {
+        Some(ms) => { app.slice(ms); }
+        null => {}
+    }
+    match (given("CW_RUN_BOUND_MS")) {
+        Some(ms) => { app.bound(ms); }
+        null => {}
+    }
     match (Async.run(serve(app, worker, listener, tended))) {
         Ok(_) => { return 0; }
         Err(e) => {

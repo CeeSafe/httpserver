@@ -37,8 +37,11 @@ public struct App<S: Send + Share> {
     /// The UDP port the same application is served on over HTTP/3, advertised in `Alt-Svc`.
     private http3Port: u16?;
     private log: Box<dyn AccessLog + Send + Share>?;
-    /// How long one resume of a task may compute without waiting, in milliseconds (`bound`); 0: no bound.
-    private boundMs: u64;
+    /// How long one resume of a task may compute without waiting, in milliseconds (`bound`); 0: no bound; null: the
+    /// default, which depends on whether the slice can pause a task (`applyLimits`).
+    private boundMs: u64?;
+    /// How long a task of an isolated connection computes before it is paused and the others run (`slice`); 0: none.
+    private sliceMs: u64;
 
     /// An application owning `state`, with no routes and no middleware; `limits` bound each connection's requests.
     public fn create(state: S, limits: Limits) -> Result<App<S>, RouteError> {
@@ -58,7 +61,8 @@ public struct App<S: Send + Share> {
             httpLimits: limits,
             http3Port: null,
             log: null,
-            boundMs: 1000,
+            boundMs: null,
+            sliceMs: defaultSliceMs(),
         });
     }
 
@@ -377,13 +381,25 @@ public struct App<S: Send + Share> {
         this.http3Port = Some(port);
     }
 
-    /// The longest one resume of a task may compute without waiting, in milliseconds: 1 000 by default, 0 for none.
-    /// `run` and `runShared` set it as the program's bound (`Async.runBound`, ceesafec ADR 0186) when they start.
-    /// Under `run`, a request past it traps with `Overran` and costs its connection, where without it the event loop
-    /// stops until the supervisor kills the worker (`stallMs`, 5 000 by default, which the bound must stay well
-    /// below). It needs a build with polls: without them `run` says so once and serves unbounded.
+    /// The longest one resume of a task may compute without waiting, in milliseconds; 0 for none. `run` and
+    /// `runShared` set it as the program's bound (`Async.runBound`, ceesafec ADR 0186) when they start. Under `run`, a
+    /// request past it traps with `Overran` and costs its connection. By default it is 30 000 under `run` where the
+    /// slice pauses a task (the request shares its worker meanwhile, so the bound is only for one that never ends),
+    /// and 1 000 otherwise: under `runShared`, or where there is no slice, a task computing holds its worker's loop,
+    /// and the bound must stay well below the supervisor's `stallMs` (5 000 by default). It needs a build with polls
+    /// (`polls = true` in the program's manifest, ceesafec ADR 0190): without them `run` says so once and serves
+    /// unbounded.
     public fn bound(borrow mut this, ms: u64) {
-        this.boundMs = ms;
+        this.boundMs = Some(ms);
+    }
+
+    /// The slice, in milliseconds (`Async.runSlice`, ceesafec ADR 0189): under `run`, a request that has computed for
+    /// this long without waiting is paused, and its worker's other requests run before it goes on, so one that
+    /// computes costs its neighbours about a slice at a time instead of the whole computation. 10 by default, 0 for
+    /// none. `runShared` sets none: a task in no isolated unit is never paused. It needs a build with polls, and a
+    /// 64-bit target; where the slice cannot be had, `run` says so once and keeps the shorter bound.
+    public fn slice(borrow mut this, ms: u64) {
+        this.sliceMs = ms;
     }
 
     /// The application's state.
@@ -398,7 +414,7 @@ public struct App<S: Send + Share> {
     /// handler that traps ends its connection (or stream), whose socket is shut, and the server goes on. What the
     /// connection held is leaked; `Isolation.report()` counts it, and a supervised worker is replaced past the bound its
     /// options set (`SupervisorOptions.recycleCrashes`, `recycleLeakedBytes`). A trap in a C library's callback, or in
-    /// a `Critical`, still ends the process. The application's `bound` is the program's when it starts. A connection
+    /// a `Critical`, still ends the process. The application's `slice` and `bound` are the program's when it starts. A connection
     /// is HTTP/2 when TLS negotiated `h2`, or when it starts with HTTP/2's preface (prior knowledge, RFC 9113 §3.3);
     /// HTTP/1.1 otherwise.
     public async fn run(
@@ -408,7 +424,7 @@ public struct App<S: Send + Share> {
         limits: borrow ConnectionLimits,
         drain: borrow Drain,
     ) -> Result<ServerReport, NetError> {
-        await applyBound(this.boundMs);
+        await applyLimits(this.sliceMs, this.boundMs);
         let httpLimits = this.httpLimits;
         let app = applicationOf(this)?;
         let boxed: Box<dyn ConnectionHandler + Send + Share> = match (Box.create(Serving {
@@ -450,7 +466,7 @@ public struct App<S: Send + Share> {
         limits: borrow ConnectionLimits,
         drain: borrow Drain,
     ) -> Result<ServerReport, NetError> {
-        await applyBound(this.boundMs);
+        await applyLimits(0, this.boundMs);
         let httpLimits = this.httpLimits;
         let app = applicationOf(this)?;
         let service = Serving { app: app, httpLimits: httpLimits };
@@ -458,15 +474,35 @@ public struct App<S: Send + Share> {
     }
 }
 
-/// Sets `ms` as the program's bound on one resume of a task (`Async.runBound`, `RunBound.Count`: a task in no isolated
-/// unit is counted, one in a unit ended); in a build without polls, says once that it cannot.
-async fn applyBound(ms: u64) {
-    if (ms == 0 || Async.runBound(ms, RunBound.Count)) {
+/// The slice `App` sets when none is given (`App.slice`), in milliseconds: ADR 0189's measurement on the benchmark
+/// server, where it cost `/small` about 2% and cut the wait beside a 300 ms request from 247 ms to 87 to 149 ms.
+fn defaultSliceMs() -> u64 => 10;
+
+/// The bound `App` sets when none is given and the slice pauses a task: a request that has computed for 30 s in one
+/// resume, while sharing its worker, is taken to never end.
+fn defaultSlicedBoundMs() -> u64 => 30000;
+
+/// The bound `App` sets when none is given and no slice pauses a task: well below the supervisor's 5 000 ms stall.
+fn defaultBoundMs() -> u64 => 1000;
+
+/// Sets the program's slice (`Async.runSlice`, `sliceMs`, 0 for none) and then its bound on one resume of a task
+/// (`Async.runBound`, `RunBound.Count`: a task in no isolated unit is counted, one in a unit ended; with a slice, the
+/// bound counts the slices one resume used). `boundMs` null is the default, which depends on whether the slice took.
+/// Says once what it could not set: polls missing from the build, or a slice on a target without one.
+async fn applyLimits(sliceMs: u64, boundMs: u64?) {
+    let sliced = sliceMs > 0 && Async.runSlice(sliceMs);
+    let bound = boundMs ?? (if (sliced) defaultSlicedBoundMs() else defaultBoundMs());
+    if (bound > 0 && !Async.runBound(bound, RunBound.Count)) {
+        let _ = await AsyncConsole.writeLine(
+            "httpserver: no polls in this build: a request that computes without waiting holds its worker (add polls = true to ceesafe.toml)",
+        );
         return;
     }
-    let _ = await AsyncConsole.writeLine(
-        "httpserver: no polls in this build: a request that computes without waiting holds its worker (add polls = true to ceesafe.toml)",
-    );
+    if (sliceMs > 0 && !sliced && bound > 0) {
+        let _ = await AsyncConsole.writeLine(
+            "httpserver: no slice on this target: a request that computes is ended at its bound, not paused",
+        );
+    }
 }
 
 /// `app` as a shared `web_http` application, which it owns from now on: what `run` serves over TCP, and what

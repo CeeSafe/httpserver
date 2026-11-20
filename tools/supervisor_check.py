@@ -20,6 +20,9 @@ stalled, answers the others meanwhile. So it runs bench/out/bench-traps, built w
 and then bench/out/bench-nopolls, built without polls, which says so at start, and whose spin the supervisor's stall
 catches:
        (cd bench && ceesafec build --no-polls -o out/bench-nopolls)
+Then, with one worker each: the bound with no slice (CW_RUN_SLICE_MS=0), where a request beside a spin waits for its
+end; the slice (CW_RUN_SLICE_MS=10, ceesafec ADR 0189), where it waits a few slices, a request computing for 300 ms is
+answered and one without end is ended at its bound of 1 000 ms; and the build without polls.
 --shared serves the connections in plain tasks (`App.runShared`, CW_ISOLATED=0), with bench/out/bench: a trap ends
 the worker, and the supervisor starts another. --isolated is the default, kept as a name.
 """
@@ -303,12 +306,13 @@ expect(f"services: one worker replaced, as a crash, no stall, no kill ({report})
 expect(f"services: each of the job's traps ended alone ({text.count('ended alone)')} of 4)", text.count("ended alone)") == 4)
 
 if isolated:
-    # The bound on one event loop: a single worker, which a crash does not recycle. A request on a second connection
-    # to it waits for the spin to be ended at the bound and is then answered by the same worker, three times over.
-    print("--- one worker, CW_RUN_BOUND_MS=250")
+    # The bound on one event loop, with no slice: a single worker, which a crash does not recycle. A request on a
+    # second connection to it waits for the spin to be ended at the bound and is then answered by the same worker,
+    # three times over.
+    print("--- one worker, CW_RUN_BOUND_MS=250, CW_RUN_SLICE_MS=0")
     port = a.port + 1
     one = dict(os.environ, CW_PORT=str(port), CW_PROCS="1", CW_STALL_MS="1500", CW_ISOLATED="1",
-               CW_RUN_BOUND_MS="250")
+               CW_RUN_BOUND_MS="250", CW_RUN_SLICE_MS="0")
     log = open("/tmp/supervisor_check_one.log", "w")
     proc = subprocess.Popen([str(binary)], env=one, stdout=log, stderr=subprocess.STDOUT)
     try:
@@ -342,6 +346,55 @@ if isolated:
     expect(f"one worker: started once, no crash, no stall, no kill ({report})", report == ["1", "0", "0", "0"])
     expect(f"one worker: the three spins were ended by the bound ({text.count('past its bound of 250 ms')} of 3)",
            text.count("past its bound of 250 ms") == 3 and text.count("ended alone)") == 3)
+if isolated:
+    # The slice (ceesafec ADR 0189) on one event loop: a request that computes is paused every 10 ms and the others
+    # run, so a request beside one that computes for 300 ms waits a few slices, not the 300 ms, and the 300 ms one
+    # is answered; one that never ends is still ended, at its bound of 1 000 ms counted in slices.
+    print("--- one worker, CW_RUN_SLICE_MS=10, CW_RUN_BOUND_MS=1000")
+    port = a.port + 4
+    sliced = dict(os.environ, CW_PORT=str(port), CW_PROCS="1", CW_STALL_MS="1500", CW_ISOLATED="1",
+                  CW_RUN_SLICE_MS="10", CW_RUN_BOUND_MS="1000")
+    log = open("/tmp/supervisor_check_slice.log", "w")
+    proc = subprocess.Popen([str(binary)], env=sliced, stdout=log, stderr=subprocess.STDOUT)
+    try:
+        time.sleep(1.0)
+        neighbour = http.client.HTTPConnection("127.0.0.1", port, timeout=3.0)
+        expect("slice: answered at the start", ask(neighbour, "/small") == (200, b"hello, world\n"))
+        for path, answer in (("/spin/300", (200, b"spun")), ("/spin", None)):
+            spinning = http.client.HTTPConnection("127.0.0.1", port, timeout=6.0)
+            spun = {}
+            spinner = threading.Thread(target=lambda: spun.update(answer=ask(spinning, path)))
+            spinner.start()
+            time.sleep(0.05)
+            waits = []
+            answered = True
+            for _ in range(5):
+                t = time.time()
+                answered = answered and ask(neighbour, "/small") == (200, b"hello, world\n")
+                waits.append(time.time() - t)
+            spinner.join()
+            spinning.close()
+            median = sorted(waits)[len(waits) // 2]
+            expect(f"slice: beside {path}, five requests are answered, the median after {median:.3f} s (< 0.2)",
+                   answered and median < 0.2)
+            what = "is answered" if answer is not None else "is ended at its bound and gets no answer"
+            expect(f"slice: {path} {what}", spun.get("answer", 0) == answer)
+        pauses = ask(neighbour, "/pauses")
+        expect(f"slice: the worker paused the spins ({pauses})",
+               pauses is not None and pauses[0] == 200 and int(pauses[1] or b"0") > 0)
+        proc.send_signal(signal.SIGTERM)
+        code = proc.wait(10)
+        expect(f"slice: the supervisor ends on SIGTERM (status {code})", code == 0)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+    log.close()
+    text = open("/tmp/supervisor_check_slice.log").read()
+    lines = text.split("\n")
+    report = lines[lines.index("bench: started, crashed, stalled, killed") + 1:][:4] if "bench: started, crashed, stalled, killed" in lines else []
+    expect(f"slice: started once, no crash, no stall, no kill ({report})", report == ["1", "0", "0", "0"])
+    expect(f"slice: the spin without end was ended by the bound ({text.count('past its bound of 1000 ms')} of 1)",
+           text.count("past its bound of 1000 ms") == 1 and text.count("ended alone)") == 1)
 if isolated:
     # A build without polls (bench/out/bench-nopolls): `App.run` says so at start, and a request that computes
     # without end holds its worker until the supervisor's stall catches it, as before the bound.

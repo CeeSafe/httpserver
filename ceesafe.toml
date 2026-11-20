@@ -4,7 +4,7 @@ version = "0.2.0"
 kind = "library"
 sources = ["src"]
 tests = ["tests"]
-ceesafec = ">=0.80.0"        # ADR 0186: `Async.runBound`, which `App.run` sets; ADR 0175: isolated tasks (`App.run`); ADR 0173: `Process.spawnWith` for the supervisor; ADR 0170: a request's budget
+ceesafec = ">=0.81.0"        # ADR 0189: `Async.runSlice` and ADR 0186: `Async.runBound`, which `App.run` sets; ADR 0175: isolated tasks (`App.run`); ADR 0173: `Process.spawnWith` for the supervisor; ADR 0170: a request's budget
 
 [dependencies]
 web_core = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "91ef1130750de03511bf2c70c1314633a5c3fce9", dir = "packages/web_core" }

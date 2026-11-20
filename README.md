@@ -377,10 +377,14 @@ replaces a worker whose isolated tasks have trapped `recycleCrashes` times (100 
 its connection or stream in a build with polls (`polls = true` in the program's manifest, ceesafec ADR 0190): `run` sets
 the application's bound, `app.bound(ms)` (1 000 ms by default, 0 for none; `Async.runBound`, ceesafec ADR 0186; the
 benchmark server's `CW_RUN_BOUND_MS`), and past it the request traps with `Overran` and ends alone, its neighbours
-having waited at most that long. A build without polls says so once at start: `httpserver: no polls in this build: …`. A
-library's `polls = true` does nothing for its users: the program's own manifest asks. Still ending the worker: a trap
-under a C library's callback or inside a `Critical`, and, without the bound, or in C code or a blocking system call, a
-computation that does not return to the loop (the stall below).
+having waited at most that long. With the slice, `app.slice(ms)` (10 ms by default, 0 for none; `Async.runSlice`,
+ceesafec ADR 0189; `CW_RUN_SLICE_MS`), a request that computes is paused every slice and its worker's other requests run
+meanwhile: beside one computing for 300 ms, a request waits a few slices, and the default bound is then 30 000 ms, for a
+request that never ends (1 000 ms without a slice: under `runShared`, or on a 32-bit target). A build without polls says
+so once at start: `httpserver: no polls in this build: …`. A library's `polls = true` does nothing for its users: the
+program's own manifest asks. Still ending the worker: a trap under a C library's callback or inside a `Critical`, and,
+without the bound, or in C code or a blocking system call, a computation that does not return to the loop (the stall
+below).
 
 What it costs: the requests in flight on a worker that ends get no answer, and the workers share no memory, so a
 counter or a cache is per worker unless it is put somewhere they share. `SharedWords` is such a place for numbers:
