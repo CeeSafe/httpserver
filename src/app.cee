@@ -37,6 +37,8 @@ public struct App<S: Send + Share> {
     /// The UDP port the same application is served on over HTTP/3, advertised in `Alt-Svc`.
     private http3Port: u16?;
     private log: Box<dyn AccessLog + Send + Share>?;
+    /// How long one resume of a task may compute without waiting, in milliseconds (`bound`); 0: no bound.
+    private boundMs: u64;
 
     /// An application owning `state`, with no routes and no middleware; `limits` bound each connection's requests.
     public fn create(state: S, limits: Limits) -> Result<App<S>, RouteError> {
@@ -56,6 +58,7 @@ public struct App<S: Send + Share> {
             httpLimits: limits,
             http3Port: null,
             log: null,
+            boundMs: 1000,
         });
     }
 
@@ -374,6 +377,15 @@ public struct App<S: Send + Share> {
         this.http3Port = Some(port);
     }
 
+    /// The longest one resume of a task may compute without waiting, in milliseconds: 1 000 by default, 0 for none.
+    /// `run` and `runShared` set it as the program's bound (`Async.runBound`, ceesafec ADR 0186) when they start.
+    /// Under `run`, a request past it traps with `Overran` and costs its connection, where without it the event loop
+    /// stops until the supervisor kills the worker (`stallMs`, 5 000 by default, which the bound must stay well
+    /// below). It needs a build with polls: without them `run` says so once and serves unbounded.
+    public fn bound(borrow mut this, ms: u64) {
+        this.boundMs = ms;
+    }
+
     /// The application's state.
     public fn state(borrow this) -> borrow S => borrow this.appState;
 
@@ -381,33 +393,22 @@ public struct App<S: Send + Share> {
     public fn limits(borrow this) -> borrow Limits => borrow this.httpLimits;
 
     /// Serves connections from `incoming` (a `Listener`, or a `MockIncoming` in tests) through `acceptor`, until
-    /// `drain` finishes or `incoming` ends. A connection is HTTP/2 when TLS negotiated `h2`, or when it starts with
-    /// HTTP/2's preface (prior knowledge, RFC 9113 §3.3); HTTP/1.1 otherwise.
+    /// `drain` finishes or `incoming` ends, each connection in an isolated task (CeeSafe.Web's
+    /// `ConnectionServer.runIsolated`, Web ADR 0016; ceesafec ADR 0175), and each HTTP/2 or HTTP/3 stream too: a
+    /// handler that traps ends its connection (or stream), whose socket is shut, and the server goes on. What the
+    /// connection held is leaked; `Isolation.report()` counts it, and a supervised worker is replaced past the bound its
+    /// options set (`SupervisorOptions.recycleCrashes`, `recycleLeakedBytes`). A trap in a C library's callback, or in
+    /// a `Critical`, still ends the process. The application's `bound` is the program's when it starts. A connection
+    /// is HTTP/2 when TLS negotiated `h2`, or when it starts with HTTP/2's preface (prior knowledge, RFC 9113 §3.3);
+    /// HTTP/1.1 otherwise.
     public async fn run(
-        this,
-        incoming: borrow dyn Incoming,
-        acceptor: borrow dyn Acceptor,
-        limits: borrow ConnectionLimits,
-        drain: borrow Drain,
-    ) -> Result<ServerReport, NetError> {
-        let httpLimits = this.httpLimits;
-        let app = applicationOf(this)?;
-        let service = Serving { app: app, httpLimits: httpLimits };
-        return await ConnectionServer.run(incoming, acceptor, service, limits, drain);
-    }
-
-    /// `run`, with each connection in an isolated task (CeeSafe.Web's `ConnectionServer.runIsolated`, Web ADR 0016;
-    /// ceesafec ADR 0175): a handler that traps ends its connection, whose socket is shut, and the server goes on. What
-    /// the connection held is leaked; `Isolation.report()` counts it, and a supervised worker is replaced past the bound
-    /// its options set (`SupervisorOptions.recycleCrashes`, `recycleLeakedBytes`). A trap in a C library's callback, or
-    /// in a `Critical`, still ends the process.
-    public async fn runIsolated(
         this,
         incoming: borrow dyn Incoming,
         acceptor: Box<dyn Acceptor + Send + Share>,
         limits: borrow ConnectionLimits,
         drain: borrow Drain,
     ) -> Result<ServerReport, NetError> {
+        await applyBound(this.boundMs);
         let httpLimits = this.httpLimits;
         let app = applicationOf(this)?;
         let boxed: Box<dyn ConnectionHandler + Send + Share> = match (Box.create(Serving {
@@ -427,6 +428,45 @@ public struct App<S: Send + Share> {
         };
         return await ConnectionServer.runIsolated(incoming, accepting, handler, limits, drain);
     }
+
+    /// `run`'s name before httpserver 0.2.0, when `run` served connections in plain tasks. It goes in the release
+    /// after 0.2.0.
+    public async fn runIsolated(
+        this,
+        incoming: borrow dyn Incoming,
+        acceptor: Box<dyn Acceptor + Send + Share>,
+        limits: borrow ConnectionLimits,
+        drain: borrow Drain,
+    ) -> Result<ServerReport, NetError> => await this.run(incoming, acceptor, limits, drain);
+
+    /// `run` with each connection in a plain task, as `run` did before httpserver 0.2.0: a trap in a handler ends the
+    /// process, and every connection on it. For a trusted service measured to need what isolation costs. The
+    /// application's `bound` is set as for `run`, and with no isolated unit to end, a task past it is counted
+    /// (`Async.overruns()`), not ended.
+    public async fn runShared(
+        this,
+        incoming: borrow dyn Incoming,
+        acceptor: borrow dyn Acceptor,
+        limits: borrow ConnectionLimits,
+        drain: borrow Drain,
+    ) -> Result<ServerReport, NetError> {
+        await applyBound(this.boundMs);
+        let httpLimits = this.httpLimits;
+        let app = applicationOf(this)?;
+        let service = Serving { app: app, httpLimits: httpLimits };
+        return await ConnectionServer.run(incoming, acceptor, service, limits, drain);
+    }
+}
+
+/// Sets `ms` as the program's bound on one resume of a task (`Async.runBound`, `RunBound.Count`: a task in no isolated
+/// unit is counted, one in a unit ended); in a build without polls, says once that it cannot.
+async fn applyBound(ms: u64) {
+    if (ms == 0 || Async.runBound(ms, RunBound.Count)) {
+        return;
+    }
+    let _ = await AsyncConsole.writeLine(
+        "httpserver: no polls in this build: a request that computes without waiting holds its worker (build with --cflag -DCEE_POLLS=1)",
+    );
 }
 
 /// `app` as a shared `web_http` application, which it owns from now on: what `run` serves over TCP, and what

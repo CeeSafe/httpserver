@@ -7,7 +7,7 @@ Bugs and gaps in CeeSafe and CeeSafe.Web met while writing httpserver, with cees
 |---|---|---|---|
 | S1 | An integer literal inside a parenthesised `if` expression does not take the type the outer `if` expects | ceesafec | fixed in ceesafec 0.65.1 |
 | S2 | A server runs on one thread: nothing serves one listener from several cores | CeeSafe.Web, runtime | measured; the supervisor's worker processes are the way round it |
-| S3 | A trap ends the process: a task cannot fail alone | ceesafec, by design (panic = abort) | ceesafec 0.75.0 (ADR 0175) and CeeSafe.Web's Web ADR 0016: under `app.runIsolated` a trap costs its connection; the supervisor still replaces a worker that ends, and recycles one past `recycleCrashes` |
+| S3 | A trap ends the process: a task cannot fail alone | ceesafec, by design (panic = abort) | ceesafec 0.75.0 (ADR 0175) and CeeSafe.Web's Web ADR 0016: under `app.runIsolated`, which is `app.run` from httpserver 0.2.0 (docs/elixir-gaps.md §2), a trap costs its connection; the supervisor still replaces a worker that ends, and recycles one past `recycleCrashes`, starting another in its place while it drains (§4) |
 | S4 | lib/std cannot start a process without waiting for it, signal one, or wait for any child | lib/std | fixed in 0.70.0 and 0.73.1 (ADRs 0169, 0173): the supervisor spawns its workers and hands them what they share (below) |
 | S5 | No allocation budget for a task, and no allocator for `Vector` or `String` but the system's | runtime | fixed in 0.70.0 (`Budget`): `app.budget(bytes)`; a worker's `RLIMIT_AS` is the backstop |
 | S6 | `ProcessSignals` does not survive `fork` | runtime | fixed in ceesafec 0.65.1: a forked child starts with no subscription |

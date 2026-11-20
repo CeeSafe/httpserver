@@ -61,8 +61,12 @@ async fn serve(
     let bounds = borrow limits;
     let draining = borrow drain;
     let kept = borrow spans;
+    let acceptor: Box<dyn Acceptor + Send + Share> = match (Box.create(PlainAcceptor {})) {
+        Ok(b) => b,
+        Err(_) => { return Err(NetError.OutOfMemory); },
+    };
     let r: Result<Raced<ServerReport>, NetError> = await Async.race(
-        async move () => await app.run(listener, PlainAcceptor {}, bounds, draining),
+        async move () => await app.run(listener, acceptor, bounds, draining),
         async move () => await export<ServerReport>(kept.get(), endpoint, "demo", 200),
     );
     return match (r) {

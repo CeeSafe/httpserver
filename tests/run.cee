@@ -1,0 +1,63 @@
+// `App.run` serves each connection in an isolated task (docs/elixir-gaps.md §2): a handler that traps costs its
+// connection, and the next connection is answered.
+import web_core;
+import web_transport;
+import web_http;
+
+/// Traps: an index out of bounds.
+struct Trapping {}
+
+impl Handler<St> for Trapping {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut Context<St>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        let few = [1u8, 2u8, 3u8];
+        let at = request.path().length + 100;
+        var one = [0u8; 1];
+        one[0] = few[at];
+        return await exchange.send(Status.ok(), one[..]);
+    }
+}
+
+fn netted<T>(r: Result<T, NetError>) -> Result<T, TestFailure> {
+    match (r) {
+        Ok(v) => { return Ok(v); }
+        Err(e) => { return Err(TestFailure.create(NetErrors.describe(e))); }
+    }
+}
+
+/// A connection that asks for `path` and closes.
+fn asking(path: StringView) -> Result<MockTransport, TestFailure> {
+    var text = Vector<u8>.create();
+    alloc(text.extend("GET ".bytes()))?;
+    alloc(text.extend(path.bytes()))?;
+    alloc(text.extend(" HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n".bytes()))?;
+    return alloc(MockTransport.create(text.view()));
+}
+
+@test
+async fn runServesEachConnectionInAnIsolatedTask() -> Result<void, TestFailure> {
+    var app = routed(App<St>.create(state(), quiet()))?;
+    let trapping: Box<dyn Handler<St> + Send + Share> = alloc(Box.create(Trapping {}))?;
+    routed(app.get("/trap", trapping))?;
+    routed(app.get("/a", named(1)?))?;
+    app.bound(0); // no bound: this test is not about it, and a build without polls would say so
+    let incoming = netted(MockIncoming.create(4))?;
+    netted(incoming.push(asking("/trap")?))?;
+    netted(incoming.push(asking("/a")?))?;
+    incoming.close();
+    let before = Isolation.report().crashes;
+    let drain = netted(Drain.create())?;
+    var limits = ConnectionLimits.defaults();
+    limits.graceMs = 1000;
+    let acceptor: Box<dyn Acceptor + Send + Share> = alloc(Box.create(PlainAcceptor {}))?;
+    let report = netted(await app.run(incoming, acceptor, limits, drain))?;
+    Check.equalU64(2, report.accepted)?;
+    Check.equalU64(1, report.crashed)?;
+    Check.isTrue(report.served >= 1, "the connection after the trap was served")?;
+    Check.equalU64(before + 1, Isolation.report().crashes)?;
+    return Ok();
+}

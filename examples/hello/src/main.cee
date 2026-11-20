@@ -69,7 +69,12 @@ fn application() -> Result<App<Shop>, RouteError> {
 async fn serve(app: App<Shop>, listener: borrow Listener) -> Result<ServerReport, NetError> {
     let drain = Drain.create()?;
     let limits = ConnectionLimits.defaults();
-    return await app.run(listener, PlainAcceptor {}, limits, drain);
+    // Each connection in an isolated task: a handler that traps costs its connection, not the server.
+    let acceptor: Box<dyn Acceptor + Send + Share> = match (Box.create(PlainAcceptor {})) {
+        Ok(b) => b,
+        Err(_) => { return Err(NetError.OutOfMemory); },
+    };
+    return await app.run(listener, acceptor, limits, drain);
 }
 
 fn main() {

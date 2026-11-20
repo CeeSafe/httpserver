@@ -3,7 +3,7 @@ name = "hello"
 version = "0.1.0"
 kind = "executable"
 sources = ["src"]
-ceesafec = ">=0.77.2"
+ceesafec = ">=0.80.0"
 
 [dependencies]
 httpserver = { path = "../.." }

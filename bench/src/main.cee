@@ -11,12 +11,12 @@
 //                        more middleware)
 //   POST /stop           starts the drain
 //   GET  /worker         which worker process answered
-//   GET  /crash          traps (an index out of bounds), which ends the process, or with CW_ISOLATED=1 its connection
-//   GET  /crash/kept     traps holding the output cache's lock, which the next use of the cache repairs (CW_ISOLATED=1);
+//   GET  /crash          traps (an index out of bounds), which costs its connection, or with CW_ISOLATED=0 the process
+//   GET  /crash/kept     traps holding the output cache's lock, which the next use of the cache repairs;
 //                        only in a build with `--cflag -DHTTPSERVER_TRAP_HOOKS=1`, else a 404
 //   GET  /crash/gz/{n:int} traps holding `/gz`'s encoder's lock, half way through n bytes, which the next `/gz` repairs
 //                        (the same build)
-//   GET  /spin           computes without end, which stops the event loop, or with CW_RUN_BOUND_MS its connection
+//   GET  /spin           computes without end: past the bound it costs its connection; without polls it stops the loop
 //   GET  /spin/{ms:int}  computes for ms milliseconds without waiting (at most a minute), then answers "spun"
 //   GET  /kept/{n:int}   the same text through the output cache, kept for a minute
 //   GET  /gz/{n:int}     n bytes of JSON-like text through `Compression`: gzip for a client that accepts it
@@ -33,14 +33,15 @@
 // (SO_REUSEPORT), which on Linux spreads connections evenly, and for which a worker replaced while it drains needs
 // `net.ipv4.tcp_migrate_req = 1` (5.14 and later) not to reset what waits in its socket's queue.
 //
-// CW_ISOLATED=1 serves each connection in an isolated task (`App.runIsolated`): a trap costs its connection, not the
-// worker, and a worker is replaced after CW_RECYCLE_CRASHES crashes (100 by default): another is started in its
-// place at once, and it drains.
+// Each connection is served in an isolated task (`App.run`): a trap costs its connection, not the worker, and a
+// worker is replaced after CW_RECYCLE_CRASHES crashes (100 by default): another is started in its place at once, and
+// it drains. CW_ISOLATED=0 serves them in plain tasks (`App.runShared`), where a trap ends the worker.
 //
-// CW_RUN_BOUND_MS=n bounds how long a task may compute without waiting (`Async.runBound`, ceesafec ADR 0186), in a
-// build with `--cflag -DCEE_POLLS=1`: under CW_ISOLATED=1 a request that computes past it traps with `Overran` and
-// costs its connection, where without it the event loop stops until the supervisor kills the worker. A task in no
-// isolated unit is counted, not ended (`RunBound.Count`). A build without the macro says so and runs unbounded.
+// CW_RUN_BOUND_MS=n is the application's bound on how long a task may compute without waiting (`App.bound`, 1 000 ms
+// by default, 0 for none; `Async.runBound`, ceesafec ADR 0186), in a build with `--cflag -DCEE_POLLS=1`: a request
+// that computes past it traps with `Overran` and costs its connection, where without it the event loop stops until
+// the supervisor kills the worker. Under CW_ISOLATED=0 a task past it is counted, not ended (`RunBound.Count`). A
+// build without the macro says so once a worker and runs unbounded.
 //
 // The worker's housekeeping runs under a `Services` supervisor (src/services.cee): the reading of the bus and, with
 // CW_JOBS=1, a scheduler whose job runs every second. Each start of one is an isolated task, so a trap in it ends
@@ -887,7 +888,7 @@ async fn serve(
     let bounds = borrow limits;
     let draining = borrow drain;
     let tending = borrow services;
-    let isolated = setting("CW_ISOLATED", 0) == 1;
+    let isolated = setting("CW_ISOLATED", 1) == 1;
     let r: Result<Raced<ServerReport>, NetError> = await Async.race(
         async move () => {
             if (isolated) {
@@ -895,9 +896,9 @@ async fn serve(
                     Ok(b) => b,
                     Err(_) => { return Err(NetError.OutOfMemory); },
                 };
-                return await app.runIsolated(listener, acceptor, bounds, draining);
+                return await app.run(listener, acceptor, bounds, draining);
             }
-            return await app.run(listener, PlainAcceptor {}, bounds, draining);
+            return await app.runShared(listener, PlainAcceptor {}, bounds, draining);
         },
         async move () => await housekeeping(worker, draining, tending),
     );
@@ -983,17 +984,15 @@ fn serveOn(worker: Worker, listener: borrow dyn web_transport.Incoming, words: S
             return 1;
         },
     };
-    let app = match (application(worker.index(), parts.wiring)) {
+    var app = match (application(worker.index(), parts.wiring)) {
         Ok(a) => a,
         Err(_) => {
             Console.writeLine("bench: could not build the routes");
             return 1;
         },
     };
-    let bound = setting("CW_RUN_BOUND_MS", 0);
-    if (bound > 0 && !Async.runBound(bound, RunBound.Count)) {
-        Console.writeLine("bench: CW_RUN_BOUND_MS needs a build with --cflag -DCEE_POLLS=1; running unbounded");
-    }
+    // The application's bound (1 000 ms by default), which `run` sets; 0 for none.
+    app.bound(setting("CW_RUN_BOUND_MS", 1000));
     match (Async.run(serve(app, worker, listener, tended))) {
         Ok(_) => { return 0; }
         Err(e) => {

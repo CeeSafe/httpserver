@@ -2,21 +2,24 @@
 """Checks the supervisor with the benchmark server: workers that crash, stall or run out of memory are replaced, the
 others keep answering, and a SIGTERM to the supervisor ends them all.
 
-usage: python3 tools/supervisor_check.py [--port 18490] [--procs 3] [--memory-mb 0] [--budget-mb 0] [--isolated]
-       (after `ceesafec build` in bench/)
+usage: python3 tools/supervisor_check.py [--port 18490] [--procs 3] [--memory-mb 0] [--budget-mb 0] [--shared]
+       (after `ceesafec build` in bench/, and the build of bench-traps below)
 
 Then, in either mode, the worker's services (src/services.cee) on ports --port + 2: a scheduled job that traps is
 started again by its `Services` supervisor, and one that traps at every run makes it give up and the worker end.
 
---isolated serves each connection in an isolated task (CW_ISOLATED=1): a trap then costs its connection and no
-worker, and a worker whose tasks have trapped twice (CW_RECYCLE_CRASHES=2) drains and is started again. Two of its
+By default the benchmark server serves each connection in an isolated task (`App.run`): a trap then costs its
+connection and no worker, and a worker whose tasks have trapped twice (CW_RECYCLE_CRASHES=2) drains and is started again. Two of its
 traps hold a lock: the output cache's, then the gzip encoder's. The next uses repair and heal them, the cache's from
 the bus's reading (CW_BUS=1), a service of the worker's `Services`. Those two traps are
-hooks only a build with the C macro HTTPSERVER_TRAP_HOOKS has. --isolated also bounds how long a request may compute
-without waiting (CW_RUN_BOUND_MS=250, ceesafec ADR 0186), which needs polls compiled in (CEE_POLLS): a request that
-spins then traps with `Overran` and costs its connection, and its worker, not stalled, answers the others meanwhile.
-So --isolated runs bench/out/bench-traps, built with both macros:
+hooks only a build with the C macro HTTPSERVER_TRAP_HOOKS has. It also bounds how long a request may compute without
+waiting (CW_RUN_BOUND_MS=250, ceesafec ADR 0186), which needs polls compiled in (CEE_POLLS): a request that spins
+then traps with `Overran` and costs its connection, and its worker, not stalled, answers the others meanwhile. So it
+runs bench/out/bench-traps, built with both macros:
        (cd bench && ceesafec build --cflag -DHTTPSERVER_TRAP_HOOKS=1 --cflag -DCEE_POLLS=1 -o out/bench-traps)
+and then bench/out/bench, built without polls, which says so at start, and whose spin the supervisor's stall catches.
+--shared serves the connections in plain tasks (`App.runShared`, CW_ISOLATED=0), with bench/out/bench: a trap ends
+the worker, and the supervisor starts another. --isolated is the default, kept as a name.
 """
 import argparse, gzip, http.client, os, pathlib, signal, subprocess, sys, threading, time
 
@@ -27,8 +30,10 @@ args.add_argument("--procs", type=int, default=3)
 args.add_argument("--memory-mb", type=int, default=0)
 args.add_argument("--budget-mb", type=int, default=0)
 args.add_argument("--inherit", action="store_true")
-args.add_argument("--isolated", action="store_true")
+args.add_argument("--isolated", action="store_true")  # the default
+args.add_argument("--shared", action="store_true")
 a = args.parse_args()
+isolated = not a.shared
 
 def get(path, timeout=3.0, port=None):
     """(status, body), or None if the connection failed or timed out."""
@@ -81,13 +86,13 @@ if a.memory_mb:
     env["CW_MEMORY_MB"] = str(a.memory_mb)
 if a.budget_mb:
     env["CW_BUDGET_MB"] = str(a.budget_mb)
-if a.isolated:
-    env["CW_ISOLATED"] = "1"
+env["CW_ISOLATED"] = "1" if isolated else "0"
+if isolated:
     env["CW_RECYCLE_CRASHES"] = "2"
     env["CW_BUS"] = "1"
     env["CW_RUN_BOUND_MS"] = "250"
 log = open("/tmp/supervisor_check.log", "w")
-binary = HERE / "bench" / "out" / ("bench-traps" if a.isolated else "bench")
+binary = HERE / "bench" / "out" / ("bench-traps" if isolated else "bench")
 proc = subprocess.Popen([str(binary)], env=env, stdout=log, stderr=subprocess.STDOUT)
 try:
     time.sleep(1.0)
@@ -109,11 +114,11 @@ try:
                 steady["failed"] += 1
             time.sleep(0.01)
 
-    clients = [threading.Thread(target=client) for _ in range(2)] if a.isolated else []
+    clients = [threading.Thread(target=client) for _ in range(2)] if isolated else []
     for c in clients:
         c.start()
 
-    if a.isolated:
+    if isolated:
         # A trap holding the cache's lock. `/bus/forget/7`, answered by another worker, reaches the one whose lock
         # is poisoned through the bus, in its bus service: it empties the table and heals the lock, where a panic
         # would cost a start of that service. Then `/forget/7` forgets in the request too.
@@ -144,7 +149,7 @@ try:
         expect(f"crash {n + 1}: the request that traps gets no answer", get("/crash") is None)
         expect(f"crash {n + 1}: the server still answers", answering() >= 39)
     time.sleep(0.5)
-    if a.isolated:
+    if isolated:
         time.sleep(1.0)  # the last recycle's drain
         steady["stop"] = True
         for c in clients:
@@ -157,7 +162,7 @@ try:
             # net.ipv4.tcp_migrate_req is 1, which this check does not set; it is told, not asked.
             print(f"     {what} (sockets of their own)")
 
-    if a.isolated:
+    if isolated:
         # The bound (ADR 0186): a request that computes past 250 ms traps with Overran and costs its connection, well
         # before the supervisor's 1.5 s stall would kill its worker; meanwhile every other request is answered.
         expect("bound: a request that computes 50 ms, under the bound, is answered",
@@ -221,7 +226,7 @@ print("--- the supervisor's log")
 print(text.strip())
 lines = text.split("\n")
 report = lines[lines.index("bench: started, crashed, stalled, killed") + 1:][:4] if "bench: started, crashed, stalled, killed" in lines else []
-if a.isolated:
+if isolated:
     # Seven traps over three workers (two of them holding a lock) and two requests ended by the run bound: at least
     # one worker took two and was replaced, none crashed, and none stalled or was killed.
     recycled = text.count("passed the bound: draining, to be replaced")
@@ -295,7 +300,7 @@ expect(f"services: one worker replaced, as a crash, no stall, no kill ({report})
 # twice more; at the third the restarts would pass three, and the supervisor gives up.
 expect(f"services: each of the job's traps ended alone ({text.count('ended alone)')} of 4)", text.count("ended alone)") == 4)
 
-if a.isolated:
+if isolated:
     # The bound on one event loop: a single worker, which a crash does not recycle. A request on a second connection
     # to it waits for the spin to be ended at the bound and is then answered by the same worker, three times over.
     print("--- one worker, CW_RUN_BOUND_MS=250")
@@ -335,4 +340,38 @@ if a.isolated:
     expect(f"one worker: started once, no crash, no stall, no kill ({report})", report == ["1", "0", "0", "0"])
     expect(f"one worker: the three spins were ended by the bound ({text.count('past its bound of 250 ms')} of 3)",
            text.count("past its bound of 250 ms") == 3 and text.count("ended alone)") == 3)
+if isolated:
+    # A build without polls (bench/out/bench): `App.run` says so at start, and a request that computes without end
+    # holds its worker until the supervisor's stall catches it, as before the bound.
+    print("--- one worker without polls")
+    port = a.port + 3
+    plain = dict(os.environ, CW_PORT=str(port), CW_PROCS="1", CW_STALL_MS="1500")
+    log = open("/tmp/supervisor_check_nopolls.log", "w")
+    proc = subprocess.Popen([str(HERE / "bench" / "out" / "bench")], env=plain, stdout=log, stderr=subprocess.STDOUT)
+    try:
+        time.sleep(1.0)
+        expect("no polls: answered at the start", get("/small", port=port) == (200, b"hello, world\n"))
+        t0 = time.time()
+        expect("no polls: the request that never ends gets no answer", get("/spin", timeout=8.0, port=port) is None)
+        print(f"     the stuck worker was gone after {time.time() - t0:.1f} s")
+        time.sleep(1.0)
+        answered = False
+        for _ in range(50):
+            if get("/small", port=port) == (200, b"hello, world\n"):
+                answered = True
+                break
+            time.sleep(0.1)
+        expect("no polls: the worker started in its place answers", answered)
+        proc.send_signal(signal.SIGTERM)
+        code = proc.wait(10)
+        expect(f"no polls: the supervisor ends on SIGTERM (status {code})", code == 0)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+    log.close()
+    text = open("/tmp/supervisor_check_nopolls.log").read()
+    lines = text.split("\n")
+    report = lines[lines.index("bench: started, crashed, stalled, killed") + 1:][:4] if "bench: started, crashed, stalled, killed" in lines else []
+    expect("no polls: the worker said it has none", "httpserver: no polls in this build" in text)
+    expect(f"no polls: the supervisor's stall caught the spin ({report})", len(report) == 4 and report[2] == "1")
 sys.exit(1 if problems else 0)
