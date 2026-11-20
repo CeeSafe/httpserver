@@ -3,20 +3,20 @@
 [[package]]
 name = "web_core"
 source = "git+https://github.com/CeeSafe/CeeSafe.Web.git"
-commit = "91ef1130750de03511bf2c70c1314633a5c3fce9"
+commit = "9e83e4d6a3c0a448481bfdf829d582038164d46b"
 dir = "packages/web_core"
 hash = "sha256:58ff1ff6e0e50253d813c75a0dc63e90100cdf3f5e22ce349befa7147e2cd6aa"
 
 [[package]]
 name = "web_http"
 source = "git+https://github.com/CeeSafe/CeeSafe.Web.git"
-commit = "91ef1130750de03511bf2c70c1314633a5c3fce9"
+commit = "9e83e4d6a3c0a448481bfdf829d582038164d46b"
 dir = "packages/web_http"
 hash = "sha256:f1a021e01dee021a1580b0583e8d0eb708bf4779c12fbf409db3948de4ec1bf0"
 
 [[package]]
 name = "web_ws"
 source = "git+https://github.com/CeeSafe/CeeSafe.Web.git"
-commit = "91ef1130750de03511bf2c70c1314633a5c3fce9"
+commit = "9e83e4d6a3c0a448481bfdf829d582038164d46b"
 dir = "packages/web_ws"
 hash = "sha256:a39acfb6dbfcc1fc4d85fe1aad93d73e7c4edb111ed6733406a8b7bbea2c777b"

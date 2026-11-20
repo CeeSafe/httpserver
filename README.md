@@ -197,9 +197,9 @@ polls = true              # the bound on a request that computes without waiting
 
 [dependencies]
 httpserver = { git = "https://github.com/CeeSafe/httpserver.git", rev = "<a commit of this repository>" }
-web_core = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "91ef1130750de03511bf2c70c1314633a5c3fce9", dir = "packages/web_core" }
-web_transport = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "91ef1130750de03511bf2c70c1314633a5c3fce9", dir = "packages/web_transport" }
-web_http = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "91ef1130750de03511bf2c70c1314633a5c3fce9", dir = "packages/web_http" }
+web_core = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "9e83e4d6a3c0a448481bfdf829d582038164d46b", dir = "packages/web_core" }
+web_transport = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "9e83e4d6a3c0a448481bfdf829d582038164d46b", dir = "packages/web_transport" }
+web_http = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "9e83e4d6a3c0a448481bfdf829d582038164d46b", dir = "packages/web_http" }
 ```
 
 The other packages are directories of this repository: add `dir`, as in

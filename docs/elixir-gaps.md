@@ -332,8 +332,8 @@ Built and checked with ceesafec 0.82.0 (CeeSafe's release branch at `8ba415aa`, 
 0.82.0 when another session tagged a 0.81.0 meanwhile; same ADR 0189 and 0190 code) and CeeSafe.Web at #53's head
 (`91ef113`), on macOS (Apple M1) at load averages of 6 to 12.
 
-- **The pin** (commit `2616409`): every manifest names CeeSafe.Web at `91ef113`, and the locks are fetched again. It
-  moves to #53's merge commit once the pull request is merged.
+- **The pin** (commit `2616409`): every manifest names CeeSafe.Web at `91ef113`, and the locks are fetched again.
+  After #53 merged, every manifest names its merge commit, `9e83e4d`, and the checks below were run again on it.
 - **Gap 3, step 4: `polls = true`** (commit `a1440dd`): `bench`, `examples/hello` and `otel/demo` ask for the polls
   in their manifests (ADR 0190), as does the README's example manifest; a library's key does nothing for its users,
   so the root package does not. The start-up line of a build without polls says `add polls = true to ceesafe.toml`.

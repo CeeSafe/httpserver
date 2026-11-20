@@ -10,9 +10,9 @@ polls = true                   # ADR 0190: the bound sees a request that compute
 httpserver = { path = ".." }
 httpserver_ws = { path = "../ws" }
 httpserver_compress = { path = "../compress" }
-web_ws = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "91ef1130750de03511bf2c70c1314633a5c3fce9", dir = "packages/web_ws" }
-web_core = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "91ef1130750de03511bf2c70c1314633a5c3fce9", dir = "packages/web_core" }
-web_transport = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "91ef1130750de03511bf2c70c1314633a5c3fce9", dir = "packages/web_transport" }
-web_http = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "91ef1130750de03511bf2c70c1314633a5c3fce9", dir = "packages/web_http" }
+web_ws = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "9e83e4d6a3c0a448481bfdf829d582038164d46b", dir = "packages/web_ws" }
+web_core = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "9e83e4d6a3c0a448481bfdf829d582038164d46b", dir = "packages/web_core" }
+web_transport = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "9e83e4d6a3c0a448481bfdf829d582038164d46b", dir = "packages/web_transport" }
+web_http = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "9e83e4d6a3c0a448481bfdf829d582038164d46b", dir = "packages/web_http" }
 # /json's writer, as CeeSafe.Web's own benchmark server uses
 json = { git = "https://github.com/CeeSafe/CeeSafeLibs.git", rev = "ca0a13fec248bbe192f0b61b930c8b8259175eed", dir = "json" }
