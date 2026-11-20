@@ -13,7 +13,7 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
-  CEESAFE_VERSION: v0.80.0 # the release the packages were last tested with and are formatted by; their manifests ask for 0.80.0 or later
+  CEESAFE_VERSION: v0.81.0 # the release the packages were last tested with and are formatted by; their manifests ask for 0.80.0 or later (0.81.0 where they say `polls`)
 
 jobs:
   test:
@@ -87,7 +87,8 @@ jobs:
         run: |
           set -e
           python3 tools/supervisor_check.py $INHERIT --budget-mb 16 --shared
-          (cd bench && ceesafec build --cflag -DHTTPSERVER_TRAP_HOOKS=1 --cflag -DCEE_POLLS=1 -o out/bench-traps)
+          (cd bench && ceesafec build --cflag -DHTTPSERVER_TRAP_HOOKS=1 -o out/bench-traps)
+          (cd bench && ceesafec build --no-polls -o out/bench-nopolls)
           python3 tools/supervisor_check.py $INHERIT --budget-mb 16 --port 18491
 
       - name: Compressed responses

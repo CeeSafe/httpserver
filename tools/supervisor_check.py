@@ -13,11 +13,13 @@ connection and no worker, and a worker whose tasks have trapped twice (CW_RECYCL
 traps hold a lock: the output cache's, then the gzip encoder's. The next uses repair and heal them, the cache's from
 the bus's reading (CW_BUS=1), a service of the worker's `Services`. Those two traps are
 hooks only a build with the C macro HTTPSERVER_TRAP_HOOKS has. It also bounds how long a request may compute without
-waiting (CW_RUN_BOUND_MS=250, ceesafec ADR 0186), which needs polls compiled in (CEE_POLLS): a request that spins
-then traps with `Overran` and costs its connection, and its worker, not stalled, answers the others meanwhile. So it
-runs bench/out/bench-traps, built with both macros:
-       (cd bench && ceesafec build --cflag -DHTTPSERVER_TRAP_HOOKS=1 --cflag -DCEE_POLLS=1 -o out/bench-traps)
-and then bench/out/bench, built without polls, which says so at start, and whose spin the supervisor's stall catches.
+waiting (CW_RUN_BOUND_MS=250, ceesafec ADR 0186), which needs polls compiled in (bench/ceesafe.toml's `polls = true`,
+ceesafec ADR 0190): a request that spins then traps with `Overran` and costs its connection, and its worker, not
+stalled, answers the others meanwhile. So it runs bench/out/bench-traps, built with the macro:
+       (cd bench && ceesafec build --cflag -DHTTPSERVER_TRAP_HOOKS=1 -o out/bench-traps)
+and then bench/out/bench-nopolls, built without polls, which says so at start, and whose spin the supervisor's stall
+catches:
+       (cd bench && ceesafec build --no-polls -o out/bench-nopolls)
 --shared serves the connections in plain tasks (`App.runShared`, CW_ISOLATED=0), with bench/out/bench: a trap ends
 the worker, and the supervisor starts another. --isolated is the default, kept as a name.
 """
@@ -341,13 +343,13 @@ if isolated:
     expect(f"one worker: the three spins were ended by the bound ({text.count('past its bound of 250 ms')} of 3)",
            text.count("past its bound of 250 ms") == 3 and text.count("ended alone)") == 3)
 if isolated:
-    # A build without polls (bench/out/bench): `App.run` says so at start, and a request that computes without end
-    # holds its worker until the supervisor's stall catches it, as before the bound.
+    # A build without polls (bench/out/bench-nopolls): `App.run` says so at start, and a request that computes
+    # without end holds its worker until the supervisor's stall catches it, as before the bound.
     print("--- one worker without polls")
     port = a.port + 3
     plain = dict(os.environ, CW_PORT=str(port), CW_PROCS="1", CW_STALL_MS="1500")
     log = open("/tmp/supervisor_check_nopolls.log", "w")
-    proc = subprocess.Popen([str(HERE / "bench" / "out" / "bench")], env=plain, stdout=log, stderr=subprocess.STDOUT)
+    proc = subprocess.Popen([str(HERE / "bench" / "out" / "bench-nopolls")], env=plain, stdout=log, stderr=subprocess.STDOUT)
     try:
         time.sleep(1.0)
         expect("no polls: answered at the start", get("/small", port=port) == (200, b"hello, world\n"))

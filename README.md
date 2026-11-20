@@ -192,13 +192,14 @@ name = "myserver"
 version = "0.1.0"
 kind = "executable"
 sources = ["src"]
-ceesafec = ">=0.77.2"
+ceesafec = ">=0.81.0"
+polls = true              # the bound on a request that computes without waiting (below)
 
 [dependencies]
 httpserver = { git = "https://github.com/CeeSafe/httpserver.git", rev = "<a commit of this repository>" }
-web_core = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "79ae13870e2d454bd590747b9b3ce3d2c5a026df", dir = "packages/web_core" }
-web_transport = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "79ae13870e2d454bd590747b9b3ce3d2c5a026df", dir = "packages/web_transport" }
-web_http = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "79ae13870e2d454bd590747b9b3ce3d2c5a026df", dir = "packages/web_http" }
+web_core = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "91ef1130750de03511bf2c70c1314633a5c3fce9", dir = "packages/web_core" }
+web_transport = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "91ef1130750de03511bf2c70c1314633a5c3fce9", dir = "packages/web_transport" }
+web_http = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "91ef1130750de03511bf2c70c1314633a5c3fce9", dir = "packages/web_http" }
 ```
 
 The other packages are directories of this repository: add `dir`, as in
@@ -365,21 +366,21 @@ one that drains beats, and writes the bus (`worker.ring()`), apart from it.
   with sockets of their own. The old one finishes what is in flight and ends; one that outlives `graceMs` after it
   was told is killed. `SupervisorReport.recycled` counts the replacements.
 
-**A trap costs one connection, not a worker.** `app.run(incoming, acceptor, limits, drain)` serves each connection in
-an isolated task (ceesafec ADR 0175, CeeSafe.Web's `ConnectionServer.runIsolated`, Web ADR 0016); `runIsolated` is
-its name before 0.2.0, kept one release, and `runShared`, with the acceptor borrowed, serves them in plain tasks,
-where a trap ends the worker. A
-handler that traps ends its connection, whose socket the server shuts, and the worker goes on with the rest. What the
-connection held, memory and its socket, is leaked, and `Isolation.report()` counts it. So `tend` replaces a worker whose
-isolated tasks have trapped `recycleCrashes` times (100 by default) or leaked `recycleLeakedBytes` (64 MiB), and the
-supervisor starts it again. HTTP/2 and HTTP/3 streams are isolated one by one (Web ADR 0016 §2.3): a trap costs its
-stream, not the connection's others. A computation that never awaits costs only its connection or stream in a build with
-polls (`--cflag -DCEE_POLLS=1`): `run` sets the application's bound, `app.bound(ms)` (1 000 ms by default, 0 for
-none; `Async.runBound`, ceesafec ADR 0186; the benchmark server's `CW_RUN_BOUND_MS`), and past it the request traps
-with `Overran` and ends alone, its neighbours having waited at most that long. A build without polls says so once at
-start: `httpserver: no polls in this build: …`. Once ceesafec has ADR 0190, a program asks for polls with
-`polls = true` in its manifest's `[package]`. Still ending the worker: a trap under a C library's callback or inside a `Critical`, and, without the bound, or in
-C code or a blocking system call, a computation that does not return to the loop (the stall below).
+**A trap costs one connection, not a worker.** `app.run(incoming, acceptor, limits, drain)` serves each connection in an
+isolated task (ceesafec ADR 0175, CeeSafe.Web's `ConnectionServer.runIsolated`, Web ADR 0016); `runIsolated` is its name
+before 0.2.0, kept one release, and `runShared`, with the acceptor borrowed, serves them in plain tasks, where a trap
+ends the worker. A handler that traps ends its connection, whose socket the server shuts, and the worker goes on with
+the rest. What the connection held, memory and its socket, is leaked, and `Isolation.report()` counts it. So `tend`
+replaces a worker whose isolated tasks have trapped `recycleCrashes` times (100 by default) or leaked
+`recycleLeakedBytes` (64 MiB), and the supervisor starts it again. HTTP/2 and HTTP/3 streams are isolated one by one
+(Web ADR 0016 §2.3): a trap costs its stream, not the connection's others. A computation that never awaits costs only
+its connection or stream in a build with polls (`polls = true` in the program's manifest, ceesafec ADR 0190): `run` sets
+the application's bound, `app.bound(ms)` (1 000 ms by default, 0 for none; `Async.runBound`, ceesafec ADR 0186; the
+benchmark server's `CW_RUN_BOUND_MS`), and past it the request traps with `Overran` and ends alone, its neighbours
+having waited at most that long. A build without polls says so once at start: `httpserver: no polls in this build: …`. A
+library's `polls = true` does nothing for its users: the program's own manifest asks. Still ending the worker: a trap
+under a C library's callback or inside a `Critical`, and, without the bound, or in C code or a blocking system call, a
+computation that does not return to the loop (the stall below).
 
 What it costs: the requests in flight on a worker that ends get no answer, and the workers share no memory, so a
 counter or a cache is per worker unless it is put somewhere they share. `SharedWords` is such a place for numbers:
@@ -394,20 +395,20 @@ the benchmark server). Nothing blocks: a reader that falls a whole ring behind s
 another worker's session sent (`Hub.encode` makes it). The bus is one machine's; across machines a broker is
 needed.
 
-`python3 tools/supervisor_check.py [--inherit] [--memory-mb 512] [--budget-mb 16] [--shared]` checks all of this
-against the benchmark server: five traps, a handler that never returns and one that takes memory until it fails,
-each followed by the server still answering. By default (isolated connections) the traps cost their requests and no
-worker, and a worker whose tasks trapped twice is replaced while two clients' requests go on, none of them failing;
-two more traps hold the output cache's lock and the gzip encoder's, which the next uses repair, the cache's from the
-bus. Those two need the trap hooks, which only a build with `--cflag -DHTTPSERVER_TRAP_HOOKS=1` has. The bound
-(`CW_RUN_BOUND_MS=250`, `App.bound`, ceesafec ADR 0186) ends the handler that never returns alone with `Overran`,
-its worker answering the other requests meanwhile. The bound needs polls compiled in, `--cflag -DCEE_POLLS=1`: the
-check runs `bench/out/bench-traps`, built with both macros, then `bench/out/bench`, built without polls, which says
-so at start and whose spin the supervisor's stall catches. It also checks the worker's services: a scheduled job
-that traps is started again, and one that traps at every run ends the worker. `--shared` runs the connections in
-plain tasks (`App.runShared`), where each trap ends a worker. On macOS add `--inherit`: without it (the checks set
-`CW_INHERIT=0`) the kernel gives every connection to one worker, and requests that wait in a replaced worker's own
-socket are reset (Linux moves them with `net.ipv4.tcp_migrate_req = 1`), so only `--inherit` asks that none fails.
+`python3 tools/supervisor_check.py [--inherit] [--memory-mb 512] [--budget-mb 16] [--shared]` checks all of this against
+the benchmark server: five traps, a handler that never returns and one that takes memory until it fails, each followed
+by the server still answering. By default (isolated connections) the traps cost their requests and no worker, and a
+worker whose tasks trapped twice is replaced while two clients' requests go on, none of them failing; two more traps
+hold the output cache's lock and the gzip encoder's, which the next uses repair, the cache's from the bus. Those two
+need the trap hooks, which only a build with `--cflag -DHTTPSERVER_TRAP_HOOKS=1` has. The bound (`CW_RUN_BOUND_MS=250`,
+`App.bound`, ceesafec ADR 0186) ends the handler that never returns alone with `Overran`, its worker answering the other
+requests meanwhile. The bound needs polls, which `bench/ceesafe.toml` asks for (`polls = true`): the check runs
+`bench/out/bench-traps`, built with the trap hooks, then `bench/out/bench-nopolls`, built with `--no-polls`, which says
+so at start and whose spin the supervisor's stall catches. It also checks the worker's services: a scheduled job that
+traps is started again, and one that traps at every run ends the worker. `--shared` runs the connections in plain tasks
+(`App.runShared`), where each trap ends a worker. On macOS add `--inherit`: without it (the checks set `CW_INHERIT=0`)
+the kernel gives every connection to one worker, and requests that wait in a replaced worker's own socket are reset
+(Linux moves them with `net.ipv4.tcp_migrate_req = 1`), so only `--inherit` asks that none fails.
 
 The shared memory is ceesafec's `SharedMemory` with no name (`SharedMemory.anonymous`), which a process reaches
 only by being handed it, so a supervisor that is killed leaves nothing behind. The supervisor starts, watches and
@@ -537,8 +538,9 @@ ceesafec test --cflag -DHTTPSERVER_TRAP_HOOKS=1 --cflag -fsanitize=address,undef
 (cd examples/hello && ceesafec build)
 (cd bench && ceesafec build)      # then: python3 <CeeSafe.Web>/benchmarks/servers/conform.py --port 8090
 python3 tools/supervisor_check.py --shared   # connections in plain tasks, against bench/out/bench
-(cd bench && ceesafec build --cflag -DHTTPSERVER_TRAP_HOOKS=1 --cflag -DCEE_POLLS=1 -o out/bench-traps)
-python3 tools/supervisor_check.py   # isolated connections, against bench/out/bench-traps, then bench/out/bench
+(cd bench && ceesafec build --cflag -DHTTPSERVER_TRAP_HOOKS=1 -o out/bench-traps)
+(cd bench && ceesafec build --no-polls -o out/bench-nopolls)
+python3 tools/supervisor_check.py   # isolated connections, against bench/out/bench-traps, then bench/out/bench-nopolls
 python3 tools/gzip_check.py       # compressed responses, against Python's gzip
 python3 tools/ratelimit_check.py  # one rate limit for four workers (add --inherit on macOS)
 python3 tools/bus_check.py        # the bus between four workers (add --inherit on macOS)

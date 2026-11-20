@@ -465,7 +465,7 @@ async fn applyBound(ms: u64) {
         return;
     }
     let _ = await AsyncConsole.writeLine(
-        "httpserver: no polls in this build: a request that computes without waiting holds its worker (build with --cflag -DCEE_POLLS=1)",
+        "httpserver: no polls in this build: a request that computes without waiting holds its worker (add polls = true to ceesafe.toml)",
     );
 }
 

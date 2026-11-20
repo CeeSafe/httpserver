@@ -37,11 +37,11 @@
 // worker is replaced after CW_RECYCLE_CRASHES crashes (100 by default): another is started in its place at once, and
 // it drains. CW_ISOLATED=0 serves them in plain tasks (`App.runShared`), where a trap ends the worker.
 //
-// CW_RUN_BOUND_MS=n is the application's bound on how long a task may compute without waiting (`App.bound`, 1 000 ms
-// by default, 0 for none; `Async.runBound`, ceesafec ADR 0186), in a build with `--cflag -DCEE_POLLS=1`: a request
-// that computes past it traps with `Overran` and costs its connection, where without it the event loop stops until
-// the supervisor kills the worker. Under CW_ISOLATED=0 a task past it is counted, not ended (`RunBound.Count`). A
-// build without the macro says so once a worker and runs unbounded.
+// CW_RUN_BOUND_MS=n is the application's bound on how long a task may compute without waiting (`App.bound`, 1 000 ms by
+// default, 0 for none; `Async.runBound`, ceesafec ADR 0186), in a build with polls (this package's `polls = true`): a
+// request that computes past it traps with `Overran` and costs its connection, where without it the event loop stops
+// until the supervisor kills the worker. Under CW_ISOLATED=0 a task past it is counted, not ended (`RunBound.Count`). A
+// build without polls (`--no-polls`) says so once a worker and runs unbounded.
 //
 // The worker's housekeeping runs under a `Services` supervisor (src/services.cee): the reading of the bus and, with
 // CW_JOBS=1, a scheduler whose job runs every second. Each start of one is an isolated task, so a trap in it ends
