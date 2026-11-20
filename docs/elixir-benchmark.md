@@ -119,8 +119,7 @@ p50 (340 to 380 µs) is mostly the client's own; the differences between rows ar
 
 ## After CeeSafe's ADR 0191 (2026-11-21)
 
-The two starvations above were one cause in CeeSafe's executor, fixed by its ADR 0191 (branch
-`fix/executor-fairness`, not yet released): a busy executor now collects socket events, wakes and due timers every
+The two starvations above were one cause in CeeSafe's executor, fixed by its ADR 0191 (ceesafec 0.83.0): a busy executor now collects socket events, wakes and due timers every
 millisecond, and a task paused past its slice waits in a queue of its own, so the tasks woken behind it run first.
 The same runs again, the bench built with that compiler, Bandit unchanged (`bench/elixir/results/2026-11-21-rq-adr0191/`):
 

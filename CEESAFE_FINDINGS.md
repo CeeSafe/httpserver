@@ -266,6 +266,15 @@ for 300 ms waits a median of under 0.2 s (0.07 s here), that the 300 ms one is a
 ended at its bound. ADR 0190 lets the manifest ask for the polls, `polls = true`, in place of a flag on every build
 command; httpserver's servers do.
 
+ceesafec 0.83.0 (ADR 0191, from the benchmark against Bandit in docs/elixir-benchmark.md) fixes what the slice still
+left: a paused task went back in the one ready queue, so every task woken behind it (a connection handing a request
+to its isolated task, and back) waited a slice at each hand-off, and a worker whose queue never emptied (h2c under
+load) never ran its timers, so its heartbeat stopped and the supervisor killed it. Paused tasks now wait in a queue
+of their own and a busy executor collects every millisecond. On the benchmark machine, h2c at 128 connections went
+from 19 439 requests a second with workers killed to 74 521 with none, and a healthy request's p99.9 beside four
+computing ones from 69 ms (9.9 s with per-request isolation) to 9.8 ms (4.6 ms). The check above that failed on
+macOS's CI under 0.82.0 (a median of 0.232 s beside `/spin`) is the first symptom.
+
 ## What ceesafec 0.65.1 to 0.71.0 changed
 
 Released 2026-11-18 from these findings and httpclient's. 0.65.1 fixed S1, S6 and S13. 0.67.0 carries three ADRs:
