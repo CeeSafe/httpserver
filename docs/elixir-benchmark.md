@@ -140,6 +140,32 @@ are as before (1.1× to 3.7×). Under computing neighbours httpserver's healthy 
 (1.5 % of healthy requests retried at 1000 crashes a second, unchanged) and the default slice's p99 (7.9 ms, a
 neighbour waiting up to one 10 ms slice, against Bandit's 3.9).
 
+## After CeeSafe.Web's Web ADR 0019 and a 2 ms slice (2026-11-21)
+
+The two gaps left above, run again (three fault runs, medians; `bench/elixir/results/2026-11-21-rq-web0019/`; the
+bench built with ceesafec 0.83.0 and CeeSafe.Web at Web ADR 0019's branch):
+
+- **Recycling.** Web ADR 0019: when a worker drains, an idle keep-alive connection waits up to a second for its next
+  request and answers it with `connection: close`, instead of closing under a client that had just sent on it.
+- **The slice.** A 2 ms slice instead of 10, now `App`'s default.
+
+| | before | after | Bandit |
+|---|---|---|---|
+| 1000 crashes/s: healthy requests retried (of 100 000) | 1 545 | **22** | 0 |
+| 1000 crashes/s, per-request isolation: healthy p99 / p99.9 | 3.7 / 9.4 ms | **1.7 / 6.5 ms** | 1.8 / 5.2 ms |
+| 1000 crashes/s, per-request isolation: crashes reset rather than answered 500 | 721 | **5** | 0 |
+| 100 crashes/s: healthy requests retried | 152 | **5** | 0 |
+| 4 × /spin/100: healthy p99 / p99.9, 2 ms slice | 7.9 / 9.8 ms (10 ms slice) | **1.5 / 3.1 ms** | 3.8 / 9.5 ms |
+| 4 × /spin/100: how long each spin took | 100 ms | 105 ms | 100 ms |
+
+`/small` over HTTP/1.1 at 128 connections answered 161 000 to 175 000 requests a second with a 10 ms slice and
+155 000 to 175 000 with 2 ms (three alternating runs each): the same within the noise.
+
+With these, httpserver's healthy requests are at Bandit's level or better in every fault run: a crash costs the
+others about what it costs under Bandit, and a computing neighbour costs them less. What still differs is where
+the crash's memory goes: Bandit frees it with the process, and httpserver replaces the worker every 100 crashes,
+which now costs a handful of retried requests rather than one or two in a hundred.
+
 ## Measurement notes
 
 - h2load is not used under faults: when the server closes connections under it, as a worker being replaced does, it
