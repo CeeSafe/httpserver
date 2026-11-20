@@ -350,4 +350,4 @@ streams one by one (Web ADR 0016 §2.3, merged as `79ae138`). Two more came with
   unit's roots with `__lsan_ignore_object`, and every other leak is still reported). It applies here too: a
   sanitized build of the benchmark server under `CW_ISOLATED=1` needs 0.77.2 for a trap not to fail its exit.
 
-httpserver asks for 0.77.2 and pins CeeSafe.Web at `79ae138`.
+httpserver asks for 0.77.2 and pins CeeSafe.Web at `4429946` (v0.6.0; `79ae138` until 2026-11-21).
