@@ -4,9 +4,10 @@ Status: **accepted** by the owner, 2026-11-20 ("I accept all the above ADRs as w
 0189 and 0190 and CeeSafe.Web ADR 0017; §6's questions as recommended). Proposed the same day ("Draft ADRs for all
 gaps"). **Implemented** the same day, on branch `plan/elixir-gaps`: gap 4 (`Services`), gap 2 (recycling that
 refuses no connection) and gap 3's steps 1 to 3, 5 and 6 (isolation and a bound by default, httpserver 0.2.0); notes
-in §7. **Waiting:** gap 3's step 4 for ceesafec's release of ADR 0190 (`polls = true` in the manifests, and the
-start-up line naming it); gap 5 and §4 item 1 for CeeSafe.Web's release of Web ADR 0017; gap 1 and §2 step 2's slice
-for ceesafec's release of ADR 0189. It starts from httpserver at ceesafec 0.80.0:
+in §7. Then, with ceesafec 0.81.0 (ADRs 0189 and 0190) and CeeSafe.Web at Web ADR 0017's
+pull request (#53): gap 3's step 4 (`polls = true`), gap 1's slice (§2 step 2) and gap 5's isolated requests (§7,
+"After 0.81.0"). **Waiting:** the tag v0.81.0, which CI installs, and #53's merge, whose commit the manifests then
+pin in place of its head. It starts from httpserver at ceesafec 0.80.0:
 isolated connections and streams (ceesafec ADR 0175, Web ADR 0016), request budgets (ADR 0170), and a bound on how
 long a task runs without waiting (ADR 0186), on branch `adr0186-run-bound`.
 
@@ -325,3 +326,42 @@ Linux was not available: what is Linux's alone (`SO_REUSEPORT` and `tcp_migrate_
 - `gzip_check.py` 16 ok, `ratelimit_check.py --inherit` 2, `ws_check.py` 6, `ws_check.py --workers 3 --inherit` 7,
   `bus_check.py --inherit` 3, `otel_check.py` 11: all passed.
 
+### After 0.81.0 and Web ADR 0017
+
+Built and checked with ceesafec 0.81.0 (CeeSafe's `release/0.81.0`, `8ba415aa`, not yet tagged) and CeeSafe.Web at
+#53's head (`91ef113`), on macOS (Apple M1) at load averages of 6 to 12.
+
+- **The pin** (commit `2616409`): every manifest names CeeSafe.Web at `91ef113`, and the locks are fetched again. It
+  moves to #53's merge commit once the pull request is merged.
+- **Gap 3, step 4: `polls = true`** (commit `a1440dd`): `bench`, `examples/hello` and `otel/demo` ask for the polls
+  in their manifests (ADR 0190), as does the README's example manifest; a library's key does nothing for its users,
+  so the root package does not. The start-up line of a build without polls says `add polls = true to ceesafe.toml`.
+  `bench-traps` is built with the trap hooks' macro alone, and `supervisor_check.py`'s phase without polls runs
+  `bench/out/bench-nopolls`, built with `--no-polls`. CI installs v0.81.0.
+- **Gap 1: the slice** (commit `e42e4f9`): `App.slice(ms)`, 10 ms by default (ADR 0189's measurement on this
+  server), which `run` sets with `Async.runSlice` before the bound. The bound's default follows §2 step 2: 30 000 ms
+  when the slice took, a request that has computed that long in one resume while sharing its worker being taken to
+  never end, and 1 000 ms when it did not (`runShared`, where no task is paused; a 32-bit target; a build without
+  polls), which keeps the bound well below the supervisor's 5 000 ms stall. A target without a slice says so once.
+  `app.bound(ms)` given is used as it is. The benchmark server takes `CW_RUN_SLICE_MS` and `CW_RUN_BOUND_MS` only
+  when they are set, and answers `/pauses` with `Async.pauses()`. `supervisor_check.py`: the one-worker bound phase
+  now runs with `CW_RUN_SLICE_MS=0`, where a request beside a spin waits for its end (0.1 to 1.0 s); a new phase with
+  a 10 ms slice and a 1 000 ms bound checks that the median wait of five requests beside `/spin/300` and beside
+  `/spin` is under 0.2 s (0.073 and 0.088 s), that `/spin/300` is answered, that `/spin` is ended at its bound, and
+  that the worker counted pauses (122). Every manifest asks for ceesafec 0.81.0, since `App` calls `Async.runSlice`.
+- **Gap 5: isolated requests** (commit `0712cc9`): `App.isolateRequests(on)` sets `Limits.isolateRequests`, off by
+  default as Web ADR 0017 has it until the benchmark machine measures its cost, and the connection handler then
+  serves HTTP/1.1 through `web_http1.serveIsolated`. `Application.crashed` reaches the access log through a new
+  default method, `AccessLog.crashed(request, crash)`; `ConsoleLog` writes `GET /crash crashed index`. The benchmark
+  server takes `CW_ISOLATE_REQUESTS=1`, has `/crash/after/{n}` (sends n bytes, then traps) and prints its
+  `ServerReport.crashed` at the end. `supervisor_check.py`: on one kept-alive connection `/crash`, `/crash/kept`,
+  `/spin` (`Overran`) and `/crash/gz/60000` are each answered 500 and the next request goes on the same socket;
+  `/crash/after/4096` loses its connection; the report counts the five, and the log has a line for each.
+  **Departure from Web ADR 0017's note:** it said `/crash/gz/60000` would still lose its connection. It does not:
+  `Compression.send` gzips the body into a buffer before the head is sent, so when it traps no byte has left, and
+  the 500 is the ADR's own rule. `/crash/after/{n}` is the route whose bytes have left.
+- **Checks, at the end:** `check` and `fmt --check` clean in all 9 packages; the core tests 32 passed with the trap
+  hooks, and 32 under AddressSanitizer and UndefinedBehaviorSanitizer; auth 9, static 1, ws 3, compress 3, otel 1;
+  `examples/hello` and `otel/demo` build; `supervisor_check.py --inherit --budget-mb 16` 84 ok (the slice and
+  isolated-requests phases among them) and with `--shared` 31 ok, no failures; `gzip_check.py` 16, `ratelimit_check.py
+  --inherit` 2, `bus_check.py --inherit` 3, `ws_check.py` 6 and with 3 workers 7, `otel_check.py` 11, all ok.

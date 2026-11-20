@@ -7,7 +7,7 @@ Bugs and gaps in CeeSafe and CeeSafe.Web met while writing httpserver, with cees
 |---|---|---|---|
 | S1 | An integer literal inside a parenthesised `if` expression does not take the type the outer `if` expects | ceesafec | fixed in ceesafec 0.65.1 |
 | S2 | A server runs on one thread: nothing serves one listener from several cores | CeeSafe.Web, runtime | measured; the supervisor's worker processes are the way round it |
-| S3 | A trap ends the process: a task cannot fail alone | ceesafec, by design (panic = abort) | ceesafec 0.75.0 (ADR 0175) and CeeSafe.Web's Web ADR 0016: under `app.runIsolated`, which is `app.run` from httpserver 0.2.0 (docs/elixir-gaps.md §2), a trap costs its connection; the supervisor still replaces a worker that ends, and recycles one past `recycleCrashes`, starting another in its place while it drains (§4) |
+| S3 | A trap ends the process: a task cannot fail alone | ceesafec, by design (panic = abort) | ceesafec 0.75.0 (ADR 0175) and CeeSafe.Web's Web ADR 0016: under `app.runIsolated`, which is `app.run` from httpserver 0.2.0 (docs/elixir-gaps.md §2), a trap costs its connection; the supervisor still replaces a worker that ends, and recycles one past `recycleCrashes`, starting another in its place while it drains (§4). With `app.isolateRequests(true)` (CeeSafe.Web's Web ADR 0017) a trap costs its HTTP/1.1 request, answered 500 when no byte of the response had left, and the connection goes on; HTTP/2 and HTTP/3 streams that trap before their head are answered 500 always |
 | S4 | lib/std cannot start a process without waiting for it, signal one, or wait for any child | lib/std | fixed in 0.70.0 and 0.73.1 (ADRs 0169, 0173): the supervisor spawns its workers and hands them what they share (below) |
 | S5 | No allocation budget for a task, and no allocator for `Vector` or `String` but the system's | runtime | fixed in 0.70.0 (`Budget`): `app.budget(bytes)`; a worker's `RLIMIT_AS` is the backstop |
 | S6 | `ProcessSignals` does not survive `fork` | runtime | fixed in ceesafec 0.65.1: a forked child starts with no subscription |
@@ -21,7 +21,7 @@ Bugs and gaps in CeeSafe and CeeSafe.Web met while writing httpserver, with cees
 | S14 | A method that is given the context by `borrow mut` cannot call a `dyn Handler<S>` with it (N0272) | ceesafec, by design: the handler and `Context<S>` share the flow name `S`, whatever its bounds (§25.6) | fixed in ceesafec 0.67.0 (ADR 0168) once the interfaces ask `S: Send + Share`, which they do now: `App.handle` owns the context and hands it to the dispatcher |
 | S15 | A cancelled task's function runs on to its end, and cannot tell without asking (`AsyncControl<E>.checkpoint`) | runtime, by design | the dispatcher asks before it tells the access log; `Arc.create(v)` and its like are inferred since ceesafec 0.67.0 (ADR 0166) |
 | S16 | A closure that stores into a captured local and also captures part of a `borrow mut` parameter is refused as if it stored into the parameter (N0272) | ceesafec, looks like a fault of the checker; reduced, not understood | no longer met: with `S: Send + Share` on the interfaces (S14) the closure is accepted in 0.67.0; without the bound it is refused as before, and why is still not known |
-| S17 | A request that computes without waiting holds its worker's event loop until the supervisor kills the worker | runtime, by design (cooperative tasks) | ceesafec 0.80.0 (ADR 0186): with `-DCEE_POLLS=1` and `CW_RUN_BOUND_MS`, an isolated connection past the bound traps with `Overran` and ends alone; the watchdog stays for C code and blocking calls |
+| S17 | A request that computes without waiting holds its worker's event loop until the supervisor kills the worker | runtime, by design (cooperative tasks) | ceesafec 0.80.0 (ADR 0186) and 0.81.0 (ADRs 0189, 0190): with `polls = true` in the program's manifest, `App.run` pauses a request every 10 ms slice, so its neighbours wait a few slices, and ends one past its bound (30 s with the slice, 1 s without) with `Overran`, alone; the watchdog stays for C code and blocking calls |
 
 ## S1: a nested `if` expression's literals are `i32`
 
@@ -256,6 +256,15 @@ blocking system call.
 The price is the polls' (ADR 0186 §10): measured on the benchmark server, `/small` and `/json` within noise and
 `/gz/16384` 6% fewer requests a second, deflate's inner loops being where it goes. A build without the macro has
 no polls and the same code as before.
+
+ceesafec 0.81.0 goes further (ADR 0189, from the comparison with Elixir in docs/elixir-gaps.md): under
+`Async.runSlice(ms)`, each resume of an isolated task runs on a stack of its own, and a poll past the slice pauses
+the task there and puts it at the back of the queue, where the bound alone could only end it. `App.run` sets a 10 ms
+slice and, with it, a bound of 30 s, for a request that never ends (1 s where no slice can pause a task: under
+`runShared`, on a 32-bit target). `supervisor_check.py` checks, with one worker, that a request beside one computing
+for 300 ms waits a median of under 0.2 s (0.07 s here), that the 300 ms one is answered, and that one without end is
+ended at its bound. ADR 0190 lets the manifest ask for the polls, `polls = true`, in place of a flag on every build
+command; httpserver's servers do.
 
 ## What ceesafec 0.65.1 to 0.71.0 changed
 
