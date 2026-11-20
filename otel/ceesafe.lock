@@ -7,48 +7,48 @@ source = "path+.."
 [[package]]
 name = "web_client"
 source = "git+https://github.com/CeeSafe/CeeSafe.Web.git"
-commit = "79ae13870e2d454bd590747b9b3ce3d2c5a026df"
+commit = "91ef1130750de03511bf2c70c1314633a5c3fce9"
 dir = "packages/web_client"
 hash = "sha256:0e561ce6e077f15f2a48a2428e74855ed80dba6177c42d71d9e95b63337bb044"
 
 [[package]]
 name = "web_core"
 source = "git+https://github.com/CeeSafe/CeeSafe.Web.git"
-commit = "79ae13870e2d454bd590747b9b3ce3d2c5a026df"
+commit = "91ef1130750de03511bf2c70c1314633a5c3fce9"
 dir = "packages/web_core"
-hash = "sha256:04d1f974bb8451f4d31d23fbd887968db77be5eab4a9cfe54ad822b51e43789c"
+hash = "sha256:58ff1ff6e0e50253d813c75a0dc63e90100cdf3f5e22ce349befa7147e2cd6aa"
 
 [[package]]
 name = "web_http"
 source = "git+https://github.com/CeeSafe/CeeSafe.Web.git"
-commit = "79ae13870e2d454bd590747b9b3ce3d2c5a026df"
+commit = "91ef1130750de03511bf2c70c1314633a5c3fce9"
 dir = "packages/web_http"
-hash = "sha256:ee862a2e4e742d8ae49b0ac4a01736505aac80a5f808cccf4e87ce3801f6fa6c"
+hash = "sha256:f1a021e01dee021a1580b0583e8d0eb708bf4779c12fbf409db3948de4ec1bf0"
 
 [[package]]
 name = "web_http1"
 source = "git+https://github.com/CeeSafe/CeeSafe.Web.git"
-commit = "79ae13870e2d454bd590747b9b3ce3d2c5a026df"
+commit = "91ef1130750de03511bf2c70c1314633a5c3fce9"
 dir = "packages/web_http1"
-hash = "sha256:b947330c04f96d4325053ed36649af974a28eb0d0d8d6f03020dd59f3da8fe40"
+hash = "sha256:35d97c896201b01b963bacd09c32d0c77012eb9161171a2a11d9ca9d4f19c286"
 
 [[package]]
 name = "web_http2"
 source = "git+https://github.com/CeeSafe/CeeSafe.Web.git"
-commit = "79ae13870e2d454bd590747b9b3ce3d2c5a026df"
+commit = "91ef1130750de03511bf2c70c1314633a5c3fce9"
 dir = "packages/web_http2"
-hash = "sha256:2b650c14acaa676458748f817f86a9bbbf28194e69651afd923f867ab4d2b5d8"
+hash = "sha256:c12dd4673fee96e3a7b65c27aa6afa085ef5a415237c4194c30a95bd9d032f36"
 
 [[package]]
 name = "web_transport"
 source = "git+https://github.com/CeeSafe/CeeSafe.Web.git"
-commit = "79ae13870e2d454bd590747b9b3ce3d2c5a026df"
+commit = "91ef1130750de03511bf2c70c1314633a5c3fce9"
 dir = "packages/web_transport"
-hash = "sha256:1b3b2e6d6fab28592cbafb68da5ec90d2d962800ca64c4b3bc11ae0b20b0fed0"
+hash = "sha256:934a0feeff09d75dbf86ad0b509226499d4b5510e74d7abb63ad83078949aabd"
 
 [[package]]
 name = "web_ws"
 source = "git+https://github.com/CeeSafe/CeeSafe.Web.git"
-commit = "79ae13870e2d454bd590747b9b3ce3d2c5a026df"
+commit = "91ef1130750de03511bf2c70c1314633a5c3fce9"
 dir = "packages/web_ws"
 hash = "sha256:a39acfb6dbfcc1fc4d85fe1aad93d73e7c4edb111ed6733406a8b7bbea2c777b"
