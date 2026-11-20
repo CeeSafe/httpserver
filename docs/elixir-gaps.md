@@ -4,9 +4,9 @@ Status: **accepted** by the owner, 2026-11-20 ("I accept all the above ADRs as w
 0189 and 0190 and CeeSafe.Web ADR 0017; §6's questions as recommended). Proposed the same day ("Draft ADRs for all
 gaps"). **Implemented** the same day, on branch `plan/elixir-gaps`: gap 4 (`Services`), gap 2 (recycling that
 refuses no connection) and gap 3's steps 1 to 3, 5 and 6 (isolation and a bound by default, httpserver 0.2.0); notes
-in §7. Then, with ceesafec 0.81.0 (ADRs 0189 and 0190) and CeeSafe.Web at Web ADR 0017's
+in §7. Then, with ceesafec 0.82.0 (ADRs 0189 and 0190) and CeeSafe.Web at Web ADR 0017's
 pull request (#53): gap 3's step 4 (`polls = true`), gap 1's slice (§2 step 2) and gap 5's isolated requests (§7,
-"After 0.81.0"). **Waiting:** the tag v0.81.0, which CI installs, and #53's merge, whose commit the manifests then
+"After 0.82.0"). **Waiting:** the tag v0.82.0, which CI installs, and #53's merge, whose commit the manifests then
 pin in place of its head. It starts from httpserver at ceesafec 0.80.0:
 isolated connections and streams (ceesafec ADR 0175, Web ADR 0016), request budgets (ADR 0170), and a bound on how
 long a task runs without waiting (ADR 0186), on branch `adr0186-run-bound`.
@@ -326,10 +326,11 @@ Linux was not available: what is Linux's alone (`SO_REUSEPORT` and `tcp_migrate_
 - `gzip_check.py` 16 ok, `ratelimit_check.py --inherit` 2, `ws_check.py` 6, `ws_check.py --workers 3 --inherit` 7,
   `bus_check.py --inherit` 3, `otel_check.py` 11: all passed.
 
-### After 0.81.0 and Web ADR 0017
+### After 0.82.0 and Web ADR 0017
 
-Built and checked with ceesafec 0.81.0 (CeeSafe's `release/0.81.0`, `8ba415aa`, not yet tagged) and CeeSafe.Web at
-#53's head (`91ef113`), on macOS (Apple M1) at load averages of 6 to 12.
+Built and checked with ceesafec 0.82.0 (CeeSafe's release branch at `8ba415aa`, first cut as 0.81.0 and renumbered
+0.82.0 when another session tagged a 0.81.0 meanwhile; same ADR 0189 and 0190 code) and CeeSafe.Web at #53's head
+(`91ef113`), on macOS (Apple M1) at load averages of 6 to 12.
 
 - **The pin** (commit `2616409`): every manifest names CeeSafe.Web at `91ef113`, and the locks are fetched again. It
   moves to #53's merge commit once the pull request is merged.
@@ -337,7 +338,7 @@ Built and checked with ceesafec 0.81.0 (CeeSafe's `release/0.81.0`, `8ba415aa`, 
   in their manifests (ADR 0190), as does the README's example manifest; a library's key does nothing for its users,
   so the root package does not. The start-up line of a build without polls says `add polls = true to ceesafe.toml`.
   `bench-traps` is built with the trap hooks' macro alone, and `supervisor_check.py`'s phase without polls runs
-  `bench/out/bench-nopolls`, built with `--no-polls`. CI installs v0.81.0.
+  `bench/out/bench-nopolls`, built with `--no-polls`. CI installs v0.82.0.
 - **Gap 1: the slice** (commit `e42e4f9`): `App.slice(ms)`, 10 ms by default (ADR 0189's measurement on this
   server), which `run` sets with `Async.runSlice` before the bound. The bound's default follows §2 step 2: 30 000 ms
   when the slice took, a request that has computed that long in one resume while sharing its worker being taken to
@@ -348,7 +349,7 @@ Built and checked with ceesafec 0.81.0 (CeeSafe's `release/0.81.0`, `8ba415aa`, 
   now runs with `CW_RUN_SLICE_MS=0`, where a request beside a spin waits for its end (0.1 to 1.0 s); a new phase with
   a 10 ms slice and a 1 000 ms bound checks that the median wait of five requests beside `/spin/300` and beside
   `/spin` is under 0.2 s (0.073 and 0.088 s), that `/spin/300` is answered, that `/spin` is ended at its bound, and
-  that the worker counted pauses (122). Every manifest asks for ceesafec 0.81.0, since `App` calls `Async.runSlice`.
+  that the worker counted pauses (122). Every manifest asks for ceesafec 0.82.0, since `App` calls `Async.runSlice`.
 - **Gap 5: isolated requests** (commit `0712cc9`): `App.isolateRequests(on)` sets `Limits.isolateRequests`, off by
   default as Web ADR 0017 has it until the benchmark machine measures its cost, and the connection handler then
   serves HTTP/1.1 through `web_http1.serveIsolated`. `Application.crashed` reaches the access log through a new

@@ -3,7 +3,7 @@ name = "bench"
 version = "0.1.0"
 kind = "executable"
 sources = ["src"]
-ceesafec = ">=0.81.0"          # ADR 0190: `polls`; ADR 0186: `Async.runBound` for CW_RUN_BOUND_MS
+ceesafec = ">=0.82.0"          # ADR 0190: `polls`; ADR 0186: `Async.runBound` for CW_RUN_BOUND_MS
 polls = true                   # ADR 0190: the bound sees a request that computes without waiting
 
 [dependencies]

@@ -21,7 +21,7 @@ Bugs and gaps in CeeSafe and CeeSafe.Web met while writing httpserver, with cees
 | S14 | A method that is given the context by `borrow mut` cannot call a `dyn Handler<S>` with it (N0272) | ceesafec, by design: the handler and `Context<S>` share the flow name `S`, whatever its bounds (§25.6) | fixed in ceesafec 0.67.0 (ADR 0168) once the interfaces ask `S: Send + Share`, which they do now: `App.handle` owns the context and hands it to the dispatcher |
 | S15 | A cancelled task's function runs on to its end, and cannot tell without asking (`AsyncControl<E>.checkpoint`) | runtime, by design | the dispatcher asks before it tells the access log; `Arc.create(v)` and its like are inferred since ceesafec 0.67.0 (ADR 0166) |
 | S16 | A closure that stores into a captured local and also captures part of a `borrow mut` parameter is refused as if it stored into the parameter (N0272) | ceesafec, looks like a fault of the checker; reduced, not understood | no longer met: with `S: Send + Share` on the interfaces (S14) the closure is accepted in 0.67.0; without the bound it is refused as before, and why is still not known |
-| S17 | A request that computes without waiting holds its worker's event loop until the supervisor kills the worker | runtime, by design (cooperative tasks) | ceesafec 0.80.0 (ADR 0186) and 0.81.0 (ADRs 0189, 0190): with `polls = true` in the program's manifest, `App.run` pauses a request every 10 ms slice, so its neighbours wait a few slices, and ends one past its bound (30 s with the slice, 1 s without) with `Overran`, alone; the watchdog stays for C code and blocking calls |
+| S17 | A request that computes without waiting holds its worker's event loop until the supervisor kills the worker | runtime, by design (cooperative tasks) | ceesafec 0.80.0 (ADR 0186) and 0.82.0 (ADRs 0189, 0190): with `polls = true` in the program's manifest, `App.run` pauses a request every 10 ms slice, so its neighbours wait a few slices, and ends one past its bound (30 s with the slice, 1 s without) with `Overran`, alone; the watchdog stays for C code and blocking calls |
 
 ## S1: a nested `if` expression's literals are `i32`
 
@@ -257,7 +257,7 @@ The price is the polls' (ADR 0186 §10): measured on the benchmark server, `/sma
 `/gz/16384` 6% fewer requests a second, deflate's inner loops being where it goes. A build without the macro has
 no polls and the same code as before.
 
-ceesafec 0.81.0 goes further (ADR 0189, from the comparison with Elixir in docs/elixir-gaps.md): under
+ceesafec 0.82.0 goes further (ADR 0189, from the comparison with Elixir in docs/elixir-gaps.md): under
 `Async.runSlice(ms)`, each resume of an isolated task runs on a stack of its own, and a poll past the slice pauses
 the task there and puts it at the back of the queue, where the bound alone could only end it. `App.run` sets a 10 ms
 slice and, with it, a bound of 30 s, for a request that never ends (1 s where no slice can pause a task: under

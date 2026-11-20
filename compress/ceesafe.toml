@@ -4,7 +4,7 @@ version = "0.1.0"
 kind = "library"
 sources = ["src"]
 tests = ["tests"]
-ceesafec = ">=0.81.0"
+ceesafec = ">=0.82.0"
 # Zstandard and Brotli are the reference C libraries, called directly (src/ffi.cee declares what it calls; no header
 # is needed). libbrotlidec is linked for the tests, which inflate what was compressed.
 links = ["zstd", "brotlienc", "brotlidec"]

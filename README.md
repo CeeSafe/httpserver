@@ -192,7 +192,7 @@ name = "myserver"
 version = "0.1.0"
 kind = "executable"
 sources = ["src"]
-ceesafec = ">=0.81.0"
+ceesafec = ">=0.82.0"
 polls = true              # the bound on a request that computes without waiting (below)
 
 [dependencies]
