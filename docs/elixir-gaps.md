@@ -2,7 +2,11 @@
 
 Status: **accepted** by the owner, 2026-11-20 ("I accept all the above ADRs as written", together with CeeSafe ADRs
 0189 and 0190 and CeeSafe.Web ADR 0017; §6's questions as recommended). Proposed the same day ("Draft ADRs for all
-gaps"). Implementation notes: §7. It starts from httpserver at ceesafec 0.80.0:
+gaps"). **Implemented** the same day, on branch `plan/elixir-gaps`: gap 4 (`Services`), gap 2 (recycling that
+refuses no connection) and gap 3's steps 1 to 3, 5 and 6 (isolation and a bound by default, httpserver 0.2.0); notes
+in §7. **Waiting:** gap 3's step 4 for ceesafec's release of ADR 0190 (`polls = true` in the manifests, and the
+start-up line naming it); gap 5 and §4 item 1 for CeeSafe.Web's release of Web ADR 0017; gap 1 and §2 step 2's slice
+for ceesafec's release of ADR 0189. It starts from httpserver at ceesafec 0.80.0:
 isolated connections and streams (ceesafec ADR 0175, Web ADR 0016), request budgets (ADR 0170), and a bound on how
 long a task runs without waiting (ADR 0186), on branch `adr0186-run-bound`.
 
@@ -238,3 +242,86 @@ Items 1 to 3 need no release of CeeSafe or CeeSafe.Web and can start at once.
    inherited socket as the supervised default (§4)? Recommended: yes.
 7. No attempt to free a crashed unit's memory, given ADR 0175 §2.4 (§4)? Recommended: yes; to be revisited only
    if CeeSafe ever copies values between units.
+
+## 7. Implementation notes (2026-11-20)
+
+Built and checked with ceesafec 0.80.0 on macOS (Apple M1), under other sessions' load (averages 12 to 155).
+Linux was not available: what is Linux's alone (`SO_REUSEPORT` and `tcp_migrate_req`, `memoryBytes`) was not run.
+
+### Gap 4: `Services` (commit `0714adc`)
+
+- `src/services.cee`: `Service`, `Restart` (permanent, transient, temporary), `Strategy` (one for one, one for all),
+  `Intensity`, `ServiceEvent` and `Services` (`create`, `add`, `watch`, `run`, `name`, `count`, `lookEvery`), as §3.
+  Each start is `set.spawnIsolated` of the service's `run`; a start's end reaches the supervisor through a channel
+  (a return) or the set's watcher (a trap), and the supervisor looks at both every 20 ms (`lookEvery`). One for all
+  runs each generation of the services in a task set of its own, which the body's `Err` cancels.
+- **Departures from §3, each forced by the language or the code:**
+  - `NetError` has no `Crashed`: past the intensity `run` returns `NetError.LimitExceeded`.
+  - An interface cannot name `Send + Share` as its bases (N0204): `Service` is a plain interface, and `add` takes a
+    `Box<dyn Service + Send + Share>`. httpserver's private `Service` (the connection handler in `src/app.cee`) is
+    now `Serving`, to free the name.
+  - A `ServiceEvent` names a service by its number, not its name (a `StringView` in a channel would need a region):
+    `services.name(id)` gives the name.
+  - The intensity counts every restart within its window, as Erlang's does: a service restarted once, then
+    trapping at every run, gives up one restart sooner.
+  - **The Hub has no task of its own**: what it does outside a session is `deliverEncoded` from the bus's sink, so it
+    is under `Services` through the bus's reading. The scheduler is a service through `Scheduler.service()`, whose
+    jobs are now shared `Arc`s so that each start runs them from a fresh schedule (the reports begin again). The
+    bus's reading is `BusCarrier<K>`, which takes a `Bus.reader` in each start (a reader that leaves the worker's
+    ring as it is, where `join` drops what was being written).
+- The benchmark server runs the bus's reading and, with `CW_JOBS=1`, a scheduler with a job every second under
+  `Services` beside `tend` (`CW_SERVICE_RESTARTS`, 5 in 30 s); `/job` counts its runs and `/job/trap/{n}` makes it
+  trap.
+- **Tests:** `tests/services.cee` (4 tests: started again after a trap, transient done after Ok, giving up past the
+  intensity, one for all), native: 4 passed. The package's tests do not run interpreted (every one of them, the
+  cron tests included, exits 70 under `--interp`: the package calls C), so they are not run there.
+  `supervisor_check.py`'s services phase: a trap of the job is started again and the job runs on, the worker
+  answers throughout; at every run it traps, the supervisor gives up, the worker ends and is started again (report
+  2 started, 1 crashed); four traps ended alone.
+
+### Gap 2: recycling that refuses no connection (commit `65bbf92`)
+
+- A worker past its bound asks for a replacement (`tend` sets its state word to 1); the parent starts another in its
+  place at once and tells the old one to drain (2): at once with the parent's socket, once the new one has beaten
+  with sockets of their own. One that outlives `graceMs` after it was told is killed. `SupervisorReport.recycled`;
+  the benchmark server prints it after its four numbers (`bench: recycled`).
+- **Departure from §4:** a place has two seats, one for each generation, each with a beat, a state and a ring of the
+  bus (`Worker.ring()`, `--httpserver-worker=<index>.<generation>`), where §4 had the replacement beat into the
+  place's word. With one word the old worker, still beating while it drains, would hide a replacement that stalls.
+  So the pages are 8 KiB (a beat and a state for each of 256 places and two generations), not 4 KiB. A supervisor's
+  bus has two rings for each place, which doubles its memory, as §4 said.
+- The parent's socket is the benchmark server's default (`CW_INHERIT=0` for sockets of their own); every tool sets
+  `CW_INHERIT` both ways.
+- **Tests:** `supervisor_check.py` (isolated, `--inherit`): two clients ask for `/small` on new connections every
+  10 ms while three workers are replaced: 0 of 484 failed, 3 recycled, each started while the old one drained.
+  **What this does not show:** with the parent's socket the old scheme (start the replacement after the exit)
+  would likely have refused nothing either, its queue waiting for the others; the change is felt in the time a
+  place has no worker, and with sockets of their own on Linux, where `tcp_migrate_req` decides. Neither was
+  measured here.
+
+### Gap 3: isolation and a bound by default (commit `c730964`)
+
+- `App.run` is the isolated server, `runShared` the former `run`, `runIsolated` a name for `run` until the release
+  after 0.2.0; `app.bound(ms)` (1 000 ms, 0 for none) is set as the program's bound (`RunBound.Count`) when `run` or
+  `runShared` starts. httpserver is 0.2.0, every manifest asks for ceesafec 0.80.0, and CI installs v0.80.0 and builds
+  `bench-traps` with `CEE_POLLS` (it did not since step 7 of ADR 0186).
+- **Departure from §2 step 3:** the line says `build with --cflag -DCEE_POLLS=1`, not `polls = true`, which no
+  released ceesafec reads yet. Step 4 (`polls = true` in httpserver's manifests) waits for ADR 0190's release.
+- **Question 2's measurement:** the benchmark server's slowest routes, with polls, ten requests each:
+  `/gz/60000` (gzip) at most 5.5 ms, `/z/60000` (Brotli) 7.1 ms, zstd 1.5 ms, `/64k` 0.9 ms; none overran. 1 000 ms
+  is over a hundred times the slowest.
+- **Tests:** `tests/run.cee` (`App.run`: a trap costs its connection, the next is served, `Isolation.report()`
+  counts one). `supervisor_check.py` is isolated by default (`--shared` for plain tasks) and runs a build without
+  polls, which says so and whose spin the stall catches.
+
+### Checks, at the end
+
+- `ceesafec check` and `fmt --check` in `.`, `auth`, `static`, `ws`, `compress`, `otel`, `otel/demo`,
+  `examples/hello`, `bench`: clean. `ceesafec fetch` changed no lock.
+- `ceesafec test --cflag -DHTTPSERVER_TRAP_HOOKS=1`: 32 passed; with `-fsanitize=address,undefined`: 32 passed;
+  `auth` 9, `static` 1, `ws` 3, `compress` 3, `otel` 1 passed.
+- `supervisor_check.py --inherit --budget-mb 16`: 64 ok, 0 failed; `--shared`: 31 ok, 0 failed (the crash steps that
+  failed under load before this work, on httpserver `c95e9e3` with 0.79.2 as well, passed in each run here).
+- `gzip_check.py` 16 ok, `ratelimit_check.py --inherit` 2, `ws_check.py` 6, `ws_check.py --workers 3 --inherit` 7,
+  `bus_check.py --inherit` 3, `otel_check.py` 11: all passed.
+
