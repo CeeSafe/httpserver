@@ -19,6 +19,8 @@ the fault table gives the median of the three).
 
 ## Speed
 
+(These are 0.82.0's numbers; the h2c rows in bold are fixed by CeeSafe's ADR 0191, below.)
+
 h2load, 10 s after a 1 s warm-up, one request at a time on each connection (`-m 1`).
 
 | mode | route | conns | httpserver req/s | Bandit req/s | ratio | httpserver p99 µs | Bandit p99 µs | RSS MiB (hs / Bandit) |
@@ -114,6 +116,30 @@ p50 (340 to 380 µs) is mostly the client's own; the differences between rows ar
    would remove most of the retries.
 4. **Gap 5 (a 500 for a crash)** is closed by per-request isolation, which keeps the connection where Bandit closes
    it.
+
+## After CeeSafe's ADR 0191 (2026-11-21)
+
+The two starvations above were one cause in CeeSafe's executor, fixed by its ADR 0191 (branch
+`fix/executor-fairness`, not yet released): a busy executor now collects socket events, wakes and due timers every
+millisecond, and a task paused past its slice waits in a queue of its own, so the tasks woken behind it run first.
+The same runs again, the bench built with that compiler, Bandit unchanged (`bench/elixir/results/2026-11-21-rq-adr0191/`):
+
+| | before (0.82.0) | after (ADR 0191) | Bandit |
+|---|---|---|---|
+| h2c `/small`, 128 connections | 39 831 req/s, workers killed | **73 325 req/s**, none killed | 24 661 |
+| h2c `/64k`, 128 connections | 3 615 req/s | **21 390 req/s** | 21 062 |
+| h2c `/stream`, 16 connections | 804 req/s | **2 354 req/s** | 1 420 |
+| h2c `/stream`, 128 connections | 166 req/s | **1 721 req/s** | 1 328 |
+| h2c `/json`, 128 connections | 12 459 req/s | **68 931 req/s** | 22 802 |
+| 4 × /spin/100, defaults: healthy p99 / p99.9 | 1.7 / 69 ms | 7.9 / **9.8 ms** | 3.9 / 7.5 ms |
+| 4 × /spin/100, per-request isolation | 6.2 s p50, 9.9 s p99.9 | **0.4 ms p50, 1.5 / 4.6 ms** | |
+| 4 × /spin/100, 1 ms slice | 3.6 s p50, 6.1 s p99.9 | **0.6 ms p50, 2.8 / 6.5 ms** | |
+
+Every h2c row is now at least Bandit's rate (1.0× to 3.4×), with no worker killed in any run, and the HTTP/1.1 rows
+are as before (1.1× to 3.7×). Under computing neighbours httpserver's healthy p99.9 is now Bandit's order (4.6 to
+9.8 ms against 7.5), where it was 69 ms to 10 s. What is left of the gaps is recycling under a high crash rate
+(1.5 % of healthy requests retried at 1000 crashes a second, unchanged) and the default slice's p99 (7.9 ms, a
+neighbour waiting up to one 10 ms slice, against Bandit's 3.9).
 
 ## Measurement notes
 

@@ -1,0 +1,586 @@
+{
+ "environment": {
+  "cpu": "Intel(R) Xeon(R) D-2123IT CPU @ 2.20GHz",
+  "threads": 8,
+  "kernel": "6.8.0-149-generic",
+  "os": "Ubuntu 24.04.5 LTS",
+  "server_cpus": [
+   0,
+   1,
+   4,
+   5
+  ],
+  "load_cpus": [
+   2,
+   3,
+   6,
+   7
+  ],
+  "ceesafec": "ceesafec 0.82.0",
+  "elixir": "Elixir 1.20.5 (compiled with Erlang/OTP 29)",
+  "otp": "29",
+  "h2load": "h2load nghttp2/1.59.0",
+  "bandit_lock": "%{\n  \"bandit\": {:hex, :bandit, \"1.15.0\", \"df5991a93535e83f9e939bee4af539e0ce17269a0d42fc63819daae60c7d23df\", [:mix], [{:hpax, \"~> 1.1\", [hex: :hpax, repo: \"hexpm\", optional: false]}, {:plug, \"~> 1.18\", [hex: :plug, repo: \"hexpm\", optional: false]}, {:telemetry, \"~> 0.4 or ~> 1.0\", [hex: :telemetry, repo: \"hexpm\", optional: false]}, {:thousand_island, \"~> 1.6\", [hex: :thousand_island, repo: \"hexpm\", optional: false]}, {:websock, \"~> 0.5\", [hex: :websock, repo: \"hexpm\", optional: false]}], \"hexpm\", \"e3b29c4a5107f4bf7dfaa263c50b9b97ddcc132622197c110e2e10a921641c44\"},\n  \"hpax\": {:hex, :hpax, \"1.1.0\", \"782931867cc23217c68fb5f68fe1a11f5e7544c7fda82c8a7019a5df5a4a1cdf\", [:mix], [], \"hexpm\", \"0b8d0f05832f55571d65ac720f79bf8994138ffbb133209dc4685eae0ad456a8\"},\n  \"jason\": {:hex, :jason, \"1.4.5\", \"2e3a008590b0b8d7388c20293e9dcc9cf3e5d642fd2a114e4cbbb52e595d940a\", [:mix], [{:decimal, \"~> 1.0 or ~> 2.0 or ~> 3.0\", [hex: :decimal, repo: \"hexpm\", optional: true]}], \"hexpm\", \"b0c823996102bcd0239b3c2444eb00409b72f6a140c1950bc8b457d836b30684\"},\n  \"mime\": {:hex, :mime, \"2.0.7\", \"b8d739037be7cd402aee1ba0306edfdef982687ee7e9859bee6198c1e7e2f128\", [:mix], [], \"hexpm\", \"6171188e399ee16023ffc5b76ce445eb6d9672e2e241d2df6050f3c771e80ccd\"},\n  \"plug\": {:hex, :plug, \"1.20.4\", \"8fca521b31eb586dbb91968dd9fa95be6b60fb40f9ca77b005361e06836aed75\", [:mix], [{:mime, \"~> 1.0 or ~> 2.0\", [hex: :mime, repo: \"hexpm\", optional: false]}, {:plug_crypto, \"~> 1.1.1 or ~> 1.2 or ~> 2.0\", [hex: :plug_crypto, repo: \"hexpm\", optional: false]}, {:telemetry, \"~> 0.4.3 or ~> 1.0\", [hex: :telemetry, repo: \"hexpm\", optional: false]}], \"hexpm\", \"96ee42c0b8b35bcb14e3e65afb85abe9bb7745a8576e8c602802bbb01e5acf72\"},\n  \"plug_crypto\": {:hex, :plug_crypto, \"2.2.1\", \"bd1d0358a2e2f5ffb818217e64c394f9d24ed191d862b7fa1bcce264ace2b8ea\", [:mix], [], \"hexpm\", \"4417ccbd8f85e627321cd07d2ab9c4b621f1fd883b9905af241f9b4b780b94b6\"},\n  \"telemetry\": {:hex, :telemetry, \"1.4.3\", \"d0333fa869361e6833d6ff8e806ff4d8553fe1332fcce0af86c7381951a1dc2f\", [:rebar3], [], \"hexpm\", \"17a63581cf2e832a238287f5fe6811e8ca1f333249f1376ad653164a3c4770d4\"},\n  \"thousand_island\": {:hex, :thousand_island, \"1.6.0\", \"d6ad7c2220c96a270cc8ca1586ec4d8bde648a4a3a53f003ce093f41beec0288\", [:mix], [{:telemetry, \"~> 0.4 or ~> 1.0\", [hex: :telemetry, repo: \"hexpm\", optional: false]}], \"hexpm\", \"4d4720470f091fc21a1311777c2ac66916c43621bffc068590c9f9bb3cd057a3\"},\n  \"websock\": {:hex, :websock, \"0.5.3\", \"2f69a6ebe810328555b6fe5c831a851f485e303a7c8ce6c5f675abeb20ebdadc\", [:mix], [], \"hexpm\", \"6105453d7fac22c712ad66fab1d45abdf049868f253cf719b625151460b8b453\"},\n}\n",
+  "duration_s": 10,
+  "healthy": {
+   "rate": 10000,
+   "conns": 64,
+   "procs": 2
+  },
+  "date": "2026-11-21 00:25 +03"
+ },
+ "faults": [
+  {
+   "server": "httpserver",
+   "fault": "baseline",
+   "healthy": {
+    "done": 100000,
+    "retried": 0,
+    "failed": 0,
+    "unfinished": 0,
+    "connections_opened": 64,
+    "rate": 10000,
+    "p50_us": 382,
+    "p99_us": 1540,
+    "p999_us": 2644,
+    "max_us": 8914
+   },
+   "fault_client": {},
+   "rss_kib_before": 15744,
+   "rss_kib_peak": 19072,
+   "rss_kib_after": 17980,
+   "processes_seen": 5,
+   "processes_at_start": 5,
+   "load_before": "3.39"
+  },
+  {
+   "server": "httpserver",
+   "fault": "crash-100/s",
+   "healthy": {
+    "done": 100000,
+    "retried": 179,
+    "failed": 0,
+    "unfinished": 0,
+    "connections_opened": 243,
+    "rate": 10000,
+    "p50_us": 473,
+    "p99_us": 1593,
+    "p999_us": 7834,
+    "max_us": 19117
+   },
+   "fault_client": {
+    "sent": 1100,
+    "answered_500": 0,
+    "other_status": 0,
+    "no_answer": 1100,
+    "connections_opened": 1100,
+    "unsent": 0
+   },
+   "rss_kib_before": 15744,
+   "rss_kib_peak": 41984,
+   "rss_kib_after": 35712,
+   "processes_seen": 12,
+   "processes_at_start": 5,
+   "load_before": "3.28"
+  },
+  {
+   "server": "httpserver",
+   "fault": "crash-1000/s",
+   "healthy": {
+    "done": 100000,
+    "retried": 1545,
+    "failed": 0,
+    "unfinished": 0,
+    "connections_opened": 1611,
+    "rate": 10000,
+    "p50_us": 674,
+    "p99_us": 7577,
+    "p999_us": 15311,
+    "max_us": 23978
+   },
+   "fault_client": {
+    "sent": 11000,
+    "answered_500": 0,
+    "other_status": 0,
+    "no_answer": 11000,
+    "connections_opened": 11000,
+    "unsent": 0
+   },
+   "rss_kib_before": 15616,
+   "rss_kib_peak": 54144,
+   "rss_kib_after": 25600,
+   "processes_seen": 91,
+   "processes_at_start": 5,
+   "load_before": "2.77"
+  },
+  {
+   "server": "httpserver",
+   "fault": "spin-100ms",
+   "healthy": {
+    "done": 100000,
+    "retried": 0,
+    "failed": 0,
+    "unfinished": 0,
+    "connections_opened": 64,
+    "rate": 10000,
+    "p50_us": 460,
+    "p99_us": 1456,
+    "p999_us": 3753,
+    "max_us": 12333
+   },
+   "fault_client": {
+    "answered": 299,
+    "no_answer": 0,
+    "spin_p50_ms": 148,
+    "spin_max_ms": 174
+   },
+   "rss_kib_before": 15872,
+   "rss_kib_peak": 19840,
+   "rss_kib_after": 18732,
+   "processes_seen": 5,
+   "processes_at_start": 5,
+   "load_before": "2.64"
+  },
+  {
+   "server": "httpserver",
+   "fault": "spin-forever",
+   "healthy": {
+    "done": 100000,
+    "retried": 0,
+    "failed": 0,
+    "unfinished": 0,
+    "connections_opened": 64,
+    "rate": 10000,
+    "p50_us": 437,
+    "p99_us": 1466,
+    "p999_us": 2983,
+    "max_us": 5830
+   },
+   "fault_client": {
+    "started": 2,
+    "still_running": 2,
+    "ended_by_server": 0
+   },
+   "rss_kib_before": 15488,
+   "rss_kib_peak": 19456,
+   "rss_kib_after": 19172,
+   "processes_seen": 5,
+   "processes_at_start": 5,
+   "load_before": "2.88"
+  },
+  {
+   "server": "httpserver-req",
+   "fault": "baseline",
+   "healthy": {
+    "done": 100000,
+    "retried": 0,
+    "failed": 0,
+    "unfinished": 0,
+    "connections_opened": 64,
+    "rate": 10000,
+    "p50_us": 355,
+    "p99_us": 1495,
+    "p999_us": 2376,
+    "max_us": 6767
+   },
+   "fault_client": {},
+   "rss_kib_before": 15744,
+   "rss_kib_peak": 21504,
+   "rss_kib_after": 21504,
+   "processes_seen": 5,
+   "processes_at_start": 5,
+   "load_before": "2.76"
+  },
+  {
+   "server": "httpserver-req",
+   "fault": "crash-100/s",
+   "healthy": {
+    "done": 100000,
+    "retried": 166,
+    "failed": 0,
+    "unfinished": 0,
+    "connections_opened": 230,
+    "rate": 10000,
+    "p50_us": 369,
+    "p99_us": 1560,
+    "p999_us": 6464,
+    "max_us": 12752
+   },
+   "fault_client": {
+    "sent": 1100,
+    "answered_500": 1008,
+    "other_status": 0,
+    "no_answer": 92,
+    "connections_opened": 124,
+    "unsent": 0
+   },
+   "rss_kib_before": 15488,
+   "rss_kib_peak": 44288,
+   "rss_kib_after": 23808,
+   "processes_seen": 13,
+   "processes_at_start": 5,
+   "load_before": "2.53"
+  },
+  {
+   "server": "httpserver-req",
+   "fault": "crash-1000/s",
+   "healthy": {
+    "done": 100000,
+    "retried": 1189,
+    "failed": 0,
+    "unfinished": 0,
+    "connections_opened": 1255,
+    "rate": 10000,
+    "p50_us": 542,
+    "p99_us": 3718,
+    "p999_us": 9374,
+    "max_us": 24740
+   },
+   "fault_client": {
+    "sent": 11000,
+    "answered_500": 10271,
+    "other_status": 0,
+    "no_answer": 729,
+    "connections_opened": 761,
+    "unsent": 0
+   },
+   "rss_kib_before": 15872,
+   "rss_kib_peak": 44288,
+   "rss_kib_after": 24448,
+   "processes_seen": 70,
+   "processes_at_start": 5,
+   "load_before": "2.44"
+  },
+  {
+   "server": "httpserver-req",
+   "fault": "spin-100ms",
+   "healthy": {
+    "done": 100000,
+    "retried": 0,
+    "failed": 0,
+    "unfinished": 0,
+    "connections_opened": 64,
+    "rate": 10000,
+    "p50_us": 553,
+    "p99_us": 8950,
+    "p999_us": 20828,
+    "max_us": 23741
+   },
+   "fault_client": {
+    "answered": 404,
+    "no_answer": 0,
+    "spin_p50_ms": 100,
+    "spin_max_ms": 126
+   },
+   "rss_kib_before": 15616,
+   "rss_kib_peak": 22144,
+   "rss_kib_after": 22128,
+   "processes_seen": 5,
+   "processes_at_start": 5,
+   "load_before": "2.74"
+  },
+  {
+   "server": "httpserver-req",
+   "fault": "spin-forever",
+   "healthy": {
+    "done": 100000,
+    "retried": 0,
+    "failed": 0,
+    "unfinished": 0,
+    "connections_opened": 64,
+    "rate": 10000,
+    "p50_us": 523,
+    "p99_us": 1499,
+    "p999_us": 4162,
+    "max_us": 11527
+   },
+   "fault_client": {
+    "started": 2,
+    "still_running": 2,
+    "ended_by_server": 0
+   },
+   "rss_kib_before": 15744,
+   "rss_kib_peak": 21500,
+   "rss_kib_after": 21500,
+   "processes_seen": 5,
+   "processes_at_start": 5,
+   "load_before": "3.19"
+  },
+  {
+   "server": "httpserver-slice1",
+   "fault": "baseline",
+   "healthy": {
+    "done": 100000,
+    "retried": 0,
+    "failed": 0,
+    "unfinished": 0,
+    "connections_opened": 64,
+    "rate": 10000,
+    "p50_us": 398,
+    "p99_us": 1538,
+    "p999_us": 1864,
+    "max_us": 7228
+   },
+   "fault_client": {},
+   "rss_kib_before": 15616,
+   "rss_kib_peak": 19200,
+   "rss_kib_after": 18812,
+   "processes_seen": 5,
+   "processes_at_start": 5,
+   "load_before": "3.02"
+  },
+  {
+   "server": "httpserver-slice1",
+   "fault": "crash-100/s",
+   "healthy": {
+    "done": 100000,
+    "retried": 142,
+    "failed": 0,
+    "unfinished": 0,
+    "connections_opened": 206,
+    "rate": 10000,
+    "p50_us": 427,
+    "p99_us": 1609,
+    "p999_us": 6755,
+    "max_us": 11982
+   },
+   "fault_client": {
+    "sent": 1100,
+    "answered_500": 0,
+    "other_status": 0,
+    "no_answer": 1100,
+    "connections_opened": 1100,
+    "unsent": 0
+   },
+   "rss_kib_before": 15744,
+   "rss_kib_peak": 39296,
+   "rss_kib_after": 25344,
+   "processes_seen": 14,
+   "processes_at_start": 5,
+   "load_before": "2.71"
+  },
+  {
+   "server": "httpserver-slice1",
+   "fault": "crash-1000/s",
+   "healthy": {
+    "done": 100000,
+    "retried": 1488,
+    "failed": 0,
+    "unfinished": 0,
+    "connections_opened": 1554,
+    "rate": 10000,
+    "p50_us": 651,
+    "p99_us": 6945,
+    "p999_us": 15130,
+    "max_us": 21924
+   },
+   "fault_client": {
+    "sent": 11000,
+    "answered_500": 0,
+    "other_status": 0,
+    "no_answer": 11000,
+    "connections_opened": 11000,
+    "unsent": 0
+   },
+   "rss_kib_before": 15616,
+   "rss_kib_peak": 52352,
+   "rss_kib_after": 24320,
+   "processes_seen": 88,
+   "processes_at_start": 5,
+   "load_before": "2.68"
+  },
+  {
+   "server": "httpserver-slice1",
+   "fault": "spin-100ms",
+   "healthy": {
+    "done": 100000,
+    "retried": 0,
+    "failed": 0,
+    "unfinished": 0,
+    "connections_opened": 64,
+    "rate": 10000,
+    "p50_us": 460,
+    "p99_us": 1465,
+    "p999_us": 3274,
+    "max_us": 12111
+   },
+   "fault_client": {
+    "answered": 421,
+    "no_answer": 0,
+    "spin_p50_ms": 104,
+    "spin_max_ms": 109
+   },
+   "rss_kib_before": 15744,
+   "rss_kib_peak": 19840,
+   "rss_kib_after": 18688,
+   "processes_seen": 5,
+   "processes_at_start": 5,
+   "load_before": "2.38"
+  },
+  {
+   "server": "httpserver-slice1",
+   "fault": "spin-forever",
+   "healthy": {
+    "done": 100000,
+    "retried": 0,
+    "failed": 0,
+    "unfinished": 0,
+    "connections_opened": 64,
+    "rate": 10000,
+    "p50_us": 549,
+    "p99_us": 1530,
+    "p999_us": 2232,
+    "max_us": 5952
+   },
+   "fault_client": {
+    "started": 2,
+    "still_running": 2,
+    "ended_by_server": 0
+   },
+   "rss_kib_before": 15488,
+   "rss_kib_peak": 19200,
+   "rss_kib_after": 18264,
+   "processes_seen": 5,
+   "processes_at_start": 5,
+   "load_before": "2.32"
+  },
+  {
+   "server": "bandit",
+   "fault": "baseline",
+   "healthy": {
+    "done": 100000,
+    "retried": 0,
+    "failed": 0,
+    "unfinished": 0,
+    "connections_opened": 64,
+    "rate": 10000,
+    "p50_us": 347,
+    "p99_us": 1433,
+    "p999_us": 2980,
+    "max_us": 22775
+   },
+   "fault_client": {},
+   "rss_kib_before": 172660,
+   "rss_kib_peak": 174380,
+   "rss_kib_after": 167208,
+   "processes_seen": 2,
+   "processes_at_start": 2,
+   "load_before": "2.41"
+  },
+  {
+   "server": "bandit",
+   "fault": "crash-100/s",
+   "healthy": {
+    "done": 100000,
+    "retried": 0,
+    "failed": 0,
+    "unfinished": 0,
+    "connections_opened": 64,
+    "rate": 10000,
+    "p50_us": 355,
+    "p99_us": 1475,
+    "p999_us": 4254,
+    "max_us": 13054
+   },
+   "fault_client": {
+    "sent": 1100,
+    "answered_500": 1100,
+    "other_status": 0,
+    "no_answer": 0,
+    "connections_opened": 1100,
+    "unsent": 0
+   },
+   "rss_kib_before": 173428,
+   "rss_kib_peak": 176380,
+   "rss_kib_after": 172400,
+   "processes_seen": 2,
+   "processes_at_start": 2,
+   "load_before": "2.65"
+  },
+  {
+   "server": "bandit",
+   "fault": "crash-1000/s",
+   "healthy": {
+    "done": 100000,
+    "retried": 0,
+    "failed": 0,
+    "unfinished": 0,
+    "connections_opened": 64,
+    "rate": 10000,
+    "p50_us": 422,
+    "p99_us": 3852,
+    "p999_us": 10695,
+    "max_us": 19467
+   },
+   "fault_client": {
+    "sent": 11000,
+    "answered_500": 11000,
+    "other_status": 0,
+    "no_answer": 0,
+    "connections_opened": 11000,
+    "unsent": 0
+   },
+   "rss_kib_before": 165792,
+   "rss_kib_peak": 168216,
+   "rss_kib_after": 161680,
+   "processes_seen": 2,
+   "processes_at_start": 2,
+   "load_before": "2.86"
+  },
+  {
+   "server": "bandit",
+   "fault": "spin-100ms",
+   "healthy": {
+    "done": 100000,
+    "retried": 0,
+    "failed": 0,
+    "unfinished": 0,
+    "connections_opened": 64,
+    "rate": 10000,
+    "p50_us": 425,
+    "p99_us": 3981,
+    "p999_us": 18798,
+    "max_us": 33004
+   },
+   "fault_client": {
+    "answered": 440,
+    "no_answer": 0,
+    "spin_p50_ms": 100,
+    "spin_max_ms": 102
+   },
+   "rss_kib_before": 176412,
+   "rss_kib_peak": 177376,
+   "rss_kib_after": 163536,
+   "processes_seen": 2,
+   "processes_at_start": 2,
+   "load_before": "3.38"
+  },
+  {
+   "server": "bandit",
+   "fault": "spin-forever",
+   "healthy": {
+    "done": 100000,
+    "retried": 0,
+    "failed": 0,
+    "unfinished": 0,
+    "connections_opened": 64,
+    "rate": 10000,
+    "p50_us": 476,
+    "p99_us": 3703,
+    "p999_us": 4891,
+    "max_us": 12905
+   },
+   "fault_client": {
+    "started": 2,
+    "still_running": 2,
+    "ended_by_server": 0
+   },
+   "rss_kib_before": 170640,
+   "rss_kib_peak": 172684,
+   "rss_kib_after": 165780,
+   "processes_seen": 2,
+   "processes_at_start": 2,
+   "load_before": "4.17"
+  }
+ ]
+}
