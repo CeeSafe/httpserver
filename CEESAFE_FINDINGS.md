@@ -21,7 +21,7 @@ Bugs and gaps in CeeSafe and CeeSafe.Web met while writing httpserver, with cees
 | S14 | A method that is given the context by `borrow mut` cannot call a `dyn Handler<S>` with it (N0272) | ceesafec, by design: the handler and `Context<S>` share the flow name `S`, whatever its bounds (§25.6) | fixed in ceesafec 0.67.0 (ADR 0168) once the interfaces ask `S: Send + Share`, which they do now: `App.handle` owns the context and hands it to the dispatcher |
 | S15 | A cancelled task's function runs on to its end, and cannot tell without asking (`AsyncControl<E>.checkpoint`) | runtime, by design | the dispatcher asks before it tells the access log; `Arc.create(v)` and its like are inferred since ceesafec 0.67.0 (ADR 0166) |
 | S16 | A closure that stores into a captured local and also captures part of a `borrow mut` parameter is refused as if it stored into the parameter (N0272) | ceesafec, looks like a fault of the checker; reduced, not understood | no longer met: with `S: Send + Share` on the interfaces (S14) the closure is accepted in 0.67.0; without the bound it is refused as before, and why is still not known |
-| S17 | A request that computes without waiting holds its worker's event loop until the supervisor kills the worker | runtime, by design (cooperative tasks) | ceesafec ADR 0186, not yet released: with `-DCEE_POLLS=1` and `CW_RUN_BOUND_MS`, an isolated connection past the bound traps with `Overran` and ends alone; the watchdog stays for C code and blocking calls |
+| S17 | A request that computes without waiting holds its worker's event loop until the supervisor kills the worker | runtime, by design (cooperative tasks) | ceesafec 0.80.0 (ADR 0186): with `-DCEE_POLLS=1` and `CW_RUN_BOUND_MS`, an isolated connection past the bound traps with `Overran` and ends alone; the watchdog stays for C code and blocking calls |
 
 ## S1: a nested `if` expression's literals are `i32`
 
@@ -244,7 +244,7 @@ real server a quadratic parse of a hostile input) holds every connection of its 
 `stallMs` (1.5 s in `tools/supervisor_check.py`), kills the worker and every connection on it. It is the largest
 gap left between httpserver and Erlang, whose scheduler takes the CPU from a process after a count of reductions.
 
-ceesafec ADR 0186 (written from this review) bounds how long one resume of a task may run without waiting. A build
+ceesafec ADR 0186 (written from this review, released in 0.80.0) bounds how long one resume of a task may run without waiting. A build
 with `--cflag -DCEE_POLLS=1` polls at loop headers and at the entry of functions that may recurse, and a monitor
 thread marks a thread whose task has run past `Async.runBound(ms, mode)`; the next poll traps an isolated task with
 `PanicKind.Overran`, which ends it alone. The benchmark server sets it from `CW_RUN_BOUND_MS`, and
