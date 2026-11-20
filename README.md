@@ -265,7 +265,8 @@ HTTP/3, give `applicationOf(app)` to `web_http3`'s server. Both are CeeSafe.Web'
 - **Request timeouts.** `app.timeout(ms)` bounds every request and `app.timeoutIn(group, ms)` a group's (longer for
   uploads, shorter for an API): a request whose middleware and handler have not returned is cancelled and answered
   504, or its connection is closed if part of the response had left. The time runs while a handler waits, not
-  while it computes: one that never awaits is the supervisor's to stop.
+  while it computes: one that never awaits is stopped by `Async.runBound` under `app.runIsolated` (below), else by
+  the supervisor.
 - **Access log.** `app.logTo(log)` tells an `AccessLog` of every request once it is answered (the request, its
   scope with the connection and what the middleware left, such as the trace id, the status, the microseconds), a 404
   or a timeout included. `ConsoleLog` writes a line a request to
@@ -329,7 +330,8 @@ A worker is told which one it is by its last argument, `--httpserver-worker=<ind
 in the parent.
 
 - A worker that ends, however it ends, is started again, after a growing pause if it keeps ending at once.
-- A worker whose loop stops turning (a computation that never awaits) stops beating and is killed after `stallMs`.
+- A worker whose loop stops turning (a computation that never awaits, where no bound ends it first: below) stops
+  beating and is killed after `stallMs`.
 - `memoryBytes` limits a worker's address space (Linux), so one that grows fails its own allocations. It is the
   backstop for `app.budget`, which bounds each request on every system.
 - SIGTERM or SIGINT to the parent is passed on; the workers drain (`tend`), and those still there after `graceMs`
@@ -338,14 +340,17 @@ in the parent.
   waiting to be accepted outlive a worker, or each bind the shared port (`reusePort`, Linux), which spreads
   connections evenly.
 
-**A trap can cost one connection instead of a worker.** `app.runIsolated(incoming, acceptor, limits, drain)` serves
-each connection in an isolated task (ceesafec ADR 0175, CeeSafe.Web's `ConnectionServer.runIsolated`, Web ADR 0016).
-A handler that traps ends its connection, whose socket the server shuts, and the worker goes on with the rest. What
-the connection held, memory and its socket, is leaked, and `Isolation.report()` counts it. So `tend` drains a worker
-whose isolated tasks have trapped `recycleCrashes` times (100 by default) or leaked `recycleLeakedBytes` (64 MiB),
-and the supervisor starts it again. A trap under a C library's callback, or inside a `Critical`, still ends the
-worker, as does a computation that never awaits. HTTP/2 streams are not isolated one by one yet: CeeSafe.Web waits
-for a non-waiting isolated spawn from CeeSafe (its U25).
+**A trap can cost one connection instead of a worker.** `app.runIsolated(incoming, acceptor, limits, drain)` serves each
+connection in an isolated task (ceesafec ADR 0175, CeeSafe.Web's `ConnectionServer.runIsolated`, Web ADR 0016). A
+handler that traps ends its connection, whose socket the server shuts, and the worker goes on with the rest. What the
+connection held, memory and its socket, is leaked, and `Isolation.report()` counts it. So `tend` drains a worker whose
+isolated tasks have trapped `recycleCrashes` times (100 by default) or leaked `recycleLeakedBytes` (64 MiB), and the
+supervisor starts it again. HTTP/2 and HTTP/3 streams are isolated one by one (Web ADR 0016 §2.3): a trap costs its
+stream, not the connection's others. A computation that never awaits costs only its connection or stream in a build with
+polls (`--cflag -DCEE_POLLS=1`) once `Async.runBound` is set (ceesafec ADR 0186; the benchmark server's
+`CW_RUN_BOUND_MS`): past the bound it traps with `Overran` and ends alone, its neighbours having waited at most that
+long. Still ending the worker: a trap under a C library's callback or inside a `Critical`, and, without the bound, or in
+C code or a blocking system call, a computation that does not return to the loop (the stall below).
 
 What it costs: the requests in flight on a worker that ends get no answer, and the workers share no memory, so a
 counter or a cache is per worker unless it is put somewhere they share. `SharedWords` is such a place for numbers:
