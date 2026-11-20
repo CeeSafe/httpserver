@@ -76,8 +76,7 @@ def expect(what, ok):
         problems.append(what)
 
 env = dict(os.environ, CW_PORT=str(a.port), CW_PROCS=str(a.procs), CW_STALL_MS="1500")
-if a.inherit:
-    env["CW_INHERIT"] = "1"
+env["CW_INHERIT"] = "1" if a.inherit else "0"  # the benchmark server's default is 1
 if a.memory_mb:
     env["CW_MEMORY_MB"] = str(a.memory_mb)
 if a.budget_mb:
@@ -95,6 +94,24 @@ try:
     expect("every request is answered at the start", answering() == 40)
     workers = {get("/worker")[1] for _ in range(200)}
     print(f"     workers seen: {sorted(workers)}")
+
+    # Recycling that refuses no connection (docs/elixir-gaps.md §4): while the traps below make workers pass their
+    # bound (CW_RECYCLE_CRASHES=2) and be replaced, two clients ask for /small on a new connection every 10 ms each.
+    # A worker that drains has another started in its place at once, and the queue of the socket they share is the
+    # others' meanwhile: none of those requests may fail.
+    steady = {"stop": False, "asked": 0, "failed": 0}
+
+    def client():
+        while not steady["stop"]:
+            r = get("/small", timeout=5.0)
+            steady["asked"] += 1
+            if r != (200, b"hello, world\n"):
+                steady["failed"] += 1
+            time.sleep(0.01)
+
+    clients = [threading.Thread(target=client) for _ in range(2)] if a.isolated else []
+    for c in clients:
+        c.start()
 
     if a.isolated:
         # A trap holding the cache's lock. `/bus/forget/7`, answered by another worker, reaches the one whose lock
@@ -127,6 +144,18 @@ try:
         expect(f"crash {n + 1}: the request that traps gets no answer", get("/crash") is None)
         expect(f"crash {n + 1}: the server still answers", answering() >= 39)
     time.sleep(0.5)
+    if a.isolated:
+        time.sleep(1.0)  # the last recycle's drain
+        steady["stop"] = True
+        for c in clients:
+            c.join()
+        what = f"recycling: {steady['failed']} of {steady['asked']} steady requests failed while workers were replaced"
+        if a.inherit:
+            expect(what, steady["asked"] > 100 and steady["failed"] == 0)
+        else:
+            # Sockets of their own: what waits in a drained worker's queue is reset unless Linux's
+            # net.ipv4.tcp_migrate_req is 1, which this check does not set; it is told, not asked.
+            print(f"     {what} (sockets of their own)")
 
     if a.isolated:
         # The bound (ADR 0186): a request that computes past 250 ms traps with Overran and costs its connection, well
@@ -196,6 +225,11 @@ if a.isolated:
     # Seven traps over three workers (two of them holding a lock) and two requests ended by the run bound: at least
     # one worker took two and was replaced, none crashed, and none stalled or was killed.
     recycled = text.count("passed the bound: draining, to be replaced")
+    replaced = lines[lines.index("bench: recycled") + 1] if "bench: recycled" in lines else "?"
+    expect(f"the report counts the workers started in the place of one that drained ({replaced})",
+           replaced.isdigit() and int(replaced) == recycled and recycled >= 1)
+    expect("each replacement was started while the worker it replaced drained",
+           text.count("started in the place of one that drains") == recycled)
     overran = text.count("past its bound of 250 ms")
     expect(f"the report counts no crash, no stall and no kill ({report})",
            len(report) == 4 and report[1] == "0" and report[2] == "0" and report[3] == "0")
@@ -213,8 +247,7 @@ else:
 print("--- services: one worker, CW_JOBS=1, CW_SERVICE_RESTARTS=3")
 sport = a.port + 2
 senv = dict(os.environ, CW_PORT=str(sport), CW_PROCS="1", CW_STALL_MS="1500", CW_JOBS="1", CW_SERVICE_RESTARTS="3")
-if a.inherit:
-    senv["CW_INHERIT"] = "1"
+senv["CW_INHERIT"] = "1" if a.inherit else "0"
 slog_path = "/tmp/supervisor_check_services.log"
 slog = open(slog_path, "w")
 proc = subprocess.Popen([str(binary)], env=senv, stdout=slog, stderr=subprocess.STDOUT)

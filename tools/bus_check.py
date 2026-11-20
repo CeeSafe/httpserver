@@ -70,8 +70,7 @@ def run(bus):
     env = dict(os.environ, CW_PORT=str(a.port), CW_PROCS="4")
     if bus:
         env["CW_BUS"] = "1"
-    if a.inherit:
-        env["CW_INHERIT"] = "1"
+    env["CW_INHERIT"] = "1" if a.inherit else "0"  # the benchmark server's default is 1
     proc = subprocess.Popen([str(HERE / "bench" / "out" / "bench")], env=env, stdout=subprocess.DEVNULL)
     try:
         time.sleep(1.5)

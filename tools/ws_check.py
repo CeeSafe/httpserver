@@ -18,8 +18,7 @@ a = args.parse_args()
 env = dict(os.environ, CW_PORT=str(a.port))
 if a.workers:
     env.update(CW_PROCS=str(a.workers), CW_BUS="1")
-if a.inherit:
-    env["CW_INHERIT"] = "1"
+env["CW_INHERIT"] = "1" if a.inherit else "0"  # the benchmark server's default is 1
 COUNT = 12 if a.workers else 5
 
 class Client:

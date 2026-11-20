@@ -337,8 +337,9 @@ fn supervised() -> Result<SupervisorReport, SupervisorError> {
 }
 ```
 
-A worker is told which one it is by its last argument, `--httpserver-worker=<index>`; `supervisor.worker()` is null
-in the parent.
+A worker is told which one it is by its last argument, `--httpserver-worker=<index>.<generation>`;
+`supervisor.worker()` is null in the parent. Each place has two generations, so that a worker started in the place of
+one that drains beats, and writes the bus (`worker.ring()`), apart from it.
 
 - A worker that ends, however it ends, is started again, after a growing pause if it keeps ending at once.
 - A worker whose loop stops turning (a computation that never awaits, where no bound ends it first: below) stops
@@ -347,14 +348,21 @@ in the parent.
   backstop for `app.budget`, which bounds each request on every system.
 - SIGTERM or SIGINT to the parent is passed on; the workers drain (`tend`), and those still there after `graceMs`
   are killed.
-- The workers either accept from one listening socket the parent bound (`supervisor.listener`), so connections
-  waiting to be accepted outlive a worker, or each bind the shared port (`reusePort`, Linux), which spreads
-  connections evenly.
+- The workers accept from one listening socket the parent bound (`supervisor.listener`), so connections waiting to
+  be accepted outlive a worker: the default, and the benchmark server's. Or each binds the shared port
+  (`reusePort`, Linux), which spreads connections evenly; then a worker replaced while it drains resets what waits
+  in its own socket's queue when it closes it, unless `net.ipv4.tcp_migrate_req = 1` (Linux 5.14 and later) moves
+  that to another socket of the port.
+- **A worker replaced refuses no connection** (docs/elixir-gaps.md §4). One whose isolated tasks' crashes passed
+  the bound (below) asks for a replacement (`tend`); the parent starts another in its place at once, and tells the
+  old one to drain: at once with the shared socket, whose queue is then the others', or once the new one has beaten
+  with sockets of their own. The old one finishes what is in flight and ends; one that outlives `graceMs` after it
+  was told is killed. `SupervisorReport.recycled` counts the replacements.
 
 **A trap can cost one connection instead of a worker.** `app.runIsolated(incoming, acceptor, limits, drain)` serves each
 connection in an isolated task (ceesafec ADR 0175, CeeSafe.Web's `ConnectionServer.runIsolated`, Web ADR 0016). A
 handler that traps ends its connection, whose socket the server shuts, and the worker goes on with the rest. What the
-connection held, memory and its socket, is leaked, and `Isolation.report()` counts it. So `tend` drains a worker whose
+connection held, memory and its socket, is leaked, and `Isolation.report()` counts it. So `tend` replaces a worker whose
 isolated tasks have trapped `recycleCrashes` times (100 by default) or leaked `recycleLeakedBytes` (64 MiB), and the
 supervisor starts it again. HTTP/2 and HTTP/3 streams are isolated one by one (Web ADR 0016 §2.3): a trap costs its
 stream, not the connection's others. A computation that never awaits costs only its connection or stream in a build with
@@ -385,7 +393,7 @@ which the next uses repair, the cache's from the bus. Those two need the trap ho
 (`CW_RUN_BOUND_MS=250`, `Async.runBound`, ceesafec ADR 0186): the handler that never returns is then ended alone with
 `Overran`, its worker answering the other requests meanwhile, where without the bound the supervisor kills the stalled
 worker. The bound needs polls compiled in, `--cflag -DCEE_POLLS=1`: `--isolated` runs `bench/out/bench-traps`, built
-with both macros. On macOS add `--inherit`: without it the kernel gives every connection to one worker.
+with both macros. On macOS add `--inherit`: without it (the checks set `CW_INHERIT=0`) the kernel gives every connection to one worker. With `--isolated` it also asks that no request fails while workers are replaced (`--inherit` only: sockets of their own need Linux's `tcp_migrate_req`).
 
 The shared memory is ceesafec's `SharedMemory` with no name (`SharedMemory.anonymous`), which a process reaches
 only by being handed it, so a supervisor that is killed leaves nothing behind. The supervisor starts, watches and
@@ -467,7 +475,7 @@ environment:
 |---|---|
 | `CW_PORT` | The port on 127.0.0.1 (8090) |
 | `CW_PROCS=n` | n worker processes under the supervisor; unset, one process and no supervisor |
-| `CW_INHERIT=1` | The workers accept from one socket the supervisor bound, instead of each binding the port |
+| `CW_INHERIT=0` | Each worker binds the port (`reusePort`) instead of accepting from the one socket the supervisor bound (`CW_INHERIT=1`, the default) |
 | `CW_REUSEPORT=1` | One process that binds the port with `reusePort`, to run several by hand (Linux) |
 | `CW_WORKERS` | The most connections served at once (256) |
 | `CW_STALL_MS` | How long a worker may go without beating before it is killed (2000) |

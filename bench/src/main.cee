@@ -28,11 +28,14 @@
 //   GET  /job/trap/{n:int} the job's next run traps (n = 1), or every run does (n = 2); 0 for neither
 //
 // CW_PROCS=n runs n worker processes under the supervisor (src/supervisor.cee), which starts a worker again when it
-// ends and kills one whose loop has stopped; CW_MEMORY_MB limits each worker's address space; CW_BUDGET_MB each request's memory; CW_INHERIT=1 has the
-// workers accept from one socket the supervisor bound, instead of each binding the shared port.
+// ends and kills one whose loop has stopped; CW_MEMORY_MB limits each worker's address space; CW_BUDGET_MB each request's memory. The
+// workers accept from one socket the supervisor bound; CW_INHERIT=0 has each bind the shared port instead
+// (SO_REUSEPORT), which on Linux spreads connections evenly, and for which a worker replaced while it drains needs
+// `net.ipv4.tcp_migrate_req = 1` (5.14 and later) not to reset what waits in its socket's queue.
 //
 // CW_ISOLATED=1 serves each connection in an isolated task (`App.runIsolated`): a trap costs its connection, not the
-// worker, and a worker is replaced after CW_RECYCLE_CRASHES crashes (100 by default).
+// worker, and a worker is replaced after CW_RECYCLE_CRASHES crashes (100 by default): another is started in its
+// place at once, and it drains.
 //
 // CW_RUN_BOUND_MS=n bounds how long a task may compute without waiting (`Async.runBound`, ceesafec ADR 0186), in a
 // build with `--cflag -DCEE_POLLS=1`: under CW_ISOLATED=1 a request that computes past it traps with `Overran` and
@@ -849,7 +852,7 @@ fn services(worker: Worker, bus: Bus?, ears: Ears, wiring: borrow Wiring) -> Res
     match (bus) {
         Some(b) => {
             let carrier: Box<dyn Service + Send + Share> =
-                Box.create(BusCarrier<Ears> { bus: b, worker: worker.index(), sink: ears, everyMs: 5 })?;
+                Box.create(BusCarrier<Ears> { bus: b, worker: worker.ring(), sink: ears, everyMs: 5 })?;
             let _ = services.add("bus", carrier, Restart.Permanent)?;
         }
         null => {}
@@ -942,7 +945,7 @@ fn wired(worker: Worker, words: SharedWords?, bus: Bus?) -> Parts? {
         Some(b) => {
             // Joining drops what the worker before in this place was writing when it ended; the bus's carrier
             // reads from its own `reader` in each start.
-            match (b.join(worker.index())) {
+            match (b.join(worker.ring())) {
                 Ok(p) => { sender = Some(p.sender()); }
                 Err(_) => { return null; }
             }
@@ -1079,8 +1082,9 @@ fn main() {
             Err(e) => { failed(e); }
         }
     }
-    // CW_INHERIT=1: the supervisor binds the port and the workers accept from its socket.
-    if (setting("CW_INHERIT", 0) == 1) {
+    // The supervisor binds the port and the workers accept from its socket (the default, CW_INHERIT=1): a worker
+    // that drains leaves its queue to the others. CW_INHERIT=0: each binds the shared port (SO_REUSEPORT).
+    if (setting("CW_INHERIT", 1) == 1) {
         let shared = ListenOptions { backlog: 0, reuseAddress: true, reusePort: false, v6Only: false };
         match (supervisor.listener(address(), shared)) {
             Ok(l) => { bench.listener = Some(l); }
@@ -1094,6 +1098,8 @@ fn main() {
             Console.writeLine(report.crashed);
             Console.writeLine(report.stalled);
             Console.writeLine(report.killed);
+            Console.writeLine("bench: recycled");
+            Console.writeLine(report.recycled);
         }
         Err(e) => { failed(e); }
     }

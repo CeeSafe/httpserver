@@ -5,6 +5,8 @@
 // is a process with its own memory, one event loop and one core; the parent does nothing but watch them:
 //
 // - a worker that ends, however it ends, is started again (after a growing pause if it keeps ending at once);
+// - a worker whose isolated tasks' crashes passed the bound asks to be replaced: another is started in its place at
+//   once, and the old one drains (docs/elixir-gaps.md §4), so a recycle refuses no connection;
 // - a worker that stops beating (its event loop is stuck in a computation) is killed and started again;
 // - a worker may be given a memory limit, so that one that grows without bound fails its own allocations;
 // - SIGTERM or SIGINT to the parent is passed to the workers, which drain and end; those that have not after the
@@ -34,7 +36,9 @@ extern "C" {
 /// The most workers a supervisor runs: what fits the page of beats.
 public fn maxWorkers() -> u32 => 256;
 
-/// The argument a worker is started with, before its index: `--httpserver-worker=3`. It is the last one.
+/// The argument a worker is started with, before its index and generation: `--httpserver-worker=3.1`. It is the
+/// last one. A place has two generations, 0 and 1, so that a worker started in the place of one that drains has
+/// words and a ring of the bus of its own.
 fn workerFlag() -> StringView => "--httpserver-worker=";
 
 /// What a supervisor is told.
@@ -75,6 +79,8 @@ public struct SupervisorOptions {
 public struct SupervisorReport {
     /// Workers started, the first of each place included.
     public started: u64;
+    /// Workers started in the place of one that drained because its isolated tasks' crashes passed the bound.
+    public recycled: u64;
     /// Workers that ended with a status other than 0, or by a signal that was not the supervisor's.
     public crashed: u64;
     /// Workers killed because they stopped beating.
@@ -105,15 +111,20 @@ public enum SupervisorError {
 /// A worker's place: which of the workers it is, and where it beats.
 public struct Worker {
     private place: u32;
+    /// Its generation in the place, 0 or 1 (`workerFlag`).
+    private generation: u32;
     /// The address of its word of the page of beats; 0 without a supervisor.
     private slot: usize;
+    /// The address of its word of the page of states: 0, 1 when it asks to be replaced, 2 when the parent tells it to
+    /// drain. 0 without a supervisor.
+    private state: usize;
     /// `SupervisorOptions.recycleCrashes` and `recycleLeakedBytes`; 0 for none.
     private crashLimit: u64;
     private leakLimit: u64;
 
     /// A worker without a supervisor: the whole server in one process. Its beat goes nowhere, and it is never
     /// recycled.
-    public fn alone() -> Worker => Worker { place: 0, slot: 0, crashLimit: 0, leakLimit: 0 };
+    public fn alone() -> Worker => Worker { place: 0, generation: 0, slot: 0, state: 0, crashLimit: 0, leakLimit: 0 };
 
     /// Whether the isolated tasks of this process have cost it more than the supervisor allows: then it should drain
     /// and end, to be started again.
@@ -126,8 +137,28 @@ public struct Worker {
             (this.leakLimit != 0 && report.leakedBytes >= this.leakLimit);
     }
 
-    /// Which worker this is: 0 to the count less one.
+    /// Which worker this is: 0 to the count less one. A worker started in the place of one that drains has its index.
     public fn index(borrow this) -> u32 => this.place;
+
+    /// Its ring of the supervisor's bus (`Bus.join`, `BusCarrier`): two for each place, one for each generation, so
+    /// a worker and the one started in its place while it drains each write a ring of their own.
+    public fn ring(borrow this) -> u32 => this.place * 2 + this.generation;
+
+    /// Its word of the page of states.
+    /// Safety: `state` is this worker's word of the page the supervisor handed it, mapped for the life of the
+    /// process, aligned, and only ever accessed atomically, here and by the parent.
+    fn stateWord(borrow this) -> borrow AtomicU64 => unsafe { Ptr.toBorrow(this.state as *mut AtomicU64) };
+
+    /// Asks the supervisor for a worker in this one's place (`tend`, once `spent`).
+    fn askToBeReplaced(borrow this) {
+        if (this.state != 0) {
+            this.stateWord().store(1);
+        }
+    }
+
+    /// Whether the supervisor told this worker to drain: its replacement is started, and where the workers bind
+    /// sockets of their own, has beaten.
+    fn released(borrow this) -> bool => this.state == 0 || this.stateWord().load() == 2;
 
     /// Whether a supervisor watches this worker.
     public fn supervised(borrow this) -> bool => this.slot != 0;
@@ -197,8 +228,13 @@ public struct Supervisor {
     private options: SupervisorOptions;
     /// In a worker: which one. Null in the parent.
     private me: u32?;
-    /// The page of beats: its address.
+    /// In a worker: its generation in its place (0 or 1).
+    private generation: u32;
+    /// The pages of beats and states: their address. Beats first, a word for each place and generation, then the
+    /// states, as many.
     private beats: usize;
+    /// In the parent: whether it bound the listening socket the workers accept from (`listener`).
+    private shared: bool;
     /// What the parent hands each worker (empty in a worker).
     private handover: Handover;
     /// What a worker was handed (empty in the parent).
@@ -211,10 +247,16 @@ public struct Supervisor {
         if (options.workers == 0 || options.workers > maxWorkers()) {
             return Err(SupervisorError.BadOptions);
         }
+        let seat = workerSeat();
         var supervisor = Supervisor {
             options: options,
-            me: workerIndex(),
+            me: match (seat) {
+                Some(s) => Some(s / 2),
+                null => null,
+            },
+            generation: (seat ?? 0) % 2,
             beats: 0,
+            shared: false,
             handover: Handover.create(),
             given: Process.inherited(),
             next: 0,
@@ -227,7 +269,7 @@ public struct Supervisor {
             }
             null => {}
         }
-        supervisor.beats = supervisor.memory(maxWorkers() as usize * 8)?;
+        supervisor.beats = supervisor.memory(maxWorkers() as usize * 32)?;
         return Ok(supervisor);
     }
 
@@ -281,9 +323,10 @@ public struct Supervisor {
 
     /// The workers' bus, rings of `ringBytes` each (`Bus.create`'s rounding).
     public fn bus(borrow mut this, ringBytes: usize) -> Result<Bus, SupervisorError> {
+        // Two rings for each place: a worker and the one started in its place while it drains (`Worker.ring`).
         let size = Bus.ringFor(ringBytes);
-        let base = this.memory(Bus.bytesFor(this.options.workers, size))?;
-        return Ok(Bus.at(base, this.options.workers, size));
+        let base = this.memory(Bus.bytesFor(this.options.workers * 2, size))?;
+        return Ok(Bus.at(base, this.options.workers * 2, size));
     }
 
     /// The listening socket every worker accepts from: bound in the parent, with `options`, and taken in a worker.
@@ -318,6 +361,7 @@ public struct Supervisor {
                     }
                     Err(_) => { return Err(SupervisorError.CannotHand); }
                 }
+                this.shared = true;
                 return Ok(SharedListener { listener: listener });
             }
         }
@@ -326,8 +370,8 @@ public struct Supervisor {
     /// In a worker, runs `main` and ends the process with its status: it never returns. In the parent, runs
     /// `options.workers` workers until the supervisor is asked to stop (SIGTERM or SIGINT) and the workers have
     /// ended.
-    /// Safety: `setrlimit` reads two `u64`, which is `struct rlimit` on LP64; the beats page is `maxWorkers()`
-    /// words, so the worker's word is inside it.
+    /// Safety: `setrlimit` reads two `u64`, which is `struct rlimit` on LP64; the pages hold a beat and a state for
+    /// each of `maxWorkers()` places and two generations, so the worker's words are inside them.
     public fn run<M: WorkerMain>(this, main: borrow M) -> Result<SupervisorReport, SupervisorError> {
         match (this.me) {
             Some(i) => {
@@ -335,10 +379,12 @@ public struct Supervisor {
                     var limit = [this.options.memoryBytes; 2];
                     unsafe { setrlimit(RLIMIT_AS, borrow limit[0] as *u64 as *rlimit); }
                 }
-                let slot = this.beats + i as usize * 8;
+                let seat = (i * 2 + this.generation) as usize;
                 Process.exit(main.run(Worker {
                     place: i,
-                    slot: slot,
+                    generation: this.generation,
+                    slot: beatAt(this.beats, seat),
+                    state: stateAt(this.beats, seat),
                     crashLimit: this.options.recycleCrashes,
                     leakLimit: this.options.recycleLeakedBytes,
                 }));
@@ -354,12 +400,15 @@ public struct Supervisor {
             Ok(p) => p,
             Err(_) => { return Err(SupervisorError.CannotStart); },
         };
-        return Async.run(watch(this.options, this.beats, program.view(), borrow this.handover, borrow signals));
+        return Async.run(
+            watch(this.options, this.beats, this.shared, program.view(), borrow this.handover, borrow signals),
+        );
     }
 }
 
-/// The worker's index, from its last argument; null in a process that was not started as a worker.
-fn workerIndex() -> u32? {
+/// The worker's seat, its index times two plus its generation, from its last argument (`--httpserver-worker=3.1`;
+/// `3` alone is generation 0); null in a process that was not started as a worker.
+fn workerSeat() -> u32? {
     let count = Process.argumentCount();
     if (count < 2) {
         return null;
@@ -370,22 +419,35 @@ fn workerIndex() -> u32? {
         return null;
     }
     let digits = last.bytes();
-    if (digits.length == flag.length || digits.length > flag.length + 3) {
+    var end = digits.length;
+    var generation: u32 = 0;
+    if (end >= flag.length + 2 && digits[end - 2] == 46) {
+        // `.0` or `.1`
+        let g = digits[end - 1];
+        if (g != 48 && g != 49) {
+            return null;
+        }
+        generation = (g - 48) as u32;
+        end -= 2;
+    }
+    if (end == flag.length || end > flag.length + 3) {
         return null;
     }
     var n: u32 = 0;
-    for (i in flag.length..digits.length) {
+    for (i in flag.length..end) {
         let d = digits[i];
         if (d < 48 || d > 57) {
             return null;
         }
         n = n * 10 + (d - 48) as u32;
     }
-    return Some(n);
+    return Some(n * 2 + generation);
 }
 
 /// A worker's process as the parent sees it.
 struct Place {
+    /// Its generation: which of the place's two seats it beats in.
+    generation: u32;
     startedMs: u64;
     /// The beat last seen, and when it last changed.
     beat: u64;
@@ -398,10 +460,34 @@ struct Place {
 
 fn nowMs() -> u64 => Clock.monotonicNanos() / 1000000;
 
-/// Word `i` of the page of beats.
-/// Safety: the page is `maxWorkers()` words, mapped for the life of the process; the callers pass an index below
-/// the count of workers.
-fn beatOf(beats: usize, i: usize) -> u64 => unsafe { ((beats + i * 8) as *u64).read() };
+/// The seat of place `i`'s generation `generation`: its index in each page.
+fn seatOf(i: usize, generation: u32) -> usize => i * 2 + generation as usize;
+
+/// The address of a seat's beat, and of its state.
+fn beatAt(beats: usize, seat: usize) -> usize => beats + seat * 8;
+fn stateAt(beats: usize, seat: usize) -> usize => beats + (maxWorkers() as usize * 2 + seat) * 8;
+
+/// A seat's beat.
+/// Safety: the pages hold `maxWorkers()` places of two seats, mapped for the life of the process; the callers pass
+/// a seat of a place below the count of workers. A beat is an aligned word only its worker writes.
+fn beatOf(beats: usize, seat: usize) -> u64 => unsafe { (beatAt(beats, seat) as *u64).read() };
+
+/// Sets a seat's beat and state to 0, before a worker is started in it.
+/// Safety: as beatOf; no worker runs in the seat.
+fn clearSeat(beats: usize, seat: usize) {
+    unsafe { (beatAt(beats, seat) as *mut u64).write(0); }
+    stateStore(beats, seat, 0);
+}
+
+/// A seat's state: 1 when its worker asks to be replaced, 2 once it is told to drain.
+/// Safety: as beatOf; a state is only ever accessed atomically, here and by its worker.
+fn stateLoad(beats: usize, seat: usize) -> u64 =>
+    unsafe { Ptr.toBorrow(stateAt(beats, seat) as *mut AtomicU64).load() };
+
+/// Safety: as stateLoad.
+fn stateStore(beats: usize, seat: usize, value: u64) {
+    unsafe { Ptr.toBorrow(stateAt(beats, seat) as *mut AtomicU64).store(value); }
+}
 
 /// One line on standard output: `supervisor: worker <index> (pid <pid>) <what> <number>`.
 async fn say(options: borrow SupervisorOptions, index: usize, pid: u64, what: StringView, number: u64, numbered: bool) {
@@ -428,12 +514,18 @@ async fn say(options: borrow SupervisorOptions, index: usize, pid: u64, what: St
     }
 }
 
-/// Starts worker `index`: this program again, with its arguments and the worker's.
-fn start(program: StringView, index: usize, handover: borrow Handover) -> Result<ChildProcess, IoError> {
+/// Starts worker `index` in its generation `generation`: this program again, with its arguments and the worker's.
+fn start(
+    program: StringView,
+    index: usize,
+    generation: u32,
+    handover: borrow Handover,
+) -> Result<ChildProcess, IoError> {
     var flag = [0u8; 40];
     var w = TextWriter.create(mut flag[..]);
     w.text(workerFlag());
     w.decimal(index as u64);
+    w.text(if (generation == 0) ".0" else ".1");
     let mine = StringView.fromUtf8(w.written()) ?? { return Err(IoError.InvalidInput); };
     var arguments = Vector<StringView>.create();
     for (i in 1..Process.argumentCount()) {
@@ -452,22 +544,33 @@ fn start(program: StringView, index: usize, handover: borrow Handover) -> Result
     return Process.spawnWith(program, arguments, ChildOptions.inherit(), handover);
 }
 
-/// The parent's loop: starts the workers, watches them, and passes a request to stop on.
+/// The parent's loop: starts the workers, watches them, starts one in the place of a worker that asks to be replaced,
+/// and passes a request to stop on. Each place has two seats, one for each generation: its worker's, and while that
+/// one drains, its replacement's. `shared`: the workers accept from the socket the parent bound, so a worker that asks
+/// to be replaced is told to drain at once, its queue being the others'; else it serves on until its replacement
+/// has beaten, since what waits in its own socket's queue when it closes it is reset (on Linux, unless
+/// `net.ipv4.tcp_migrate_req` is 1).
 async fn watch(
     options: SupervisorOptions,
     beats: usize,
+    shared: bool,
     program: StringView,
     handover: borrow Handover,
     signals: borrow ProcessSignals,
 ) -> Result<SupervisorReport, SupervisorError> {
-    var report = SupervisorReport { started: 0, crashed: 0, stalled: 0, killed: 0 };
+    var report = SupervisorReport { started: 0, recycled: 0, crashed: 0, stalled: 0, killed: 0 };
     let count = options.workers as usize;
     var places = Vector<Place>.create();
+    // By seat: a place's worker in the seat of its generation, and one that drains in the other.
     var children = Vector<ChildProcess?>.create();
+    // By place: when the worker that drains in the other seat was told to; 0 before. Whether it was killed.
+    var toldMs = Vector<u64>.create();
+    var retiredKilled = Vector<bool>.create();
     for (i in 0..count) {
         // due at once
-        let place = Place { startedMs: 0, beat: 0, beatMs: 0, restartMs: 1, quick: 0 };
-        if (places.push(place).isErr() || children.push(null).isErr()) {
+        let place = Place { generation: 0, startedMs: 0, beat: 0, beatMs: 0, restartMs: 1, quick: 0 };
+        if (places.push(place).isErr() || children.push(null).isErr() || children.push(null).isErr() ||
+            toldMs.push(0).isErr() || retiredKilled.push(false).isErr()) {
             return Err(SupervisorError.CannotWatch);
         }
     }
@@ -484,11 +587,13 @@ async fn watch(
                 _ => {}
             }
         }
-        // Workers that ended.
-        for (i in 0..count) {
+        // Workers that ended: a place's own, and one that drained in the place of another.
+        for (seat in 0..count * 2) {
+            let i = seat / 2;
+            let current = seat == seatOf(i, places[i].generation);
             var ended: ChildExit? = null;
             var pid: u64 = 0;
-            match (borrow mut children[i]) {
+            match (borrow mut children[seat]) {
                 Some(child) => {
                     pid = child.id();
                     match (child.poll()) {
@@ -499,7 +604,7 @@ async fn watch(
                 null => {}
             }
             let exit = ended ?? { continue; };
-            children[i] = null;
+            children[seat] = null;
             let signalled = match (exit) {
                 ChildExit.Signal(_) => true,
                 ChildExit.Status(_) => false,
@@ -508,6 +613,22 @@ async fn watch(
                 ChildExit.Signal(n) => n,
                 ChildExit.Status(n) => n,
             };
+            if (!current) {
+                if (!stopping && !retiredKilled[i] && (signalled || code != 0)) {
+                    report.crashed += 1;
+                }
+                toldMs[i] = 0;
+                retiredKilled[i] = false;
+                await say(
+                    options,
+                    i,
+                    pid,
+                    if (signalled) "drained, replaced: ended by signal" else "drained, replaced: exited with status",
+                    truncate<u64>(code as i64),
+                    true,
+                );
+                continue;
+            }
             let asked = stopping || places[i].restartMs != 0; // restartMs is set when the supervisor killed it
             if (!asked && (signalled || code != 0)) {
                 report.crashed += 1;
@@ -533,8 +654,8 @@ async fn watch(
         }
         if (stopping) {
             var alive: usize = 0;
-            for (i in 0..count) {
-                if (children[i].isSome()) {
+            for (seat in 0..count * 2) {
+                if (children[seat].isSome()) {
                     alive += 1;
                 }
             }
@@ -543,8 +664,8 @@ async fn watch(
             }
             if (stopSentMs == 0) {
                 stopSentMs = now;
-                for (i in 0..count) {
-                    match (borrow children[i]) {
+                for (seat in 0..count * 2) {
+                    match (borrow children[seat]) {
                         Some(child) => {
                             let _ = child.terminate();
                         }
@@ -553,11 +674,11 @@ async fn watch(
                 }
             } else if (!killSent && now - stopSentMs > options.graceMs) {
                 killSent = true;
-                for (i in 0..count) {
-                    match (borrow children[i]) {
+                for (seat in 0..count * 2) {
+                    match (borrow children[seat]) {
                         Some(child) => {
                             report.killed += 1;
-                            await say(options, i, child.id(), "outlived the grace: killed", 0, false);
+                            await say(options, seat / 2, child.id(), "outlived the grace: killed", 0, false);
                             let _ = child.kill();
                         }
                         null => {}
@@ -566,16 +687,18 @@ async fn watch(
             }
         } else {
             for (i in 0..count) {
-                if (children[i].isNull()) {
+                let seat = seatOf(i, places[i].generation);
+                let other = seatOf(i, 1 - places[i].generation);
+                if (children[seat].isNull()) {
                     if (places[i].restartMs != 0 && now >= places[i].restartMs) {
-                        match (start(program, i, handover)) {
+                        clearSeat(beats, seat);
+                        match (start(program, i, places[i].generation, handover)) {
                             Ok(child) => {
                                 report.started += 1;
                                 let pid = child.id();
-                                children[i] = Some(child);
-                                // The beat goes on from what the page holds: the parent compares, not counts.
+                                children[seat] = Some(child);
                                 places[i].startedMs = now;
-                                places[i].beat = beatOf(beats, i);
+                                places[i].beat = 0;
                                 places[i].beatMs = now;
                                 places[i].restartMs = 0;
                                 await say(options, i, pid, "started", 0, false);
@@ -590,16 +713,64 @@ async fn watch(
                     }
                     continue;
                 }
+                // A worker that asks to be replaced (`tend`, once `spent`): another in its place at once, in the
+                // other seat, while it drains.
+                if (children[other].isNull() && places[i].restartMs == 0 && stateLoad(beats, seat) == 1) {
+                    let next = 1 - places[i].generation;
+                    clearSeat(beats, other);
+                    match (start(program, i, next, handover)) {
+                        Ok(child) => {
+                            report.started += 1;
+                            report.recycled += 1;
+                            let pid = child.id();
+                            children[other] = Some(child);
+                            places[i].generation = next;
+                            places[i].startedMs = now;
+                            places[i].beat = 0;
+                            places[i].beatMs = now;
+                            toldMs[i] = 0;
+                            retiredKilled[i] = false;
+                            await say(options, i, pid, "started in the place of one that drains", 0, false);
+                            if (shared) {
+                                stateStore(beats, seat, 2);
+                                toldMs[i] = now;
+                            }
+                        }
+                        Err(_) => {
+                            // No process for its replacement: it drains alone, and is started again when it ends.
+                            stateStore(beats, seat, 2);
+                        }
+                    }
+                    continue;
+                }
+                // The worker that drains in the other seat: told to once its replacement has beaten, and killed past
+                // the grace.
+                match (borrow children[other]) {
+                    Some(retiring) => {
+                        if (toldMs[i] == 0) {
+                            if (beatOf(beats, seat) != 0) {
+                                stateStore(beats, other, 2);
+                                toldMs[i] = now;
+                            }
+                        } else if (!retiredKilled[i] && now - toldMs[i] > options.graceMs) {
+                            retiredKilled[i] = true;
+                            report.killed += 1;
+                            await say(options, i, retiring.id(), "drained past the grace: killed", 0, false);
+                            let _ = retiring.kill();
+                        }
+                    }
+                    null => {}
+                }
                 if (options.stallMs == 0 || places[i].restartMs != 0) {
                     continue;
                 }
-                let beat = beatOf(beats, i);
+                let beat = beatOf(beats, seat);
                 if (beat != places[i].beat) {
                     places[i].beat = beat;
                     places[i].beatMs = now;
                 } else if (now - places[i].beatMs > options.stallMs) {
                     report.stalled += 1;
-                    match (borrow children[i]) {
+                    match (borrow children[seat]) {
                         Some(child) => {
                             await say(
                                 options,
@@ -625,9 +796,11 @@ async fn watch(
 }
 
 /// A worker's housekeeping, to race against its server (`Async.race(server, tend<ServerReport>(…))`): beats every
-/// `everyMs`, and starts `drain` when the process is asked to stop (SIGTERM or SIGINT), or when its isolated tasks
-/// have cost it more than the supervisor allows (`Worker.spent`), so the server finishes what is in flight and
-/// returns; the supervisor then starts the worker again. It returns only an error.
+/// `everyMs`, and starts `drain` when the process is asked to stop (SIGTERM or SIGINT). When its isolated tasks have
+/// cost it more than the supervisor allows (`Worker.spent`), it asks the supervisor for a worker in its place and
+/// starts `drain` when told to: at once where the workers accept from the parent's socket, else once the new one
+/// has beaten. So the server finishes what is in flight and returns while another serves; nothing is refused. A
+/// worker without a supervisor drains at once. It returns only an error.
 public async fn tend<T>(worker: Worker, drain: borrow Drain, everyMs: u64) -> Result<T, NetError> {
     // A subscription that fails (another holds it) leaves the signals to their holder.
     let signals = match (ProcessSignals.subscribe()) {
@@ -635,10 +808,20 @@ public async fn tend<T>(worker: Worker, drain: borrow Drain, everyMs: u64) -> Re
         Err(_) => null,
     };
     var recycling = false;
+    var released = false;
     loop {
         worker.beat();
         if (!recycling && worker.spent()) {
             recycling = true;
+            if (worker.supervised()) {
+                worker.askToBeReplaced();
+                let _ = await AsyncConsole.writeLine(
+                    "worker: its isolated tasks' crashes passed the bound: asking for a worker in its place",
+                );
+            }
+        }
+        if (recycling && !released && worker.released()) {
+            released = true;
             let _ = await AsyncConsole.writeLine(
                 "worker: its isolated tasks' crashes passed the bound: draining, to be replaced",
             );
