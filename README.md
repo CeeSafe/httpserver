@@ -386,6 +386,17 @@ program's own manifest asks. Still ending the worker: a trap under a C library's
 without the bound, or in C code or a blocking system call, a computation that does not return to the loop (the stall
 below).
 
+**A trap can cost one request, not its connection.** `app.isolateRequests(true)` (CeeSafe.Web's
+`Limits.isolateRequests`, Web ADR 0017; the benchmark server's `CW_ISOLATE_REQUESTS=1`) serves each HTTP/1.1 request in
+an isolated task of its own, the connection's task keeping the socket and TLS. A handler that traps, or computes past
+its bound, is answered 500 when no byte of its response has left (a body that waits in a buffer, as gzip's does, has not
+left), and the next request goes on the same connection; if part of the response had left, or the request's body could
+not be drained, the connection closes. What leaks is the request's, not the connection's. The access log's
+`crashed(request, crash)` is told of each, as `ConsoleLog` writes it: `GET /crash crashed index`. It is off by default:
+it costs each request a task and a relay through its connection's (Web ADR 0017 measured a median of 16% fewer small
+requests a second). HTTP/2 and HTTP/3 streams are isolated whether or not it is on, and a stream that traps before its
+head is answered 500 too.
+
 What it costs: the requests in flight on a worker that ends get no answer, and the workers share no memory, so a
 counter or a cache is per worker unless it is put somewhere they share. `SharedWords` is such a place for numbers:
 words the parent maps and hands to every worker, changed only atomically, with no locks and no pointers in them, so

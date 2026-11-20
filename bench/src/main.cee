@@ -12,6 +12,8 @@
 //   POST /stop           starts the drain
 //   GET  /worker         which worker process answered
 //   GET  /crash          traps (an index out of bounds), which costs its connection, or with CW_ISOLATED=0 the process
+//   GET  /crash/after/{n:int} sends n bytes of its body (at most 64 KiB), then traps: it costs its connection even
+//                        as an isolated request
 //   GET  /crash/kept     traps holding the output cache's lock, which the next use of the cache repairs;
 //                        only in a build with `--cflag -DHTTPSERVER_TRAP_HOOKS=1`, else a 404
 //   GET  /crash/gz/{n:int} traps holding `/gz`'s encoder's lock, half way through n bytes, which the next `/gz` repairs
@@ -37,6 +39,8 @@
 // Each connection is served in an isolated task (`App.run`): a trap costs its connection, not the worker, and a
 // worker is replaced after CW_RECYCLE_CRASHES crashes (100 by default): another is started in its place at once, and
 // it drains. CW_ISOLATED=0 serves them in plain tasks (`App.runShared`), where a trap ends the worker.
+// CW_ISOLATE_REQUESTS=1 serves each HTTP/1.1 request in an isolated task of its own (`App.isolateRequests`, Web ADR
+// 0017): a trap is then answered 500 and the connection goes on, unless part of the response had left.
 //
 // CW_RUN_SLICE_MS=n is the application's slice (`App.slice`, 10 ms by default, 0 for none; `Async.runSlice`, ceesafec
 // ADR 0189): a request that has computed that long without waiting is paused and the worker's other requests run
@@ -359,6 +363,34 @@ impl Handler<St> for Crash {
         var one = [0u8; 1];
         one[0] = few[at];
         return await exchange.send(Status.ok(), one[..]);
+    }
+}
+
+/// Sends the head and `n` bytes of its body (at most 64 KiB), then traps: part of its response has left, so even an
+/// isolated request (CW_ISOLATE_REQUESTS=1) costs its connection.
+struct CrashAfter {}
+
+impl Handler<St> for CrashAfter {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut Context<St>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        let wanted = ctx.paramInt("n") ?? 0;
+        let n: usize = if (wanted < 1) 1 else if (wanted > 65536) 65536 else truncate<usize>(wanted);
+        var chunk = [120u8; 1024];
+        var left = n;
+        while (left > 0) {
+            let now = if (left < chunk.length) left else chunk.length;
+            await exchange.write(chunk[0..now])?;
+            left -= now;
+        }
+        await exchange.flush()?;
+        let few = [1u8, 2u8, 3u8];
+        let at = request.path().length + 100;
+        chunk[0] = few[at];
+        return Ok();
     }
 }
 
@@ -741,6 +773,7 @@ fn application(worker: u32, wiring: Wiring) -> Result<App<St>, RouteError> {
         app.use(stock(made)?)?;
     }
     app.timeout(setting("CW_TIMEOUT_MS", 0));
+    app.isolateRequests(setting("CW_ISOLATE_REQUESTS", 0) == 1);
     app.budget(truncate<usize>(setting("CW_BUDGET_MB", 0) * 1048576));
     match (setting("CW_LOG", 0)) {
         1 => {
@@ -775,6 +808,7 @@ fn application(worker: u32, wiring: Wiring) -> Result<App<St>, RouteError> {
     app.post("/stop", handler(Box.create(Stop {}))?)?;
     app.get("/worker", handler(Box.create(Which {}))?)?;
     app.get("/crash", handler(Box.create(Crash {}))?)?;
+    app.get("/crash/after/{n:int}", handler(Box.create(CrashAfter {}))?)?;
     app.get("/spin", handler(Box.create(Spin {}))?)?;
     app.get("/spin/{ms:int}", handler(Box.create(SpinFor {}))?)?;
     app.get("/pauses", handler(Box.create(Pauses {}))?)?;
@@ -1030,7 +1064,12 @@ fn serveOn(worker: Worker, listener: borrow dyn web_transport.Incoming, words: S
         null => {}
     }
     match (Async.run(serve(app, worker, listener, tended))) {
-        Ok(_) => { return 0; }
+        Ok(report) => {
+            // Tasks of this worker's that trapped and ended alone: connections, requests and streams.
+            Console.writeLine("bench: crashed tasks");
+            Console.writeLine(report.crashed);
+            return 0;
+        }
         Err(e) => {
             Console.writeLine(NetErrors.describe(e));
             return 1;

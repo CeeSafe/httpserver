@@ -396,6 +396,50 @@ if isolated:
     expect(f"slice: the spin without end was ended by the bound ({text.count('past its bound of 1000 ms')} of 1)",
            text.count("past its bound of 1000 ms") == 1 and text.count("ended alone)") == 1)
 if isolated:
+    # Isolated requests (CW_ISOLATE_REQUESTS=1, CeeSafe.Web's Web ADR 0017): on one kept-alive connection, a request
+    # that traps, one that traps holding the cache's lock, and one that computes past its bound (Overran) are each
+    # answered 500, and the next request goes on the same connection (so is one that traps holding gzip's encoder:
+    # what it wrote waited in the encoder, and no byte had left); one that traps after part of its body left loses
+    # the connection. The access log (CW_LOG=2) has a line for each, and the worker's report counts them.
+    print("--- one worker, CW_ISOLATE_REQUESTS=1")
+    port = a.port + 5
+    requests = dict(os.environ, CW_PORT=str(port), CW_PROCS="1", CW_STALL_MS="1500", CW_ISOLATED="1",
+                    CW_ISOLATE_REQUESTS="1", CW_LOG="2", CW_RUN_BOUND_MS="300")
+    log = open("/tmp/supervisor_check_requests.log", "w")
+    proc = subprocess.Popen([str(binary)], env=requests, stdout=log, stderr=subprocess.STDOUT)
+    try:
+        time.sleep(1.0)
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=6.0)
+        expect("requests: answered at the start", ask(c, "/small") == (200, b"hello, world\n"))
+        for path in ("/crash", "/crash/kept", "/spin", "/crash/gz/60000"):
+            before = c.sock.getsockname() if c.sock else None
+            crashed = ask(c, path)
+            after = ask(c, "/small")
+            same = before is not None and c.sock is not None and c.sock.getsockname() == before
+            expect(f"requests: {path} is answered 500 ({crashed and crashed[0]}), and the next request on the same "
+                   f"connection is answered", crashed is not None and crashed[0] == 500 and
+                   after == (200, b"hello, world\n") and same)
+        expect("requests: /crash/after/4096, after part of its body, loses its connection",
+               ask(c, "/crash/after/4096") is None)
+        c.close()
+        expect("requests: the worker still answers", get("/small", port=port) == (200, b"hello, world\n"))
+        proc.send_signal(signal.SIGTERM)
+        code = proc.wait(10)
+        expect(f"requests: the supervisor ends on SIGTERM (status {code})", code == 0)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+    log.close()
+    text = open("/tmp/supervisor_check_requests.log").read()
+    lines = text.split("\n")
+    report = lines[lines.index("bench: started, crashed, stalled, killed") + 1:][:4] if "bench: started, crashed, stalled, killed" in lines else []
+    expect(f"requests: started once, no crash, no stall, no kill ({report})", report == ["1", "0", "0", "0"])
+    tasks = lines[lines.index("bench: crashed tasks") + 1] if "bench: crashed tasks" in lines else ""
+    expect(f"requests: the worker's report counts the five ({tasks})", tasks == "5")
+    told = [l for l in lines if l.startswith("GET ") and " crashed " in l]
+    expect(f"requests: the access log has a line for each ({len(told)}: {told})",
+           len(told) == 5 and "GET /crash crashed index" in told and "GET /spin crashed overran" in told)
+if isolated:
     # A build without polls (bench/out/bench-nopolls): `App.run` says so at start, and a request that computes
     # without end holds its worker until the supervisor's stall catches it, as before the bound.
     print("--- one worker without polls")

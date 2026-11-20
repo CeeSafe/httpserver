@@ -25,6 +25,11 @@ public interface AccessLog {
     /// response's, 0 if the connection failed before one was sent; `micros` is the
     /// time from the request's head to the handler's return, body included when the handler sent it whole.
     async fn record(borrow this, request: borrow Request, scope: borrow Scope, status: u16, micros: u64);
+
+    /// A request whose handler trapped and ended alone (`isolateRequests`, CeeSafe.Web's Web ADR 0017): its connection
+    /// answered 500, or was closed if part of the response had left. `record` is not called for it. The default does
+    /// nothing.
+    async fn crashed(borrow this, request: borrow Request, crash: borrow TaskCrash) {}
 }
 
 /// An HTTP application whose state is `S`.
@@ -393,6 +398,16 @@ public struct App<S: Send + Share> {
         this.boundMs = Some(ms);
     }
 
+    /// Serves each HTTP/1.1 request in an isolated task of its own (`Limits.isolateRequests`, CeeSafe.Web's Web ADR
+    /// 0017), off by default: a handler that traps, or computes past the bound, is answered 500 when no byte of its
+    /// response has left, and its connection goes on (it closes if part of the response had left, or the request's
+    /// body could not be drained). What leaks is that request's, not the connection's. The access log's `crashed`
+    /// is told. It costs each request a task and a relay through the connection's (Web ADR 0017 §5 measured a median
+    /// of 16% of small requests a second); HTTP/2 and HTTP/3 streams are isolated whether or not it is on.
+    public fn isolateRequests(borrow mut this, on: bool) {
+        this.httpLimits.isolateRequests = on;
+    }
+
     /// The slice, in milliseconds (`Async.runSlice`, ceesafec ADR 0189): under `run`, a request that has computed for
     /// this long without waiting is paused, and its worker's other requests run before it goes on, so one that
     /// computes costs its neighbours about a slice at a time instead of the whole computation. 10 by default, 0 for
@@ -558,6 +573,10 @@ impl ConnectionHandler for Serving {
         if (n == first.length && prefixOf(first[..], preface)) {
             return await serveH2(conn, ctx, this.app, this.httpLimits, first[..]);
         }
+        if (this.httpLimits.isolateRequests) {
+            // Each request in an isolated task: a trap is answered 500 and the connection goes on (Web ADR 0017).
+            return await web_http1.serveIsolated(conn, ctx, this.app, this.httpLimits, first[0..n]);
+        }
         let app: borrow dyn Application = this.app.get();
         return await web_http1.serveFrom(conn, ctx, app, this.httpLimits, first[0..n]);
     }
@@ -643,6 +662,14 @@ impl<S: Send + Share> Application for App<S> {
             null => {}
         }
         return r;
+    }
+
+    /// A request whose handler trapped (Web ADR 0017): the access log's `crashed`.
+    async fn crashed(borrow this, request: borrow Request, crash: borrow TaskCrash) {
+        match (borrow this.log) {
+            Some(log) => { await log.crashed(request, crash); }
+            null => {}
+        }
     }
 
     /// The application's middleware's `after`, in reverse order.

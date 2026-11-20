@@ -38,4 +38,40 @@ impl AccessLog for ConsoleLog {
         let text = StringView.fromUtf8(line.view()) ?? { return; };
         let _ = await AsyncConsole.writeLine(text);
     }
+
+    /// Writes `GET /users/7 crashed index` for a request whose handler trapped (Web ADR 0017).
+    async fn crashed(borrow this, request: borrow Request, crash: borrow TaskCrash) {
+        var line = Vector<u8>.create();
+        let ok = put(mut line, Methods.text(request.method()).bytes()) &&
+            put(mut line, " ".bytes()) &&
+            put(mut line, request.path().bytes()) &&
+            put(mut line, " crashed ".bytes()) &&
+            put(mut line, kindName(crash.kind()).bytes());
+        if (!ok) {
+            return;
+        }
+        let text = StringView.fromUtf8(line.view()) ?? { return; };
+        let _ = await AsyncConsole.writeLine(text);
+    }
 }
+
+/// The panic's kind, as the access log writes it.
+fn kindName(kind: PanicKind) -> StringView => match (kind) {
+    PanicKind.Overflow => "overflow",
+    PanicKind.DivideByZero => "divide-by-zero",
+    PanicKind.Shift => "shift",
+    PanicKind.Unreachable => "unreachable",
+    PanicKind.Index => "index",
+    PanicKind.Slice => "slice",
+    PanicKind.Unwrap => "unwrap",
+    PanicKind.Scratch => "scratch",
+    PanicKind.UnwrapNull => "unwrap-null",
+    PanicKind.StringBoundary => "string-boundary",
+    PanicKind.ForeignEnum => "foreign-enum",
+    PanicKind.Length => "length",
+    PanicKind.FloatRange => "float-range",
+    PanicKind.Explicit => "panic",
+    PanicKind.Poisoned => "poisoned",
+    PanicKind.Overran => "overran",
+    PanicKind.Other => "other",
+};
