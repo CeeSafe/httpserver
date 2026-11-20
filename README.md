@@ -365,8 +365,11 @@ against the benchmark server: five traps, a handler that never returns and one t
 each followed by the server still answering. With `--isolated` the traps cost their requests and no worker, and a
 worker whose tasks trapped twice is replaced; two more traps hold the output cache's lock and the gzip encoder's,
 which the next uses repair, the cache's from the bus. Those two need the trap hooks, which only a build with
-`--cflag -DHTTPSERVER_TRAP_HOOKS=1` has: `--isolated` runs `bench/out/bench-traps`, built so. On macOS add `--inherit`: without it the kernel gives every connection
-to one worker.
+`--cflag -DHTTPSERVER_TRAP_HOOKS=1` has. `--isolated` also bounds how long a request may compute without waiting
+(`CW_RUN_BOUND_MS=250`, `Async.runBound`, ceesafec ADR 0186): the handler that never returns is then ended alone with
+`Overran`, its worker answering the other requests meanwhile, where without the bound the supervisor kills the stalled
+worker. The bound needs polls compiled in, `--cflag -DCEE_POLLS=1`: `--isolated` runs `bench/out/bench-traps`, built
+with both macros. On macOS add `--inherit`: without it the kernel gives every connection to one worker.
 
 The shared memory is ceesafec's `SharedMemory` with no name (`SharedMemory.anonymous`), which a process reaches
 only by being handed it, so a supervisor that is killed leaves nothing behind. The supervisor starts, watches and
@@ -491,7 +494,7 @@ ceesafec test --cflag -DHTTPSERVER_TRAP_HOOKS=1 --cflag -fsanitize=address,undef
 (cd examples/hello && ceesafec build)
 (cd bench && ceesafec build)      # then: python3 <CeeSafe.Web>/benchmarks/servers/conform.py --port 8090
 python3 tools/supervisor_check.py # the supervisor, against bench/out/bench
-(cd bench && ceesafec build --cflag -DHTTPSERVER_TRAP_HOOKS=1 -o out/bench-traps)
+(cd bench && ceesafec build --cflag -DHTTPSERVER_TRAP_HOOKS=1 --cflag -DCEE_POLLS=1 -o out/bench-traps)
 python3 tools/supervisor_check.py --isolated   # isolated connections, against bench/out/bench-traps
 python3 tools/gzip_check.py       # compressed responses, against Python's gzip
 python3 tools/ratelimit_check.py  # one rate limit for four workers (add --inherit on macOS)

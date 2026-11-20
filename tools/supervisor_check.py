@@ -9,10 +9,13 @@ usage: python3 tools/supervisor_check.py [--port 18490] [--procs 3] [--memory-mb
 worker, and a worker whose tasks have trapped twice (CW_RECYCLE_CRASHES=2) drains and is started again. Two of its
 traps hold a lock: the output cache's, then the gzip encoder's. The next uses repair and heal them, the cache's from
 the bus's `carry` (CW_BUS=1), outside any isolated task, where a panic would end the worker. Those two traps are
-hooks only a build with the C macro HTTPSERVER_TRAP_HOOKS has, so --isolated runs bench/out/bench-traps:
-       (cd bench && ceesafec build --cflag -DHTTPSERVER_TRAP_HOOKS=1 -o out/bench-traps)
+hooks only a build with the C macro HTTPSERVER_TRAP_HOOKS has. --isolated also bounds how long a request may compute
+without waiting (CW_RUN_BOUND_MS=250, ceesafec ADR 0186), which needs polls compiled in (CEE_POLLS): a request that
+spins then traps with `Overran` and costs its connection, and its worker, not stalled, answers the others meanwhile.
+So --isolated runs bench/out/bench-traps, built with both macros:
+       (cd bench && ceesafec build --cflag -DHTTPSERVER_TRAP_HOOKS=1 --cflag -DCEE_POLLS=1 -o out/bench-traps)
 """
-import argparse, gzip, http.client, os, pathlib, signal, subprocess, sys, time
+import argparse, gzip, http.client, os, pathlib, signal, subprocess, sys, threading, time
 
 HERE = pathlib.Path(__file__).resolve().parent.parent
 args = argparse.ArgumentParser()
@@ -50,6 +53,15 @@ def gzipped(path, timeout=3.0):
     except (OSError, http.client.HTTPException, EOFError, gzip.BadGzipFile):
         return None
 
+def ask(c, path):
+    """(status, body) of `path` on the kept-alive connection `c`, or None if it failed or timed out."""
+    try:
+        c.request("GET", path)
+        r = c.getresponse()
+        return r.status, r.read()
+    except (OSError, http.client.HTTPException):
+        return None
+
 def answering(tries=40):
     """How many of `tries` requests for /small are answered."""
     return sum(1 for _ in range(tries) if get("/small") == (200, b"hello, world\n"))
@@ -71,6 +83,7 @@ if a.isolated:
     env["CW_ISOLATED"] = "1"
     env["CW_RECYCLE_CRASHES"] = "2"
     env["CW_BUS"] = "1"
+    env["CW_RUN_BOUND_MS"] = "250"
 log = open("/tmp/supervisor_check.log", "w")
 binary = HERE / "bench" / "out" / ("bench-traps" if a.isolated else "bench")
 proc = subprocess.Popen([str(binary)], env=env, stdout=log, stderr=subprocess.STDOUT)
@@ -112,10 +125,41 @@ try:
         expect(f"crash {n + 1}: the server still answers", answering() >= 39)
     time.sleep(0.5)
 
-    t0 = time.time()
-    expect("spin: the request that never ends gets no answer", get("/spin", timeout=6.0) is None)
-    print(f"     the stuck worker was gone after {time.time() - t0:.1f} s")
-    expect("spin: the server still answers", answering() >= 39)
+    if a.isolated:
+        # The bound (ADR 0186): a request that computes past 250 ms traps with Overran and costs its connection, well
+        # before the supervisor's 1.5 s stall would kill its worker; meanwhile every other request is answered.
+        expect("bound: a request that computes 50 ms, under the bound, is answered",
+               all(get("/spin/50") == (200, b"spun") for _ in range(5)))
+        spun = {}
+
+        def spin():
+            t = time.time()
+            spun["answer"] = get("/spin", timeout=6.0)
+            spun["seconds"] = time.time() - t
+
+        spinner = threading.Thread(target=spin)
+        spinner.start()
+        time.sleep(0.05)
+        waits = []
+        for _ in range(40):
+            t = time.time()
+            waits.append((get("/small") == (200, b"hello, world\n"), time.time() - t))
+        spinner.join()
+        slowest = max(w for _, w in waits)
+        expect(f"bound: the request that never ends is ended, after {spun['seconds']:.2f} s (the stall is 1.5 s)",
+               spun["answer"] is None and spun["seconds"] < 1.0)
+        expect(f"bound: every other request is answered meanwhile, the slowest after {slowest:.2f} s",
+               all(ok for ok, _ in waits) and slowest < 1.0)
+        t0 = time.time()
+        r = get("/spin/2000", timeout=6.0)
+        seconds = time.time() - t0
+        expect(f"bound: a request that computes 2 s is ended, after {seconds:.2f} s", r is None and seconds < 1.0)
+        expect("bound: the server still answers", answering() == 40)
+    else:
+        t0 = time.time()
+        expect("spin: the request that never ends gets no answer", get("/spin", timeout=6.0) is None)
+        print(f"     the stuck worker was gone after {time.time() - t0:.1f} s")
+        expect("spin: the server still answers", answering() >= 39)
 
     if a.memory_mb:
         r = get("/bloat", timeout=20.0)
@@ -146,12 +190,56 @@ print(text.strip())
 lines = text.split("\n")
 report = lines[lines.index("bench: started, crashed, stalled, killed") + 1:][:4] if "bench: started, crashed, stalled, killed" in lines else []
 if a.isolated:
-    # Seven traps over three workers (two of them holding a lock): at least one worker took two and was replaced,
-    # and none crashed, not even in the bus's `carry`.
+    # Seven traps over three workers (two of them holding a lock) and two requests ended by the run bound: at least
+    # one worker took two and was replaced, none crashed, not even in the bus's `carry`, and none stalled or was killed.
     recycled = text.count("passed the bound: draining, to be replaced")
-    expect(f"the report counts no crash and 1 stall ({report})", len(report) == 4 and report[1] == "0" and report[2] == "1")
-    expect(f"each trap ended alone ({text.count('ended alone)')} of 7)", text.count("ended alone)") == 7)
+    overran = text.count("past its bound of 250 ms")
+    expect(f"the report counts no crash, no stall and no kill ({report})",
+           len(report) == 4 and report[1] == "0" and report[2] == "0" and report[3] == "0")
+    expect(f"each trap ended alone ({text.count('ended alone)')} of 9)", text.count("ended alone)") == 9)
+    expect(f"the two spins were ended by the run bound ({overran} of 2)", overran == 2)
     expect(f"a worker whose tasks trapped twice was replaced ({recycled})", recycled >= 1 and int(report[0]) >= 5)
 else:
     expect(f"the report counts 5 crashes and 1 stall ({report})", len(report) == 4 and report[1] == "5" and report[2] == "1")
+
+if a.isolated:
+    # The bound on one event loop: a single worker, which a crash does not recycle. A request on a second connection
+    # to it waits for the spin to be ended at the bound and is then answered by the same worker, three times over.
+    print("--- one worker, CW_RUN_BOUND_MS=250")
+    port = a.port + 1
+    one = dict(os.environ, CW_PORT=str(port), CW_PROCS="1", CW_STALL_MS="1500", CW_ISOLATED="1",
+               CW_RUN_BOUND_MS="250")
+    log = open("/tmp/supervisor_check_one.log", "w")
+    proc = subprocess.Popen([str(binary)], env=one, stdout=log, stderr=subprocess.STDOUT)
+    try:
+        time.sleep(1.0)
+        neighbour = http.client.HTTPConnection("127.0.0.1", port, timeout=3.0)
+        expect("one worker: answered at the start", ask(neighbour, "/small") == (200, b"hello, world\n"))
+        for n, path in enumerate(("/spin", "/spin/2000", "/spin")):
+            spinning = http.client.HTTPConnection("127.0.0.1", port, timeout=6.0)
+            spun = {}
+            spinner = threading.Thread(target=lambda: spun.update(answer=ask(spinning, path)))
+            spinner.start()
+            time.sleep(0.05)
+            t = time.time()
+            r = ask(neighbour, "/small")
+            wait = time.time() - t
+            spinner.join()
+            spinning.close()
+            expect(f"one worker {n + 1}: {path} is ended and gets no answer", spun.get("answer", 0) is None)
+            expect(f"one worker {n + 1}: the request beside it waits for its end, then is answered, after {wait:.2f} s",
+                   r == (200, b"hello, world\n") and 0.1 < wait < 1.0)
+        proc.send_signal(signal.SIGTERM)
+        code = proc.wait(10)
+        expect(f"one worker: the supervisor ends on SIGTERM (status {code})", code == 0)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+    log.close()
+    text = open("/tmp/supervisor_check_one.log").read()
+    lines = text.split("\n")
+    report = lines[lines.index("bench: started, crashed, stalled, killed") + 1:][:4] if "bench: started, crashed, stalled, killed" in lines else []
+    expect(f"one worker: started once, no crash, no stall, no kill ({report})", report == ["1", "0", "0", "0"])
+    expect(f"one worker: the three spins were ended by the bound ({text.count('past its bound of 250 ms')} of 3)",
+           text.count("past its bound of 250 ms") == 3 and text.count("ended alone)") == 3)
 sys.exit(1 if problems else 0)

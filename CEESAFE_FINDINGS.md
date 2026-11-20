@@ -21,6 +21,7 @@ Bugs and gaps in CeeSafe and CeeSafe.Web met while writing httpserver, with cees
 | S14 | A method that is given the context by `borrow mut` cannot call a `dyn Handler<S>` with it (N0272) | ceesafec, by design: the handler and `Context<S>` share the flow name `S`, whatever its bounds (§25.6) | fixed in ceesafec 0.67.0 (ADR 0168) once the interfaces ask `S: Send + Share`, which they do now: `App.handle` owns the context and hands it to the dispatcher |
 | S15 | A cancelled task's function runs on to its end, and cannot tell without asking (`AsyncControl<E>.checkpoint`) | runtime, by design | the dispatcher asks before it tells the access log; `Arc.create(v)` and its like are inferred since ceesafec 0.67.0 (ADR 0166) |
 | S16 | A closure that stores into a captured local and also captures part of a `borrow mut` parameter is refused as if it stored into the parameter (N0272) | ceesafec, looks like a fault of the checker; reduced, not understood | no longer met: with `S: Send + Share` on the interfaces (S14) the closure is accepted in 0.67.0; without the bound it is refused as before, and why is still not known |
+| S17 | A request that computes without waiting holds its worker's event loop until the supervisor kills the worker | runtime, by design (cooperative tasks) | ceesafec ADR 0186, not yet released: with `-DCEE_POLLS=1` and `CW_RUN_BOUND_MS`, an isolated connection past the bound traps with `Overran` and ends alone; the watchdog stays for C code and blocking calls |
 
 ## S1: a nested `if` expression's literals are `i32`
 
@@ -234,6 +235,27 @@ store that `dispatch` may make into `ctx` (its receiver shares `S` with it, S14)
 captures of one closure. This is what refused `Async.timeout(ms, late, async () => await this.dispatch(…, mut ctx,
 …, exchange))` in `App.handle`. One guess was tried in the checker and was wrong (a captured local written "through"
 as a reference is, `collectWrites`): the cause is not known.
+
+## S17: a request that computes holds its worker
+
+A task runs until it awaits, so a handler that computes without waiting (`GET /spin`, a loop that never ends; in a
+real server a quadratic parse of a hostile input) holds every connection of its worker's event loop. Isolation
+(S3) does not help: nothing traps. The supervisor's watchdog was the remedy: it sees the loop stop and, after
+`stallMs` (1.5 s in `tools/supervisor_check.py`), kills the worker and every connection on it. It is the largest
+gap left between httpserver and Erlang, whose scheduler takes the CPU from a process after a count of reductions.
+
+ceesafec ADR 0186 (written from this review) bounds how long one resume of a task may run without waiting. A build
+with `--cflag -DCEE_POLLS=1` polls at loop headers and at the entry of functions that may recurse, and a monitor
+thread marks a thread whose task has run past `Async.runBound(ms, mode)`; the next poll traps an isolated task with
+`PanicKind.Overran`, which ends it alone. The benchmark server sets it from `CW_RUN_BOUND_MS`, and
+`supervisor_check.py --isolated` (250 ms) checks that `/spin` and `/spin/2000` are ended in under a second, that
+`/spin/50` is answered, that every other request is answered meanwhile, and that no worker stalls or is killed. The
+spin so moves from the supervisor to the unit. The watchdog stays for what polls cannot see: computing in C, or a
+blocking system call.
+
+The price is the polls' (ADR 0186 §10): measured on the benchmark server, `/small` and `/json` within noise and
+`/gz/16384` 6% fewer requests a second, deflate's inner loops being where it goes. A build without the macro has
+no polls and the same code as before.
 
 ## What ceesafec 0.65.1 to 0.71.0 changed
 
