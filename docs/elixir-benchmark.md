@@ -1,0 +1,123 @@
+# httpserver against Elixir (Bandit), 2026-11-20
+
+`tools/elixir_bench.py` against httpserver's bench server (`bench/`) and the same routes on Bandit with Plug
+(`bench/elixir/`, no Phoenix). Raw results: `bench/elixir/results/2026-11-20-rq/` (one speed run, three fault runs;
+the fault table gives the median of the three).
+
+## The machine and the settings
+
+- **rq**: Intel Xeon D-2123IT (4 cores, 8 threads, 2.2 GHz), 31 GB, Ubuntu 24.04.5, Linux 6.8.0-149. It also runs
+  production services (a .NET site on 80/443, an API service, Docker containers), lightly loaded: the 1-minute load
+  was 0.2 to 1.5 before each run, recorded in every row.
+- **Each server** has CPUs 0, 1, 4, 5 (two physical cores, both hyperthreads): httpserver as 4 worker processes
+  (`CW_PROCS=4`), Bandit as 4 schedulers (`+S 4:4`). **The load** (h2load, the clients, the script) has CPUs 2, 3, 6, 7.
+- httpserver: ceesafec 0.82.0, CeeSafe.Web `9e83e4d`, its defaults (each connection an isolated task, a 10 ms slice,
+  a 30 s bound, a worker replaced after 100 crashes) unless a row says otherwise.
+- Bandit 1.15.0, Thousand Island 1.6.0, Plug 1.20.4, Jason 1.4.5 (`bench/elixir/mix.lock`), Elixir 1.20.5 on
+  Erlang/OTP 29.1.2, a `mix release` in prod, Logger at `:error`.
+- Both servers pass CeeSafe.Web's `benchmarks/servers/conform.py` (HTTP/1.1 and h2c) before anything is measured.
+
+## Speed
+
+h2load, 10 s after a 1 s warm-up, one request at a time on each connection (`-m 1`).
+
+| mode | route | conns | httpserver req/s | Bandit req/s | ratio | httpserver p99 µs | Bandit p99 µs | RSS MiB (hs / Bandit) |
+|---|---|---|---|---|---|---|---|---|
+| h1 | small | 1 | 12691 | 9368 | 1.4× | 120 | 142 | 16 / 162 |
+| h1 | small | 16 | 136674 | 47066 | 2.9× | 171 | 583 | 17 / 161 |
+| h1 | small | 128 | 156978 | 48273 | 3.3× | 3721 | 3168 | 22 / 174 |
+| h1 | 4k | 16 | 129293 | 46166 | 2.8× | 246 | 601 | 17 / 161 |
+| h1 | 64k | 16 | 63620 | 34263 | 1.9× | 501 | 837 | 16 / 168 |
+| h1 | stream (1 MiB) | 16 | 3173 | 1876 | 1.7× | 13814 | 11355 | 17 / 168 |
+| h1 | json | 16 | 127010 | 41340 | 3.1× | 186 | 632 | 17 / 167 |
+| h1 | json | 128 | 154764 | 41938 | 3.7× | 3575 | 3398 | 22 / 169 |
+| h1 | echo (4 KiB) | 16 | 101859 | 42024 | 2.4× | 525 | 642 | 17 / 166 |
+| h2c | small | 1 | 8284 | 5975 | 1.4× | 176 | 192 | 16 / 162 |
+| h2c | small | 16 | 73524 | 22084 | 3.3× | 315 | 1394 | 19 / 172 |
+| h2c | json | 16 | 69533 | 20162 | 3.4× | 368 | 1514 | 19 / 170 |
+| h2c | echo | 16 | 61480 | 18908 | 3.3× | 434 | 1608 | 19 / 166 |
+| h2c | small | 128 | **39831** | 24597 | 1.6× | 1928 | 9359 | 38 / 166 |
+| h2c | 64k | 128 | **3615** | 21094 | 0.2× | 7777 | 9676 | 44 / 174 |
+| h2c | stream | 16 | **804** | 1440 | 0.6× | 7222 | 19025 | 20 / 166 |
+| h2c | stream | 128 | **166** | 1364 | 0.1× | 83685 | 101655 | 45 / 172 |
+
+(Every row is in `speed.json`.) Over HTTP/1.1, httpserver serves 1.4× Bandit's rate on one connection and 1.7× to 3.7×
+under concurrency, with a lower p99 up to 16 connections and about the same at 128, in a tenth of the memory
+(15 to 25 MiB against 160 to 190). Bandit uses more CPU for one connection (1.07 cores against 0.6).
+
+**The h2c rows in bold are not httpserver's speed: its workers were killed under them.** At 128 h2c connections (and
+at 16 for `/stream`) the workers' heartbeats stop, and the supervisor kills each one 2 s later (`has not beaten:
+killed after ms 2011`, signal 9), so the run is mostly reconnects. gdb on a worker that is about to be killed shows it
+busy serving (`web_http2_handle`, `send`), not stuck. The cause is in CeeSafe's executor
+(`runtime/hosted/ceesafe_rt_async.c`, `cee_exec_tasks`): it looks at its timers only when no task is ready, or after
+a task is paused past its slice. A worker whose HTTP/2 tasks keep its queue full never runs its heartbeat's timer.
+Under the same load Bandit loses nothing. (The `cpu_cores` of those rows, 0.02 to 0.04, is wrong too: a killed
+worker's CPU time leaves the process tree that the script sums.)
+
+## Faults
+
+A fixed healthy load, 10 000 GET /small a second over 64 keep-alive connections, each request's latency counted from
+when it was due, while a fault client runs beside it. A healthy request whose connection ends before any answer is
+sent again once on a new connection, and counted as retried; none failed twice, in any run.
+
+| server | fault | healthy p50 µs | p99 µs | p99.9 µs | healthy retried (of 100 000) | what the faulty requests got | peak RSS MiB | workers replaced |
+|---|---|---|---|---|---|---|---|---|
+| httpserver | none | 375 | 1534 | 2681 | 0 | | 19 | 0 |
+| httpserver | 100 crashes/s | 484 | 1634 | 8831 | 186 | 1100 resets, each costing its connection | 38 | 8 |
+| httpserver | 1000 crashes/s | 663 | 6706 | 14444 | 1565 | 11 000 resets | 53 | 83 |
+| httpserver | 4 × /spin/100 in a loop | 545 | 1687 | 69123 | 0 | 336 spins, p50 100 ms | 19 | 0 |
+| httpserver | 2 × /spin forever | 553 | 1530 | 2432 | 0 | still running | 19 | 0 |
+| httpserver, per-request isolation | none | 352 | 1476 | 2316 | 0 | | 21 | 0 |
+| httpserver, per-request isolation | 100 crashes/s | 371 | 1554 | 5638 | 147 | 1010 × 500, 90 resets; 118 connections for 1100 | 42 | 8 |
+| httpserver, per-request isolation | 1000 crashes/s | 525 | 3421 | 8520 | 1180 | 10 287 × 500, 713 resets; 745 connections | 45 | 68 |
+| httpserver, per-request isolation | 4 × /spin/100 | **6 213 650** | **9 889 994** | **9 959 145** | 0 | 440 spins, p50 101 ms | 22 | 0 |
+| httpserver, 1 ms slice | 4 × /spin/100 | **3 632 544** | **6 101 054** | **6 139 100** | 0 | 440 spins, p50 100 ms | 19 | 0 |
+| httpserver, 1 ms slice | 2 × /spin forever | 445 | 1464 | 2446 | 0 | still running | 19 | 0 |
+| Bandit | none | 344 | 1441 | 4370 | 0 | | 166 | 0 |
+| Bandit | 100 crashes/s | 354 | 1446 | 4123 | 0 | 1100 × 500, the connection closed after each | 166 | 0 |
+| Bandit | 1000 crashes/s | 421 | 2533 | 5763 | 0 | 11 000 × 500, closed after each | 170 | 0 |
+| Bandit | 4 × /spin/100 | 428 | 3721 | 7533 | 0 | 440 spins, p50 100 ms | 164 | 0 |
+| Bandit | 2 × /spin forever | 451 | 3720 | 5028 | 0 | still running | 166 | 0 |
+
+(The 1 ms slice's crash rows match the default's: `fault-*.json`.) The healthy client is Python, so the baseline's
+p50 (340 to 380 µs) is mostly the client's own; the differences between rows are what the faults add.
+
+- **A crash.** Bandit answers 500 and closes the connection; httpserver resets the connection (its default), or with
+  per-request isolation (Web ADR 0017) answers 500 and keeps the connection, which Bandit does not. Neither lets a
+  crash touch another client's request directly.
+- **What crashes cost the healthy clients.** Bandit: nothing measurable at 100 a second, p99 1.4 → 2.5 ms at 1000.
+  httpserver: every 100 crashes a worker is replaced (gap 2, the memory a crash leaks), and the worker it replaces
+  drains, closing its healthy keep-alive connections. At 1000 crashes a second that is 83 replacements in 11 s and
+  1.6 % of healthy requests retried on a new connection, with p99 rising to 6.7 ms (3.4 ms with per-request
+  isolation). The memory is reclaimed (peak 53 MiB, back to about 20). Bandit's processes leak nothing, so it never
+  replaces anything.
+- **A request that computes.** Two requests that never end cost neither server anything measurable. Four that
+  compute 100 ms at a time, back to back, cost Bandit a p99 of 3.7 ms. With httpserver's defaults they cost the
+  p99.9 69 ms (two runs of three; 3.8 ms in the third). **With per-request isolation or a 1 ms slice, healthy
+  requests waited 3.6 to 10 s, in all three runs**, while the spinning clients were served at once (440 spins,
+  every one they asked for). The spinner's requests keep each worker's queue full, so like the h2c rows this looks
+  like the executor not getting to what waits on sockets, or on timers, while some task is always ready; the exact
+  path is not yet found.
+
+## What this says about the gaps (docs/elixir-gaps.md)
+
+1. **Speed and memory** are httpserver's: 1.4 to 3.7× the rate over HTTP/1.1 and h2c at moderate concurrency, in a
+   tenth of the memory.
+2. **Gap 1 (fair preemption) is not closed.** Bandit's scheduler keeps every healthy p99 under 4 ms whatever the
+   faulty requests do. httpserver's slice helps for a task that computes without end, but a busy executor still
+   starves its socket waits and timers: seconds of latency with four spinners under per-request isolation or a short
+   slice, and its supervisor killing healthy workers under h2c load. The fix is in CeeSafe's executor: collect events
+   and due timers every so many resumes, or every slice's worth of time, whether or not a task was paused, not only
+   when the queue is empty.
+3. **Gap 2 (a crash's memory)** costs healthy clients reconnects under a high crash rate, through recycling. Recycling
+   that drains a worker without closing its idle keep-alive connections at once (or hands them to the new worker)
+   would remove most of the retries.
+4. **Gap 5 (a 500 for a crash)** is closed by per-request isolation, which keeps the connection where Bandit closes
+   it.
+
+## Measurement notes
+
+- h2load is not used under faults: when the server closes connections under it, as a worker being replaced does, it
+  reported 0 requests for a run in which the server answered about 94 000.
+- One speed run, so the speed rows carry the run-to-run noise of a shared machine (the three fault baselines differ by
+  up to 2.5× at p99.9). The ratios are large enough not to depend on it; the latencies of the 128-connection rows do.
