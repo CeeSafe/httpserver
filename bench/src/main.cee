@@ -42,7 +42,7 @@
 // CW_ISOLATE_REQUESTS=1 serves each HTTP/1.1 request in an isolated task of its own (`App.isolateRequests`, Web ADR
 // 0017): a trap is then answered 500 and the connection goes on, unless part of the response had left.
 //
-// CW_RUN_SLICE_MS=n is the application's slice (`App.slice`, 10 ms by default, 0 for none; `Async.runSlice`, ceesafec
+// CW_RUN_SLICE_MS=n is the application's slice (`App.slice`, 2 ms by default, 0 for none; `Async.runSlice`, ceesafec
 // ADR 0189): a request that has computed that long without waiting is paused and the worker's other requests run
 // before it goes on. CW_RUN_BOUND_MS=n is its bound on one resume of a task (`App.bound`; 30 000 ms by default with
 // the slice, 1 000 ms without; 0 for none; `Async.runBound`, ADR 0186): a request that computes past it traps with
@@ -1053,7 +1053,7 @@ fn serveOn(worker: Worker, listener: borrow dyn web_transport.Incoming, words: S
             return 1;
         },
     };
-    // The application's slice and bound, which `run` sets: `App`'s defaults (10 ms, and 30 000 ms with the slice or
+    // The application's slice and bound, which `run` sets: `App`'s defaults (2 ms, and 30 000 ms with the slice or
     // 1 000 ms without) unless the environment names them; 0 for none.
     match (given("CW_RUN_SLICE_MS")) {
         Some(ms) => { app.slice(ms); }

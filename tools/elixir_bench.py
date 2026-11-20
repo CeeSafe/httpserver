@@ -31,7 +31,7 @@ RSS before, at peak and after, and its process count (httpserver replaces a work
   spin-100ms      as many clients as server CPUs, each asking for /spin/100 (100 ms of computing) in a loop
   spin-forever    two requests to /spin, which never end, made at the start
 Servers: `httpserver` (each connection an isolated task: a crash costs its connection), `httpserver-req`
-(CW_ISOLATE_REQUESTS=1: a crash is answered 500 and the connection goes on), `httpserver-slice1` (CW_RUN_SLICE_MS=1
+(CW_ISOLATE_REQUESTS=1: a crash is answered 500 and the connection goes on), `httpserver-sliceN` (CW_RUN_SLICE_MS=N
 instead of the default 10), `bandit`.
 """
 import argparse, asyncio, json, os, pathlib, platform, signal, socket, subprocess, sys, tempfile, threading, time
@@ -53,8 +53,8 @@ def server_command(name, cpus, port):
         env["CW_PROCS"] = str(n)
         if name == "httpserver-req":
             env["CW_ISOLATE_REQUESTS"] = "1"
-        elif name == "httpserver-slice1":
-            env["CW_RUN_SLICE_MS"] = "1"
+        elif name.startswith("httpserver-slice"):
+            env["CW_RUN_SLICE_MS"] = name[len("httpserver-slice"):]
         cmd = [str(BENCH)]
     elif name == "bandit":
         env.update(RELEASE_DISTRIBUTION="none", ERL_FLAGS=f"+S {n}:{n}")
@@ -443,7 +443,7 @@ def healthy(args):
 def conform(servers, cpus, log):
     script = pathlib.Path(os.environ.get("CONFORM", ROOT.parent / "conform.py"))
     for name in servers:
-        if name in ("httpserver-req", "httpserver-slice1"):
+        if name != "httpserver" and name.startswith("httpserver"):
             continue
         srv = Server(name, cpus, PORT, log)
         r = subprocess.run([sys.executable, str(script), "--port", str(PORT), "--name", name], capture_output=True,

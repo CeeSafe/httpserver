@@ -53,7 +53,7 @@ would restart a node.
 | "let it crash" | isolated tasks, and errors as values | see below |
 | a process's `max_heap_size` | `app.budget(bytes)`, `app.budgetIn(group, bytes)` | an allocation past it fails in that request alone |
 | a request timeout of your own | `app.timeout(ms)` | 504, or the connection closed if part of the answer had left |
-| preemption by reductions | `app.slice(ms)` (10 ms) and `app.bound(ms)` (30 s), in a build with `polls = true` | paused every slice at the compiler's polls; ended past the bound |
+| preemption by reductions | `app.slice(ms)` (2 ms) and `app.bound(ms)` (30 s), in a build with `polls = true` | paused every slice at the compiler's polls; ended past the bound |
 | hot code upgrade | drain and restart | SIGTERM to the supervisor drains every worker |
 
 ## The same API in both
@@ -169,7 +169,7 @@ What Elixir gives a request for free, and how httpserver gets it:
 |---|---|
 | A crash ends the request's process; Plug answers 500 | A trap (an index out of bounds, an unwrapped `Err`) ends the connection's isolated task; with `app.isolateRequests(true)` only the request's, answered 500 with the connection kept |
 | The process's heap goes with it | What the task held is leaked and counted; after 100 crashes or 64 MiB leaked the worker is replaced, while the others keep serving |
-| The scheduler preempts a process that computes | The compiler puts polls in loops and calls (`polls = true` in the manifest); past a 10 ms slice the task is paused and the worker's other requests run; past 30 s it is ended with `Overran` |
+| The scheduler preempts a process that computes | The compiler puts polls in loops and calls (`polls = true` in the manifest); past a 2 ms slice the task is paused and the worker's other requests run; past 30 s it is ended with `Overran` |
 | A supervisor restarts a crashed process | `Services` restarts a worker's long-lived tasks; the `Supervisor` restarts a worker process, and kills one whose loop stops beating |
 
 Some failures still end a worker rather than a task: a trap inside a C library's callback or a `Critical`, and a

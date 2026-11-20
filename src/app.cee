@@ -410,7 +410,7 @@ public struct App<S: Send + Share> {
 
     /// The slice, in milliseconds (`Async.runSlice`, ceesafec ADR 0189): under `run`, a request that has computed for
     /// this long without waiting is paused, and its worker's other requests run before it goes on, so one that
-    /// computes costs its neighbours about a slice at a time instead of the whole computation. 10 by default, 0 for
+    /// computes costs its neighbours about a slice at a time instead of the whole computation. 2 by default, 0 for
     /// none. `runShared` sets none: a task in no isolated unit is never paused. It needs a build with polls, and a
     /// 64-bit target; where the slice cannot be had, `run` says so once and keeps the shorter bound.
     public fn slice(borrow mut this, ms: u64) {
@@ -489,9 +489,11 @@ public struct App<S: Send + Share> {
     }
 }
 
-/// The slice `App` sets when none is given (`App.slice`), in milliseconds: ADR 0189's measurement on the benchmark
-/// server, where it cost `/small` about 2% and cut the wait beside a 300 ms request from 247 ms to 87 to 149 ms.
-fn defaultSliceMs() -> u64 => 10;
+/// The slice `App` sets when none is given (`App.slice`), in milliseconds. docs/elixir-benchmark.md, with ceesafec
+/// 0.83.0 on a 4-core Xeon: beside four requests computing 100 ms at a time, healthy requests' p99 and p99.9 were 1.5
+/// and 3.1 ms with 2 ms, against 7.8 and 20 ms with 10 (ADR 0189's first default) and Bandit's 3.8 and 9.5, with
+/// `/small`'s rate the same within the noise; the computing requests took 105 ms instead of 100.
+fn defaultSliceMs() -> u64 => 2;
 
 /// The bound `App` sets when none is given and the slice pauses a task: a request that has computed for 30 s in one
 /// resume, while sharing its worker, is taken to never end.

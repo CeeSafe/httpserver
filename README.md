@@ -15,7 +15,7 @@ install: a server is one native program, which answers about 100 000 small reque
 
 **Status:** version 0.2.0, on ceesafec 0.83.0. `App.run` serves each connection in an isolated task (a trap costs
 the connection, not the worker); `app.isolateRequests(true)` isolates each HTTP/1.1 request, answering 500 for one
-that traps; a request that computes is paused every 10 ms slice so its neighbours run, and ended past a bound of 30 s
+that traps; a request that computes is paused every 2 ms slice so its neighbours run, and ended past a bound of 30 s
 (ceesafec ADRs 0186, 0189 and 0191, in a build with `polls = true`). How that compares with Elixir's process
 isolation, measured against Bandit: [Compared with Elixir](#compared-with-elixir). The API is not settled, and the
 language under it is young: what was met while writing this is in [CEESAFE_FINDINGS.md](CEESAFE_FINDINGS.md). Linux
@@ -383,7 +383,7 @@ replaces a worker whose isolated tasks have trapped `recycleCrashes` times (100 
 its connection or stream in a build with polls (`polls = true` in the program's manifest, ceesafec ADR 0190): `run` sets
 the application's bound, `app.bound(ms)` (1 000 ms by default, 0 for none; `Async.runBound`, ceesafec ADR 0186; the
 benchmark server's `CW_RUN_BOUND_MS`), and past it the request traps with `Overran` and ends alone, its neighbours
-having waited at most that long. With the slice, `app.slice(ms)` (10 ms by default, 0 for none; `Async.runSlice`,
+having waited at most that long. With the slice, `app.slice(ms)` (2 ms by default, 0 for none; `Async.runSlice`,
 ceesafec ADR 0189; `CW_RUN_SLICE_MS`), a request that computes is paused every slice and its worker's other requests run
 meanwhile: beside one computing for 300 ms, a request waits about one slice (0.013 s in `supervisor_check.py`; before
 ceesafec 0.83.0's ADR 0191 every hand-off between a connection's tasks waited a slice behind the paused one, and a
@@ -460,7 +460,7 @@ gets most of that from a native program with no garbage collector. Against Bandi
 | Unit of isolation | an isolated task per connection and per HTTP/2 or HTTP/3 stream; per HTTP/1.1 request with `app.isolateRequests(true)` | a process per connection, and per HTTP/2 stream |
 | A handler that crashes | its connection is reset; with per-request isolation it is answered 500 and the connection goes on | answered 500, and the connection closed |
 | What a crash held | leaked and counted (`Isolation.report()`); the worker is replaced, without refusing a connection, after 100 crashes or 64 MiB | freed with the process's heap |
-| A request that computes without waiting | paused every slice (10 ms) at the compiler's polls, and ended past its bound (30 s), in a build with `polls = true` | preempted every few thousand reductions; never ended unless the application sets a limit |
+| A request that computes without waiting | paused every slice (2 ms) at the compiler's polls, and ended past its bound (30 s), in a build with `polls = true` | preempted every few thousand reductions; never ended unless the application sets a limit |
 | Memory per request | `app.budget(bytes)`: an allocation past it fails in that request alone | `max_heap_size`, a process flag, if the application sets it |
 | Time per request | `app.timeout(ms)` | none in Bandit; the application's own |
 | Supervision | a process supervisor (workers restarted, killed when their loop stops beating) and `Services` with a restart intensity for a worker's housekeeping | OTP's supervision trees, for anything in the application |
