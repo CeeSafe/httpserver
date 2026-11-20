@@ -1,0 +1,114 @@
+// docs/from-elixir.md's example: a Plug pipeline (an API key check) and a router, as httpserver writes them.
+//
+//   ceesafec build && out/shop        then:  curl -i -X POST -H "x-api-key: k1" http://127.0.0.1:8080/api/orders
+import web_core;
+import web_transport;
+import web_http;
+import httpserver;
+
+/// The application's state, what a Phoenix app keeps in its config, an Agent or ETS.
+struct Shop {
+    orders: AtomicU64;
+}
+
+/// `plug :require_api_key`: answers 401 itself, or leaves who called for the handler, as `assign/3` does.
+struct ApiKey {}
+
+impl<S: Send + Share> Middleware<S> for ApiKey {
+    async fn before(
+        borrow this,
+        ctx: borrow mut Context<S>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<Flow, HandlerError> {
+        let key = request.headers().getNamed("x-api-key") ?? {
+            let unauthorized = StatusCode.of(401) ?? { return Err(HandlerError.Internal); };
+            await Reply.problem(exchange, unauthorized, "No API key", "")?;
+            return Ok(Flow.Responded); // halt/1
+        };
+        let _ = ctx.put("caller", key); // assign(conn, :caller, key)
+        return Ok(Flow.Continue);
+    }
+
+    async fn after(borrow this, request: borrow Request, head: borrow mut ResponseHead) -> Result<void, HandlerError> =>
+        Ok();
+}
+
+/// `def create(conn, _params)`: a handler is a struct with a `handle` method.
+struct CreateOrder {}
+
+impl Handler<Shop> for CreateOrder {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut Context<Shop>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        let n = ctx.state().orders.fetchAdd(1) + 1;
+        var text = [0u8; 64];
+        var w = TextWriter.create(mut text[..]);
+        w.text("{\"order\":");
+        w.decimal(n);
+        w.text("}");
+        return await Reply.json(exchange, Status.created(), w.written());
+    }
+}
+
+fn boxed<H: Handler<Shop> + Send + Share>(handler: H) -> Result<Box<dyn Handler<Shop> + Send + Share>, RouteError> {
+    match (Box.create(handler)) {
+        Ok(b) => {
+            let d: Box<dyn Handler<Shop> + Send + Share> = b;
+            return Ok(d);
+        }
+        Err(_) => { return Err(RouteError.OutOfMemory); }
+    }
+}
+
+/// `scope "/api" do pipe_through :api; post "/orders", OrderController, :create end`
+fn application() -> Result<App<Shop>, RouteError> {
+    var app = App<Shop>.create(Shop { orders: AtomicU64.create(0) }, Limits.defaults())?;
+    let api = app.group("/api")?;
+    let check: Box<dyn Middleware<Shop> + Send + Share> = match (Box.create(ApiKey {})) {
+        Ok(b) => b,
+        Err(_) => { return Err(RouteError.OutOfMemory); }
+    };
+    app.useIn(api, check)?;
+    app.routeIn(api, Method.Post, "/orders", boxed(CreateOrder {})?)?;
+    app.timeout(5000);         // a request still running after 5 s is answered 504
+    app.isolateRequests(true); // a request that crashes is answered 500, and its connection goes on
+    return Ok(app);
+}
+
+async fn serve(app: App<Shop>, listener: borrow Listener) -> Result<ServerReport, NetError> {
+    let drain = Drain.create()?;
+    let acceptor: Box<dyn Acceptor + Send + Share> = match (Box.create(PlainAcceptor {})) {
+        Ok(b) => b,
+        Err(_) => { return Err(NetError.OutOfMemory); },
+    };
+    return await app.run(listener, acceptor, ConnectionLimits.defaults(), drain);
+}
+
+fn main() {
+    let app = match (application()) {
+        Ok(a) => a,
+        Err(_) => {
+            Console.writeLine("shop: could not build the routes");
+            Process.exit(1);
+        },
+    };
+    let options = ListenOptions { backlog: 0, reuseAddress: true, reusePort: false, v6Only: false };
+    let listener = match (Listener.bindWith(SocketAddresses.v4Loopback(8080), options)) {
+        Ok(l) => l,
+        Err(e) => {
+            Console.writeLine(NetErrors.describe(e));
+            Process.exit(1);
+        },
+    };
+    match (Async.run(serve(app, listener))) {
+        Ok(_) => {}
+        Err(e) => {
+            Console.writeLine(NetErrors.describe(e));
+            Process.exit(1);
+        }
+    }
+}

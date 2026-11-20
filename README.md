@@ -29,7 +29,7 @@ and macOS; the supervisor is POSIX only.
 - [What is here](#what-is-here)
 - [One process per core, supervised](#one-process-per-core-supervised)
 - [What is not here yet](#what-is-not-here-yet)
-- [Compared with Elixir](#compared-with-elixir)
+- [Compared with Elixir](#compared-with-elixir) (and [a guide for Elixir developers](docs/from-elixir.md))
 - [Measured](#measured)
 - [The benchmark server](#the-benchmark-server)
 - [Working on it](#working-on-it)
@@ -39,7 +39,7 @@ and macOS; the supervisor is POSIX only.
 
 You need:
 
-- `ceesafec` 0.77.2 or later ([releases](https://github.com/CeeSafe/CeeSafe/releases), or the
+- `ceesafec` 0.83.0 or later ([releases](https://github.com/CeeSafe/CeeSafe/releases), or the
   [guide](https://ceesafe.github.io/CeeSafe/)'s installation page) and a C compiler (`cc`);
 - for `auth/` only, OpenSSL's libcrypto; for `compress/` only, libzstd and libbrotli
   (`brew install zstd brotli`; `apt install libzstd-dev libbrotli-dev`). The core package needs no C library.
@@ -226,6 +226,7 @@ HTTP/3, give `applicationOf(app)` to `web_http3`'s server. Both are CeeSafe.Web'
 | `otel/` | `httpserver_otel` | Traced requests as spans, exported to a collector as OTLP/JSON | none |
 | `bench/` | `bench` | The benchmark server: a whole program | as `compress/` |
 | `examples/hello/` | `hello` | The quick start's program | none |
+| `examples/shop/` | `shop` | A route group behind an API-key middleware: [docs/from-elixir.md](docs/from-elixir.md)'s example | none |
 
 ## What is here
 
@@ -445,6 +446,9 @@ dependency injection (handlers are structs), Razor and Blazor, the front-end dev
 protocol; gRPC and OpenAPI unless asked for.
 
 ## Compared with Elixir
+
+Coming from Plug and Phoenix? [docs/from-elixir.md](docs/from-elixir.md) maps routers, pipelines, assigns, supervisors,
+PubSub and Channels to what httpserver has, with the same API written in both.
 
 Elixir's web servers are the usual reference for isolating requests: every connection (and every HTTP/2 stream) is a
 BEAM process, which crashes alone, owns its own garbage-collected heap, and is preempted by the VM's scheduler. httpserver

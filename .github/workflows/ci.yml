@@ -50,7 +50,7 @@ jobs:
       - name: Check and format
         run: |
           set -e
-          for p in . auth static ws compress otel otel/demo examples/hello bench; do
+          for p in . auth static ws compress otel otel/demo examples/hello examples/shop bench; do
             echo "== $p"
             (cd "$p" && ceesafec fetch && git diff --exit-code -- ceesafe.lock && ceesafec check && ceesafec fmt --check)
           done
@@ -72,7 +72,7 @@ jobs:
       - name: Example, benchmark server and collector demo builds
         run: |
           set -e
-          for p in examples/hello bench otel/demo; do
+          for p in examples/hello examples/shop bench otel/demo; do
             echo "== $p"
             (cd "$p" && ceesafec build)
           done
