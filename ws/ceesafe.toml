@@ -7,7 +7,7 @@ tests = ["tests"]
 ceesafec = ">=0.77.2"
 
 [dependencies]
-web_core = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "79ae13870e2d454bd590747b9b3ce3d2c5a026df", dir = "packages/web_core" }
-web_http = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "79ae13870e2d454bd590747b9b3ce3d2c5a026df", dir = "packages/web_http" }
+web_core = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "44299461d0e7ba3d1d7ffb982fc7fa288af96433", dir = "packages/web_core" }
+web_http = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "44299461d0e7ba3d1d7ffb982fc7fa288af96433", dir = "packages/web_http" }
 # The WebSocket session, and the queue other tasks send through.
-web_ws = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "79ae13870e2d454bd590747b9b3ce3d2c5a026df", dir = "packages/web_ws" }
+web_ws = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "44299461d0e7ba3d1d7ffb982fc7fa288af96433", dir = "packages/web_ws" }

@@ -8,10 +8,10 @@ ceesafec = ">=0.77.2"
 
 [dependencies]
 httpserver = { path = ".." }
-web_core = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "79ae13870e2d454bd590747b9b3ce3d2c5a026df", dir = "packages/web_core" }
-web_transport = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "79ae13870e2d454bd590747b9b3ce3d2c5a026df", dir = "packages/web_transport" }   # the tests' mock connection
-web_http = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "79ae13870e2d454bd590747b9b3ce3d2c5a026df", dir = "packages/web_http" }
-web_http1 = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "79ae13870e2d454bd590747b9b3ce3d2c5a026df", dir = "packages/web_http1" }
+web_core = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "44299461d0e7ba3d1d7ffb982fc7fa288af96433", dir = "packages/web_core" }
+web_transport = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "44299461d0e7ba3d1d7ffb982fc7fa288af96433", dir = "packages/web_transport" }   # the tests' mock connection
+web_http = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "44299461d0e7ba3d1d7ffb982fc7fa288af96433", dir = "packages/web_http" }
+web_http1 = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "44299461d0e7ba3d1d7ffb982fc7fa288af96433", dir = "packages/web_http1" }
 # HMAC-SHA-256 for HS256, base64url for the token's parts, JSON for its header and claims.
 sha256 = { git = "https://github.com/CeeSafe/CeeSafeLibs.git", rev = "ca0a13fec248bbe192f0b61b930c8b8259175eed", dir = "sha256" }
 encoding = { git = "https://github.com/CeeSafe/CeeSafeLibs.git", rev = "ca0a13fec248bbe192f0b61b930c8b8259175eed", dir = "encoding" }
