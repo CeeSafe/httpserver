@@ -13,9 +13,13 @@ port of CosmoApiServer (.NET) by what it does, not line by line. There is no gar
 install: a server is one native program, which answers about 100 000 small requests a second on one core in 8 to
 22 MB of memory ([Measured](#measured)).
 
-**Status:** version 0.2.0: `App.run` serves each connection in an isolated task, the former `run` is `runShared`, and
-an application has a bound of 1 000 ms on a request that computes without waiting (docs/elixir-gaps.md §2). The API is not settled, and the language under it is young: what was met while writing
-this is in [CEESAFE_FINDINGS.md](CEESAFE_FINDINGS.md). Linux and macOS; the supervisor is POSIX only.
+**Status:** version 0.2.0, on ceesafec 0.83.0. `App.run` serves each connection in an isolated task (a trap costs
+the connection, not the worker); `app.isolateRequests(true)` isolates each HTTP/1.1 request, answering 500 for one
+that traps; a request that computes is paused every 10 ms slice so its neighbours run, and ended past a bound of 30 s
+(ceesafec ADRs 0186, 0189 and 0191, in a build with `polls = true`). How that compares with Elixir's process
+isolation, measured against Bandit: [Compared with Elixir](#compared-with-elixir). The API is not settled, and the
+language under it is young: what was met while writing this is in [CEESAFE_FINDINGS.md](CEESAFE_FINDINGS.md). Linux
+and macOS; the supervisor is POSIX only.
 
 ## Contents
 
@@ -25,6 +29,7 @@ this is in [CEESAFE_FINDINGS.md](CEESAFE_FINDINGS.md). Linux and macOS; the supe
 - [What is here](#what-is-here)
 - [One process per core, supervised](#one-process-per-core-supervised)
 - [What is not here yet](#what-is-not-here-yet)
+- [Compared with Elixir](#compared-with-elixir)
 - [Measured](#measured)
 - [The benchmark server](#the-benchmark-server)
 - [Working on it](#working-on-it)
@@ -379,7 +384,9 @@ the application's bound, `app.bound(ms)` (1 000 ms by default, 0 for none; `Asyn
 benchmark server's `CW_RUN_BOUND_MS`), and past it the request traps with `Overran` and ends alone, its neighbours
 having waited at most that long. With the slice, `app.slice(ms)` (10 ms by default, 0 for none; `Async.runSlice`,
 ceesafec ADR 0189; `CW_RUN_SLICE_MS`), a request that computes is paused every slice and its worker's other requests run
-meanwhile: beside one computing for 300 ms, a request waits a few slices, and the default bound is then 30 000 ms, for a
+meanwhile: beside one computing for 300 ms, a request waits about one slice (0.013 s in `supervisor_check.py`; before
+ceesafec 0.83.0's ADR 0191 every hand-off between a connection's tasks waited a slice behind the paused one, and a
+worker kept busy by HTTP/2 never ran its heartbeat), and the default bound is then 30 000 ms, for a
 request that never ends (1 000 ms without a slice: under `runShared`, or on a 32-bit target). A build without polls says
 so once at start: `httpserver: no polls in this build: …`. A library's `polls = true` does nothing for its users: the
 program's own manifest asks. Still ending the worker: a trap under a C library's callback or inside a `Critical`, and,
@@ -436,6 +443,48 @@ Of CosmoApiServer, nothing that was planned. Spans go to a collector over plain 
 and a span is named by its method, not its route's pattern. Not planned: reflection controllers and
 dependency injection (handlers are structs), Razor and Blazor, the front-end development helpers, SignalR's wire
 protocol; gRPC and OpenAPI unless asked for.
+
+## Compared with Elixir
+
+Elixir's web servers are the usual reference for isolating requests: every connection (and every HTTP/2 stream) is a
+BEAM process, which crashes alone, owns its own garbage-collected heap, and is preempted by the VM's scheduler. httpserver
+gets most of that from a native program with no garbage collector. Against Bandit, Phoenix's default server, with Plug
+(no Phoenix) on Erlang/OTP 29 (`bench/elixir/`, Bandit 1.15.0):
+
+| | httpserver | Elixir, Bandit + Plug |
+|---|---|---|
+| Unit of isolation | an isolated task per connection and per HTTP/2 or HTTP/3 stream; per HTTP/1.1 request with `app.isolateRequests(true)` | a process per connection, and per HTTP/2 stream |
+| A handler that crashes | its connection is reset; with per-request isolation it is answered 500 and the connection goes on | answered 500, and the connection closed |
+| What a crash held | leaked and counted (`Isolation.report()`); the worker is replaced, without refusing a connection, after 100 crashes or 64 MiB | freed with the process's heap |
+| A request that computes without waiting | paused every slice (10 ms) at the compiler's polls, and ended past its bound (30 s), in a build with `polls = true` | preempted every few thousand reductions; never ended unless the application sets a limit |
+| Memory per request | `app.budget(bytes)`: an allocation past it fails in that request alone | `max_heap_size`, a process flag, if the application sets it |
+| Time per request | `app.timeout(ms)` | none in Bandit; the application's own |
+| Supervision | a process supervisor (workers restarted, killed when their loop stops beating) and `Services` with a restart intensity for a worker's housekeeping | OTP's supervision trees, for anything in the application |
+| Several cores | one worker process per core, under the supervisor | one VM, a scheduler per core |
+| Shared state | per worker; `SharedWords` (atomic numbers) and the `Bus` between workers on one machine | ETS, and messages between processes; Phoenix.PubSub and distributed Erlang across machines |
+| HTTP/3 | yes (`web_http3`) | no |
+| Upgrading code in place | no: drain and restart | yes, with OTP releases |
+| What ships | one native binary | a release with the Erlang runtime |
+
+Measured on one 4-core Xeon D-2123IT (Linux), each server on the same two cores and the load on the other two, both
+first checked by CeeSafe.Web's `conform.py`; the full tables, the method and the raw results are in
+[docs/elixir-benchmark.md](docs/elixir-benchmark.md) (`tools/elixir_bench.py`):
+
+- **Rate:** 1.1 to 3.7 times Bandit's requests a second over HTTP/1.1, and 1.0 to 3.4 times over h2c (for example
+  `/json` at 128 connections: 154 504 against 41 868 over HTTP/1.1, 68 931 against 22 802 over h2c).
+- **Memory:** 15 to 45 MiB for four workers, against 160 to 190 MiB.
+- **Crashes beside 10 000 healthy requests a second:** neither server lets one touch another client's request. At
+  1 000 crashes a second Bandit's healthy p99 is 2.4 ms with nothing retried; httpserver's is 3.7 ms with per-request
+  isolation (7.4 ms without), and 1.2 to 1.5 % of healthy requests are retried on a new connection, since a replaced
+  worker closes its keep-alive connections as it drains. That recycling is what a garbage-collected heap does not
+  need, and the gap that is left.
+- **Requests that compute beside them** (four, 100 ms at a time): healthy p99.9 4.6 ms with per-request isolation and
+  9.8 ms with the defaults, against Bandit's 7.5 ms. Two requests that never end cost neither server anything
+  measurable.
+
+The benchmark found two faults in CeeSafe's executor, which Bandit does not have: a worker kept busy by HTTP/2 never
+ran its heartbeat and was killed, and requests behind a paused one waited seconds. ceesafec 0.83.0 (ADR 0191) fixed
+both; the numbers above are with it, and docs/elixir-benchmark.md has the ones before.
 
 ## Measured
 
@@ -508,7 +557,9 @@ environment:
 | `CW_INHERIT=0` | Each worker binds the port (`reusePort`) instead of accepting from the one socket the supervisor bound (`CW_INHERIT=1`, the default) |
 | `CW_REUSEPORT=1` | One process that binds the port with `reusePort`, to run several by hand (Linux) |
 | `CW_ISOLATED=0` | Connections in plain tasks (`App.runShared`), where a trap ends the worker; by default each is isolated (`App.run`) |
-| `CW_RUN_BOUND_MS` | The application's bound on a request that computes without waiting (`App.bound`, 1000; 0 for none), in a build with polls |
+| `CW_ISOLATE_REQUESTS=1` | Each HTTP/1.1 request in an isolated task of its own (`App.isolateRequests`): a trap is answered 500 and the connection goes on |
+| `CW_RUN_SLICE_MS` | The application's slice: a request that computes this long without waiting is paused (`App.slice`, 10; 0 for none), in a build with polls |
+| `CW_RUN_BOUND_MS` | The application's bound on a request that computes without waiting (`App.bound`, 30 000 with a slice, 1000 without; 0 for none), in a build with polls |
 | `CW_RECYCLE_CRASHES` | A worker whose isolated tasks trapped this many times is replaced (100) |
 | `CW_JOBS=1` | A scheduler, a service of the worker, with a job every second: `/job`, `/job/trap/{n}` |
 | `CW_SERVICE_RESTARTS` | The restarts of a service within 30 s past which the worker ends (5) |
@@ -526,7 +577,9 @@ environment:
 
 Its routes are listed at the top of [bench/src/main.cee](bench/src/main.cee): `/small`, `/json`, `/echo`,
 `/users/{id:int}`, `/stream`, `/kept/{n}` (the output cache), `/gz/{n}` and `/z/{n}` (compression), `/chat` (a
-WebSocket), and `/crash`, `/spin` and `/bloat`, which a server should survive.
+WebSocket), and `/crash`, `/crash/after/{n}`, `/spin`, `/spin/{ms}` and `/bloat`, which a server should survive.
+`bench/elixir/` answers the same comparison routes and faults on Bandit, for `tools/elixir_bench.py`
+([Compared with Elixir](#compared-with-elixir)).
 
 ```sh
 (cd bench && ceesafec build)
@@ -564,7 +617,9 @@ python3 tools/ws_check.py         # the hub, with WebSocket clients written from
 python3 tools/ws_check.py --workers 4   # the same over four workers and the bus (add --inherit on macOS)
 ```
 
-The compiler: ceesafec 0.80.0 or later, for `Async.runBound` (ADR 0186), which `run` sets. Isolated tasks (ADR 0175), which `app.run` serves connections in,
+The compiler: ceesafec 0.83.0 or later, whose executor runs the tasks woken behind a paused one first and keeps a busy
+worker's timers running (ADR 0191); `Async.runSlice` (ADR 0189) and `polls = true` in a manifest (ADR 0190) came with
+0.82.0, `Async.runBound` (ADR 0186), which `run` sets, with 0.80.0. Isolated tasks (ADR 0175), which `app.run` serves connections in,
 came with 0.75.0; `Process.spawnWith` and `SharedMemory.anonymous` (ADR 0173, 0.73.1) start the workers and hand them
 what they share; `Budget`, for a request's memory, came with 0.70.0; and the stock middleware are impls for every
 application state, which 0.68.0 accepts. CeeSafe.Web at the pinned revision, whose HTTP/2 and HTTP/3 streams are
