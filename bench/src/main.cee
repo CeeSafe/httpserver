@@ -24,6 +24,8 @@
 //   GET  /chat           a WebSocket: every message a session sends goes to all the sessions of this process, and with
 //                         CW_BUS=1 to those of every worker
 //   GET  /bloat          allocates until an allocation fails, then answers how many MiB it got
+//   GET  /job            how many times this worker's scheduled job has run (CW_JOBS=1)
+//   GET  /job/trap/{n:int} the job's next run traps (n = 1), or every run does (n = 2); 0 for neither
 //
 // CW_PROCS=n runs n worker processes under the supervisor (src/supervisor.cee), which starts a worker again when it
 // ends and kills one whose loop has stopped; CW_MEMORY_MB limits each worker's address space; CW_BUDGET_MB each request's memory; CW_INHERIT=1 has the
@@ -36,6 +38,11 @@
 // build with `--cflag -DCEE_POLLS=1`: under CW_ISOLATED=1 a request that computes past it traps with `Overran` and
 // costs its connection, where without it the event loop stops until the supervisor kills the worker. A task in no
 // isolated unit is counted, not ended (`RunBound.Count`). A build without the macro says so and runs unbounded.
+//
+// The worker's housekeeping runs under a `Services` supervisor (src/services.cee): the reading of the bus and, with
+// CW_JOBS=1, a scheduler whose job runs every second. Each start of one is an isolated task, so a trap in it ends
+// that start alone and it is started again; past CW_SERVICE_RESTARTS restarts in 30 s (5 by default) the supervisor
+// gives up and the worker ends, for the process supervisor to start again.
 //
 // CW_BUS=1 gives the workers a bus: `/bus/say/{n}` says n to all of them, `/bus/heard` answers the worker and the
 // last number it heard, `/forget/{n}` has every worker forget `/kept/{n}`, and `/bus/forget/{n}` only the others,
@@ -68,6 +75,56 @@ struct Wiring {
     cache: Arc<OutputCache>;
     /// The sessions of `/chat`.
     hub: Arc<Hub>;
+    /// The scheduled job's runs, and its traps to come (`/job/trap`).
+    jobRuns: Arc<AtomicU64>;
+    jobTraps: Arc<AtomicU64>;
+}
+
+/// The job of CW_JOBS=1: counts its runs, and traps when `/job/trap` asked it to.
+struct Tick {
+    runs: Arc<AtomicU64>;
+    traps: Arc<AtomicU64>;
+}
+
+impl Job for Tick {
+    async fn run(borrow this, at: i64) -> Result<void, JobError> {
+        let asked = this.traps.get().load();
+        if (asked == 1) {
+            this.traps.get().store(0);
+        }
+        if (asked == 1 || asked == 2) {
+            let few = [1u8, 2u8, 3u8];
+            let i = truncate<usize>(asked) + 100;
+            let _ = few[i]; // out of bounds: this start of the scheduler ends alone
+        }
+        let _ = this.runs.get().fetchAdd(1);
+        return Ok();
+    }
+}
+
+/// `/job` and `/job/trap/{n}`.
+struct Jobs {
+    trap: bool;
+}
+
+impl Handler<St> for Jobs {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut Context<St>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        let wiring = borrow ctx.state().wiring;
+        if (this.trap) {
+            let n = ctx.paramInt("n") ?? 0;
+            wiring.jobTraps.get().store(if (n == 1 || n == 2) truncate<u64>(n) else 0);
+            return await exchange.send(Status.ok(), "ok".bytes());
+        }
+        var buffer = [0u8; 24];
+        var w = TextWriter.create(mut buffer[..]);
+        w.decimal(wiring.jobRuns.get().load());
+        return await exchange.send(Status.ok(), w.written());
+    }
 }
 
 /// What a worker does with the other workers' messages: topic 1 is a number said, topic 2 a target to forget,
@@ -690,6 +747,8 @@ fn application(worker: u32, wiring: Wiring) -> Result<App<St>, RouteError> {
     app.get("/spin", handler(Box.create(Spin {}))?)?;
     app.get("/spin/{ms:int}", handler(Box.create(SpinFor {}))?)?;
     app.get("/bloat", handler(Box.create(Bloat {}))?)?;
+    app.get("/job", handler(Box.create(Jobs { trap: false }))?)?;
+    app.get("/job/trap/{n:int}", handler(Box.create(Jobs { trap: true }))?)?;
     app.get("/chat", handler(Box.create(Chat {}))?)?;
     var coding = CodingOptions.defaults();
     coding.gzip = true;
@@ -749,37 +808,70 @@ fn address() -> SocketAddress {
     return SocketAddresses.v4Loopback(port);
 }
 
-/// A worker's housekeeping: `tend`, and with a port the reading of the bus beside it.
+/// A worker's housekeeping: `tend`, and the services beside it. `tend` stays outside the services: it is what beats
+/// and drains, and a crash in it should end the worker.
 async fn housekeeping(
     worker: Worker,
     drain: borrow Drain,
-    port: BusPort?,
-    ears: Ears,
+    services: borrow Services,
 ) -> Result<ServerReport, NetError> {
-    match (port) {
-        null => { return await tend<ServerReport>(worker, drain, 100); }
-        Some(p) => {
-            var mine = p;
-            let reading = borrow mut mine;
-            let sink = borrow ears;
-            let r: Result<Raced<ServerReport>, NetError> = await Async.race(
-                async move () => await tend<ServerReport>(worker, drain, 100),
-                async move () => await carry<ServerReport, Ears>(reading, sink, 5),
-            );
-            return match (r) {
-                Ok(raced) => Ok(raced.value),
-                Err(e) => Err(e),
-            };
-        }
+    if (services.count() == 0) {
+        return await tend<ServerReport>(worker, drain, 100);
     }
+    let r: Result<Raced<ServerReport>, NetError> = await Async.race(
+        async move () => await tend<ServerReport>(worker, drain, 100),
+        async move () => {
+            let ended = await services.run<ServerReport>(drain);
+            match (ended) {
+                Err(NetError.LimitExceeded) => {
+                    let _ = await AsyncConsole.writeLine(
+                        "worker: a service restarted too often: ending, to be replaced",
+                    );
+                }
+                _ => {}
+            }
+            return ended;
+        },
+    );
+    return match (r) {
+        Ok(raced) => Ok(raced.value),
+        Err(e) => Err(e),
+    };
+}
+
+/// The worker's services: the reading of the bus, and with CW_JOBS=1 the scheduler.
+fn services(worker: Worker, bus: Bus?, ears: Ears, wiring: borrow Wiring) -> Result<Services, AllocError> {
+    let restarts = setting("CW_SERVICE_RESTARTS", 5);
+    var services = Services.create(
+        Strategy.OneForOne,
+        Intensity { restarts: truncate<u32>(restarts), withinMs: 30000 },
+    );
+    match (bus) {
+        Some(b) => {
+            let carrier: Box<dyn Service + Send + Share> =
+                Box.create(BusCarrier<Ears> { bus: b, worker: worker.index(), sink: ears, everyMs: 5 })?;
+            let _ = services.add("bus", carrier, Restart.Permanent)?;
+        }
+        null => {}
+    }
+    if (setting("CW_JOBS", 0) == 1) {
+        var scheduler = Scheduler.create(Zone.Utc);
+        let tick: Box<dyn Job + Send + Share> =
+            Box.create(Tick { runs: wiring.jobRuns.clone(), traps: wiring.jobTraps.clone() })?;
+        match (scheduler.every(1, tick)) {
+            Ok(_) => {}
+            Err(_) => { return Err(AllocError.OutOfMemory); }
+        }
+        let _ = services.add("scheduler", scheduler.service()?, Restart.Permanent)?;
+    }
+    return Ok(services);
 }
 
 async fn serve(
     app: App<St>,
     worker: Worker,
     listener: borrow dyn web_transport.Incoming,
-    port: BusPort?,
-    ears: Ears,
+    services: Services,
 ) -> Result<ServerReport, NetError> {
     let drain = Drain.create()?;
     var limits = ConnectionLimits.defaults();
@@ -791,6 +883,7 @@ async fn serve(
     // The server owns the application, so its child moves it; the rest is lent to both.
     let bounds = borrow limits;
     let draining = borrow drain;
+    let tending = borrow services;
     let isolated = setting("CW_ISOLATED", 0) == 1;
     let r: Result<Raced<ServerReport>, NetError> = await Async.race(
         async move () => {
@@ -803,7 +896,7 @@ async fn serve(
             }
             return await app.run(listener, PlainAcceptor {}, bounds, draining);
         },
-        async move () => await housekeeping(worker, draining, port, ears),
+        async move () => await housekeeping(worker, draining, tending),
     );
     return match (r) {
         Ok(raced) => Ok(raced.value),
@@ -811,10 +904,10 @@ async fn serve(
     };
 }
 
-/// A worker's wiring and its end of the bus.
+/// A worker's wiring and the bus.
 struct Parts {
     wiring: Wiring;
-    port: BusPort?;
+    bus: Bus?;
 }
 
 fn wired(worker: Worker, words: SharedWords?, bus: Bus?) -> Parts? {
@@ -836,23 +929,36 @@ fn wired(worker: Worker, words: SharedWords?, bus: Bus?) -> Parts? {
         },
         Err(_) => { return null; },
     };
-    var port: BusPort? = null;
+    let jobRuns = match (Arc<AtomicU64>.create(AtomicU64.create(0))) {
+        Ok(a) => a,
+        Err(_) => { return null; },
+    };
+    let jobTraps = match (Arc<AtomicU64>.create(AtomicU64.create(0))) {
+        Ok(a) => a,
+        Err(_) => { return null; },
+    };
     var sender: BusSender? = null;
     match (bus) {
         Some(b) => {
+            // Joining drops what the worker before in this place was writing when it ended; the bus's carrier
+            // reads from its own `reader` in each start.
             match (b.join(worker.index())) {
-                Ok(p) => {
-                    sender = Some(p.sender());
-                    port = Some(p);
-                }
+                Ok(p) => { sender = Some(p.sender()); }
                 Err(_) => { return null; }
             }
         }
         null => {}
     }
-    return Some(
-        Parts { wiring: Wiring { words: words, sender: sender, heard: heard, cache: cache, hub: hub }, port: port },
-    );
+    let wiring = Wiring {
+        words: words,
+        sender: sender,
+        heard: heard,
+        cache: cache,
+        hub: hub,
+        jobRuns: jobRuns,
+        jobTraps: jobTraps,
+    };
+    return Some(Parts { wiring: wiring, bus: bus });
 }
 
 /// One process's server on `listener`; the status it exits with.
@@ -867,6 +973,13 @@ fn serveOn(worker: Worker, listener: borrow dyn web_transport.Incoming, words: S
         cache: parts.wiring.cache.clone(),
         hub: parts.wiring.hub.clone(),
     };
+    let tended = match (services(worker, parts.bus, ears, borrow parts.wiring)) {
+        Ok(s) => s,
+        Err(_) => {
+            Console.writeLine("bench: no memory");
+            return 1;
+        },
+    };
     let app = match (application(worker.index(), parts.wiring)) {
         Ok(a) => a,
         Err(_) => {
@@ -878,7 +991,7 @@ fn serveOn(worker: Worker, listener: borrow dyn web_transport.Incoming, words: S
     if (bound > 0 && !Async.runBound(bound, RunBound.Count)) {
         Console.writeLine("bench: CW_RUN_BOUND_MS needs a build with --cflag -DCEE_POLLS=1; running unbounded");
     }
-    match (Async.run(serve(app, worker, listener, parts.port, ears))) {
+    match (Async.run(serve(app, worker, listener, tended))) {
         Ok(_) => { return 0; }
         Err(e) => {
             Console.writeLine(NetErrors.describe(e));

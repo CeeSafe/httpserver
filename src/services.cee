@@ -1,0 +1,346 @@
+// Services: a supervisor for a worker's long-lived tasks (docs/elixir-gaps.md §3; ceesafec ADR 0175 §3, "a
+// supervisor for tasks can be a library over `watch`").
+//
+// A service is a part of a worker that runs as long as the worker does: the scheduler, the reading of the bus. Each
+// start of one is an isolated task (ADR 0175): a trap in it ends that start alone, and the supervisor starts it
+// again, after a pause that grows while it keeps ending at once. Past an intensity (so many restarts within so long)
+// the supervisor gives up and returns an error, which ends the worker; the process supervisor (`Supervisor`) then
+// starts the worker again, which is the next level of the tree. What a start held when it trapped is leaked (ADR 0175
+// §2.4), so a service builds its state again in each start; what must outlive a crash lives outside it (an `Arc` it
+// was given, `SharedWords`), as in Erlang it lives in ETS or in another process.
+//
+// The supervisor looks at its services every `tickMs` (20 ms): a restart comes within that of its pause.
+import web_core;
+
+/// A long-lived part of a worker, started and started again by `Services`. It is given to `Services.add` as a
+/// `Box<dyn Service + Send + Share>`: each start runs on it from an isolated task.
+public interface Service {
+    /// Runs until `drain` starts (then returns Ok) or fails. Each start is a new isolated task: what the last one
+    /// held is gone, so it builds its state again here.
+    async fn run(borrow this, drain: Drain) -> Result<void, NetError>;
+}
+
+/// When a service that ended is started again.
+public enum Restart {
+    /// Always, unless the worker is draining: a service meant to run as long as the worker.
+    Permanent,
+    /// After a trap or an `Err`, not after `Ok`: a service that may finish its work.
+    Transient,
+    /// Never: started once.
+    Temporary,
+}
+
+/// Which services an end restarts.
+public enum Strategy {
+    /// The one that ended.
+    OneForOne,
+    /// All of them: the others are cancelled (each sees it at its next wait), and all start again together. For
+    /// services that depend on one another's state.
+    OneForAll,
+}
+
+/// How many restarts within how long the supervisor allows: one more and it gives up.
+public struct Intensity {
+    public restarts: u32;
+    public withinMs: u64;
+}
+
+/// What happened to a service, numbered as `Services.add` returned.
+public enum ServiceEvent {
+    /// A start began.
+    Started(u32),
+    /// A start trapped and ended alone.
+    Crashed(u32, PanicKind),
+    /// A start returned: true for `Ok`.
+    Returned(u32, bool),
+    /// It needed a restart past the intensity: the supervisor returns an error, and the worker ends.
+    GaveUp(u32),
+}
+
+/// Why a generation of the services ended. The set's error type: `Crashed` is a child's that trapped.
+enum Halt {
+    Crashed,
+    Restart,
+    GaveUp,
+    Cancelled,
+    OutOfMemory,
+}
+
+/// A start that returned, as its task tells the supervisor.
+struct Ended {
+    index: u32;
+    generation: u64;
+    ok: bool;
+}
+
+/// What the supervisor was given for a service.
+struct Spec {
+    name: String;
+    service: Arc<Box<dyn Service + Send + Share>>;
+    restart: Restart;
+}
+
+/// A service's present life, as the supervisor sees it.
+struct Life {
+    /// The running start's task, and its number of starts.
+    task: u64;
+    generation: u64;
+    running: bool;
+    /// It is not to be started again.
+    done: bool;
+    startedMs: u64;
+    /// When to start it; 0: not due.
+    dueMs: u64;
+    /// How many times in a row it ended within a second of starting.
+    quick: u32;
+}
+
+/// The pause before a start after `quick` quick ends: 0, 100 ms, 200 ms, ... 3.2 s, then 5 s, as the process
+/// supervisor's.
+fn pauseFor(quick: u32) -> u64 => if (quick > 6) 5000u64 else (if (quick == 0) 0u64 else 50u64 << quick);
+
+/// A supervisor for a worker's services.
+///
+/// ```
+/// var services = Services.create(Strategy.OneForOne, Intensity { restarts: 5, withinMs: 10000 });
+/// services.add("scheduler", Box.create(Jobs { … })?, Restart.Permanent)?;
+/// let events = services.watch(16)?;
+/// await Async.race(server, async move () => await services.run<ServerReport>(draining));
+/// ```
+public struct Services {
+    private strategy: Strategy;
+    private intensity: Intensity;
+    private specs: Vector<Spec>;
+    private events: Channel<ServiceEvent>?;
+    private tick: u64;
+
+    /// A supervisor with no services yet.
+    public fn create(strategy: Strategy, intensity: Intensity) -> Services =>
+        Services { strategy: strategy, intensity: intensity, specs: Vector<Spec>.create(), events: null, tick: 20 };
+
+    /// Adds `service` under `name`; its number, which events name it by.
+    public fn add(
+        borrow mut this,
+        name: StringView,
+        service: Box<dyn Service + Send + Share>,
+        restart: Restart,
+    ) -> Result<u32, AllocError> {
+        let id = truncate<u32>(this.specs.length);
+        let shared = Arc<Box<dyn Service + Send + Share>>.create(service)?;
+        this.specs.push(Spec { name: String.from(name)?, service: shared, restart: restart })?;
+        return Ok(id);
+    }
+
+    /// How many services there are.
+    public fn count(borrow this) -> usize => this.specs.length;
+
+    /// The name service `id` was added under.
+    public fn name(borrow this, id: u32) -> StringView? {
+        if (id as usize >= this.specs.length) {
+            return null;
+        }
+        return Some(this.specs[id as usize].name.view());
+    }
+
+    /// How often the supervisor looks at its services, in milliseconds (20 by default, at least 1).
+    public fn lookEvery(borrow mut this, ms: u64) {
+        this.tick = if (ms == 0) 1 else ms;
+    }
+
+    /// A channel that is told of every start, crash, return and the giving up, from now: the monitor. It holds
+    /// `capacity` events; one that does not fit is dropped, never waited for.
+    public fn watch(borrow mut this, capacity: usize) -> Result<Channel<ServiceEvent>, AllocError> {
+        let channel = Channel<ServiceEvent>.create(if (capacity == 0) 1usize else capacity)?;
+        let theirs = channel.clone();
+        this.events = Some(channel);
+        return Ok(theirs);
+    }
+
+    fn tell(borrow this, event: ServiceEvent) {
+        match (borrow this.events) {
+            Some(c) => {
+                let _ = c.trySend(event);
+            }
+            null => {}
+        }
+    }
+
+    /// Runs the services until it is cancelled, to race against the server as `tend` is. It returns only an error:
+    /// `NetError.LimitExceeded` when a service needed a restart past the intensity (the worker should end, and its
+    /// supervisor start it again), `OutOfMemory`, or the error that cancelled it. Once `drain` starts, nothing is
+    /// started again, and the services are expected to return.
+    public async fn run<T>(borrow this, drain: borrow Drain) -> Result<T, NetError> {
+        let count = this.specs.length;
+        var lives = Vector<Life>.create();
+        if (lives.reserve(count).isErr()) {
+            return Err(NetError.OutOfMemory);
+        }
+        for (i in 0..count) {
+            let life = Life {
+                task: 0,
+                generation: 0,
+                running: false,
+                done: false,
+                startedMs: 0,
+                dueMs: 1,
+                quick: 0,
+            };
+            if (lives.push(life).isErr()) {
+                return Err(NetError.OutOfMemory);
+            }
+        }
+        // The times of the restarts within the intensity's window.
+        var history = Vector<u64>.create();
+        let limit = truncate<u32>(count) + 1;
+        loop {
+            let r = await Async.tasks(limit, Halt.OutOfMemory, async (set) =>
+                await this.generation(set, drain, mut lives, mut history));
+            match (r) {
+                Err(Halt.Restart) => {
+                    // One for all: every service that is to run again starts after the longest of their pauses.
+                    var pause: u64 = 0;
+                    for (i in 0..count) {
+                        lives[i].running = false;
+                        if (!lives[i].done && pauseFor(lives[i].quick) > pause) {
+                            pause = pauseFor(lives[i].quick);
+                        }
+                    }
+                    let due = nowMs() + pause + 1;
+                    for (i in 0..count) {
+                        if (!lives[i].done) {
+                            lives[i].dueMs = due;
+                        }
+                    }
+                }
+                Err(Halt.GaveUp) => { return Err(NetError.LimitExceeded); }
+                Err(Halt.OutOfMemory) => { return Err(NetError.OutOfMemory); }
+                _ => { return Err(NetError.Cancelled); }
+            }
+        }
+    }
+
+    /// One generation of the services: one task set, until it is cancelled, a service needs a restart past the
+    /// intensity, or (one for all) one needs a restart at all.
+    async fn generation(
+        borrow this,
+        set: borrow TaskSet<Halt>,
+        drain: borrow Drain,
+        lives: borrow mut Vector<Life>,
+        history: borrow mut Vector<u64>,
+    ) -> Result<void, Halt> {
+        let count = this.specs.length;
+        let room = count * 4 + 4;
+        let crashes = match (Channel<TaskCrash>.create(room)) {
+            Ok(c) => c,
+            Err(_) => { return Err(Halt.OutOfMemory); },
+        };
+        let ended = match (Channel<Ended>.create(room)) {
+            Ok(c) => c,
+            Err(_) => { return Err(Halt.OutOfMemory); },
+        };
+        if (!Isolation.watch(set, borrow crashes)) {
+            return Err(Halt.OutOfMemory);
+        }
+        loop {
+            let now = nowMs();
+            // Ends, before starts: a start's end is read only after spawnIsolated has given its task's number.
+            loop {
+                let crash = crashes.tryRecv() ?? { break; };
+                for (i in 0..count) {
+                    if (lives[i].running && lives[i].task == crash.task) {
+                        lives[i].running = false;
+                        this.tell(ServiceEvent.Crashed(truncate<u32>(i), crash.kind()));
+                        this.afterEnd(i, true, false, drain, mut lives, mut history, now)?;
+                    }
+                }
+            }
+            loop {
+                let end = ended.tryRecv() ?? { break; };
+                let i = end.index as usize;
+                if (i < count && lives[i].running && lives[i].generation == end.generation) {
+                    lives[i].running = false;
+                    this.tell(ServiceEvent.Returned(end.index, end.ok));
+                    this.afterEnd(i, false, end.ok, drain, mut lives, mut history, now)?;
+                }
+            }
+            if (!drain.isDraining()) {
+                for (i in 0..count) {
+                    if (lives[i].running || lives[i].done || lives[i].dueMs == 0 || now < lives[i].dueMs) {
+                        continue;
+                    }
+                    lives[i].generation += 1;
+                    lives[i].running = true;
+                    lives[i].dueMs = 0;
+                    lives[i].startedMs = now;
+                    let service = this.specs[i].service.clone();
+                    let stopping = drain.share();
+                    let told = ended.clone();
+                    let index = truncate<u32>(i);
+                    let generation = lives[i].generation;
+                    let task = await set.spawnIsolated(Halt.Crashed, async move () => {
+                        let r = await service.get().run(stopping);
+                        let _ = told.trySend(Ended { index: index, generation: generation, ok: r.isOk() });
+                        return Ok();
+                    })?;
+                    lives[i].task = task;
+                    this.tell(ServiceEvent.Started(index));
+                }
+            }
+            match (await Timer.sleep(this.tick)) {
+                Ok() => {}
+                Err(_) => { return Err(Halt.Cancelled); }
+            }
+        }
+    }
+
+    /// What follows the end of service `i`'s start: a restart when its `Restart` asks for one and the worker is not
+    /// draining, within the intensity; `Err(GaveUp)` past it, and `Err(Restart)` for one for all.
+    fn afterEnd(
+        borrow this,
+        i: usize,
+        crashed: bool,
+        ok: bool,
+        drain: borrow Drain,
+        lives: borrow mut Vector<Life>,
+        history: borrow mut Vector<u64>,
+        now: u64,
+    ) -> Result<void, Halt> {
+        let again = match (this.specs[i].restart) {
+            Restart.Permanent => true,
+            Restart.Transient => crashed || !ok,
+            Restart.Temporary => false,
+        };
+        if (!again || drain.isDraining()) {
+            lives[i].done = true;
+            return Ok();
+        }
+        // The intensity: restarts within the window, the oldest first.
+        var kept: usize = 0;
+        for (k in 0..history.length) {
+            if (now - history[k] < this.intensity.withinMs) {
+                history[kept] = history[k];
+                kept += 1;
+            }
+        }
+        history.truncate(kept);
+        if (history.length as u64 >= this.intensity.restarts as u64) {
+            this.tell(ServiceEvent.GaveUp(truncate<u32>(i)));
+            return Err(Halt.GaveUp);
+        }
+        if (history.push(now).isErr()) {
+            return Err(Halt.OutOfMemory);
+        }
+        if (now - lives[i].startedMs < 1000) {
+            lives[i].quick += 1;
+        } else {
+            lives[i].quick = 0;
+        }
+        match (this.strategy) {
+            Strategy.OneForAll => { return Err(Halt.Restart); }
+            Strategy.OneForOne => {
+                lives[i].dueMs = now + pauseFor(lives[i].quick) + 1;
+                return Ok();
+            }
+        }
+    }
+}

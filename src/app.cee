@@ -392,7 +392,7 @@ public struct App<S: Send + Share> {
     ) -> Result<ServerReport, NetError> {
         let httpLimits = this.httpLimits;
         let app = applicationOf(this)?;
-        let service = Service { app: app, httpLimits: httpLimits };
+        let service = Serving { app: app, httpLimits: httpLimits };
         return await ConnectionServer.run(incoming, acceptor, service, limits, drain);
     }
 
@@ -410,7 +410,7 @@ public struct App<S: Send + Share> {
     ) -> Result<ServerReport, NetError> {
         let httpLimits = this.httpLimits;
         let app = applicationOf(this)?;
-        let boxed: Box<dyn ConnectionHandler + Send + Share> = match (Box.create(Service {
+        let boxed: Box<dyn ConnectionHandler + Send + Share> = match (Box.create(Serving {
             app: app,
             httpLimits: httpLimits,
         })) {
@@ -443,12 +443,12 @@ public fn applicationOf<S: Send + Share>(app: App<S>) -> Result<Arc<Box<dyn Appl
 }
 
 /// An application served over HTTP/1.1 and HTTP/2: the protocol is chosen per connection.
-struct Service {
+struct Serving {
     app: Arc<Box<dyn Application + Send + Share>>;
     httpLimits: Limits;
 }
 
-impl ConnectionHandler for Service {
+impl ConnectionHandler for Serving {
     async fn serve(
         borrow this,
         conn: borrow mut dyn Transport,

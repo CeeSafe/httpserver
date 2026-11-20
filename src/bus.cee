@@ -99,6 +99,18 @@ public struct Bus {
         }
         return Ok(BusPort { bus: this, mine: mine, cursors: cursors, next: 0, lost: 0 });
     }
+
+    /// A reading end for worker `worker` that leaves its ring as it is: for a reader started again in the same
+    /// process (`BusCarrier`), while the worker's handlers go on publishing in its ring. It starts reading the others
+    /// where they are now.
+    public fn reader(this, worker: u32) -> Result<BusPort, AllocError> {
+        var cursors = Vector<u64>.create();
+        cursors.reserve(this.rings as usize)?;
+        for (r in 0..this.rings) {
+            cursors.push(this.word(r, 0).load())?;
+        }
+        return Ok(BusPort { bus: this, mine: worker % this.rings, cursors: cursors, next: 0, lost: 0 });
+    }
 }
 
 /// A message's sender and topic; its bytes are in the vector given to `poll`.
@@ -234,5 +246,40 @@ public async fn carry<T, K: BusSink>(port: borrow mut BusPort, sink: borrow K, e
             Ok() => {}
             Err(e) => { return Err(NetErrors.fromAsync(e)); }
         }
+    }
+}
+
+/// The reading of the bus as a `Service` (services.cee), for a `Services` supervisor to start: each start reads from
+/// where the rings are now (`Bus.reader`) and gives `sink` what the other workers publish, every `everyMs`, until the
+/// drain. A sink that traps ends that start alone, and the supervisor starts it again; what was published between
+/// the two is not delivered, as for a worker started again.
+public struct BusCarrier<K: BusSink> {
+    public bus: Bus;
+    public worker: u32;
+    public sink: K;
+    public everyMs: u64;
+}
+
+impl<K: BusSink> Service for BusCarrier<K> {
+    async fn run(borrow this, drain: Drain) -> Result<void, NetError> {
+        var port = match (this.bus.reader(this.worker)) {
+            Ok(p) => p,
+            Err(_) => { return Err(NetError.OutOfMemory); },
+        };
+        let reading = borrow mut port;
+        let sink = borrow this.sink;
+        let draining = borrow drain;
+        let every = this.everyMs;
+        let r: Result<Raced<u8>, NetError> = await Async.race(
+            async move () => await carry<u8, K>(reading, sink, every),
+            async move () => {
+                await draining.wait()?;
+                return Ok(0u8);
+            },
+        );
+        return match (r) {
+            Ok(_) => Ok(),
+            Err(e) => Err(e),
+        };
     }
 }

@@ -1,0 +1,168 @@
+// Services, the supervisor of a worker's long-lived tasks (docs/elixir-gaps.md §3): a start that traps is started
+// again, a transient one that returns is not, past the intensity the supervisor gives up, and one for all starts a
+// sibling again.
+import web_core;
+
+/// A service that counts its starts, traps in those listed in `traps` (bit n: start n, from 0), and otherwise runs
+/// until the drain or returns at once (`returns`).
+struct Counted {
+    starts: Arc<AtomicU64>;
+    traps: u64;
+    returns: bool;
+}
+
+impl Service for Counted {
+    async fn run(borrow this, drain: Drain) -> Result<void, NetError> {
+        let n = this.starts.get().fetchAdd(1);
+        if (n < 64 && (this.traps >> n) & 1 == 1) {
+            let small = [0u8; 2];
+            let at = truncate<usize>(n) + 2;
+            let _ = small[at]; // out of bounds: the start traps
+        }
+        if (this.returns) {
+            return Ok();
+        }
+        return await drain.wait();
+    }
+}
+
+fn counter() -> Result<Arc<AtomicU64>, TestFailure> => alloc(Arc<AtomicU64>.create(AtomicU64.create(0)));
+
+fn counted(starts: borrow Arc<AtomicU64>, traps: u64, returns: bool) -> Result<Box<dyn Service + Send + Share>, TestFailure> {
+    let b: Box<dyn Service + Send + Share> = alloc(Box.create(Counted { starts: starts.clone(), traps: traps, returns: returns }))?;
+    return Ok(b);
+}
+
+/// Waits, a little at a time, for `starts` to reach `n` (at most two seconds); then starts `drain` and gives the
+/// count.
+async fn until(starts: borrow Arc<AtomicU64>, n: u64, drain: borrow Drain) -> Result<u64, NetError> {
+    for (k in 0u32..400) {
+        let _ = k;
+        if (starts.get().load() >= n) {
+            break;
+        }
+        match (await Timer.sleep(5)) {
+            Ok() => {}
+            Err(_) => { return Err(NetError.Cancelled); }
+        }
+    }
+    // A little longer, for a start that should not come.
+    match (await Timer.sleep(100)) {
+        Ok() => {}
+        Err(_) => { return Err(NetError.Cancelled); }
+    }
+    drain.start();
+    return Ok(starts.get().load());
+}
+
+/// Runs `services` against `until(starts, n)`; the count of starts the waiter saw, or the supervisor's error.
+async fn supervised(services: borrow Services, starts: borrow Arc<AtomicU64>, n: u64) -> Result<u64, NetError> {
+    let drain = Drain.create()?;
+    let d = borrow drain;
+    let r: Result<Raced<u64>, NetError> = await Async.race(
+        async () => await services.run<u64>(d),
+        async () => await until(starts, n, d),
+    );
+    return match (r) {
+        Ok(raced) => Ok(raced.value),
+        Err(e) => Err(e),
+    };
+}
+
+fn often() -> Intensity => Intensity { restarts: 5, withinMs: 10000 };
+
+/// A start that traps is started again, and the second runs.
+@test
+async fn aServiceThatTrapsIsStartedAgain() -> Result<void, TestFailure> {
+    let starts = counter()?;
+    var services = Services.create(Strategy.OneForOne, often());
+    let _ = alloc(services.add("trapping once", counted(borrow starts, 1, false)?, Restart.Permanent))?;
+    let events = alloc(services.watch(16))?;
+    match (await supervised(borrow services, borrow starts, 2)) {
+        Ok(n) => { Check.equalU64(2, n)?; }
+        Err(_) => { return Err(TestFailure.create("the supervisor failed")); }
+    }
+    // Started, crashed (out of bounds), started.
+    var started: u64 = 0;
+    var crashed: u64 = 0;
+    loop {
+        let event = events.tryRecv() ?? { break; };
+        match (event) {
+            ServiceEvent.Started(id) => {
+                Check.equalU64(0, id as u64)?;
+                started += 1;
+            }
+            ServiceEvent.Crashed(id, kind) => {
+                Check.equalU64(0, id as u64)?;
+                Check.isTrue(kind == PanicKind.Index, "an index out of bounds")?;
+                crashed += 1;
+            }
+            _ => {}
+        }
+    }
+    Check.equalU64(2, started)?;
+    Check.equalU64(1, crashed)?;
+    Check.isTrue(services.name(0) == Some("trapping once"), "its name")?;
+    return Ok();
+}
+
+/// A transient service that returns Ok is not started again; a permanent one is.
+@test
+async fn aTransientServiceThatReturnsIsDone() -> Result<void, TestFailure> {
+    let once = counter()?;
+    var transient = Services.create(Strategy.OneForOne, often());
+    let _ = alloc(transient.add("transient", counted(borrow once, 0, true)?, Restart.Transient))?;
+    match (await supervised(borrow transient, borrow once, 2)) {
+        Ok(n) => { Check.equalU64(1, n)?; }
+        Err(_) => { return Err(TestFailure.create("the supervisor failed")); }
+    }
+    let again = counter()?;
+    var permanent = Services.create(Strategy.OneForOne, often());
+    let _ = alloc(permanent.add("permanent", counted(borrow again, 0, true)?, Restart.Permanent))?;
+    match (await supervised(borrow permanent, borrow again, 2)) {
+        Ok(n) => { Check.isTrue(n >= 2, "started again after it returned")?; }
+        Err(_) => { return Err(TestFailure.create("the supervisor failed")); }
+    }
+    return Ok();
+}
+
+/// A service that always traps is started again up to the intensity; at the next end the supervisor gives up.
+@test
+async fn pastTheIntensityTheSupervisorGivesUp() -> Result<void, TestFailure> {
+    let starts = counter()?;
+    var services = Services.create(Strategy.OneForOne, Intensity { restarts: 2, withinMs: 60000 });
+    let _ = alloc(services.add("always trapping", counted(borrow starts, 0xFFFFFFFFFFFFFFFF, false)?, Restart.Permanent))?;
+    let events = alloc(services.watch(16))?;
+    match (await supervised(borrow services, borrow starts, 100)) {
+        Ok(_) => { return Err(TestFailure.create("the supervisor went on")); }
+        Err(NetError.LimitExceeded) => {}
+        Err(_) => { return Err(TestFailure.create("another error than LimitExceeded")); }
+    }
+    Check.equalU64(3, starts.get().load())?; // the first start and two restarts
+    var gaveUp = false;
+    loop {
+        let event = events.tryRecv() ?? { break; };
+        match (event) {
+            ServiceEvent.GaveUp(id) => { gaveUp = id == 0; }
+            _ => {}
+        }
+    }
+    Check.isTrue(gaveUp, "told GaveUp")?;
+    return Ok();
+}
+
+/// One for all: when one service traps, its sibling is cancelled and started again with it.
+@test
+async fn oneForAllStartsTheSiblingAgain() -> Result<void, TestFailure> {
+    let trapping = counter()?;
+    let sibling = counter()?;
+    var services = Services.create(Strategy.OneForAll, often());
+    let _ = alloc(services.add("trapping once", counted(borrow trapping, 1, false)?, Restart.Permanent))?;
+    let _ = alloc(services.add("sibling", counted(borrow sibling, 0, false)?, Restart.Permanent))?;
+    match (await supervised(borrow services, borrow sibling, 2)) {
+        Ok(n) => { Check.equalU64(2, n)?; }
+        Err(_) => { return Err(TestFailure.create("the supervisor failed")); }
+    }
+    Check.equalU64(2, trapping.get().load())?;
+    return Ok();
+}

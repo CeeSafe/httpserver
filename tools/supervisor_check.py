@@ -5,10 +5,13 @@ others keep answering, and a SIGTERM to the supervisor ends them all.
 usage: python3 tools/supervisor_check.py [--port 18490] [--procs 3] [--memory-mb 0] [--budget-mb 0] [--isolated]
        (after `ceesafec build` in bench/)
 
+Then, in either mode, the worker's services (src/services.cee) on ports --port + 2: a scheduled job that traps is
+started again by its `Services` supervisor, and one that traps at every run makes it give up and the worker end.
+
 --isolated serves each connection in an isolated task (CW_ISOLATED=1): a trap then costs its connection and no
 worker, and a worker whose tasks have trapped twice (CW_RECYCLE_CRASHES=2) drains and is started again. Two of its
 traps hold a lock: the output cache's, then the gzip encoder's. The next uses repair and heal them, the cache's from
-the bus's `carry` (CW_BUS=1), outside any isolated task, where a panic would end the worker. Those two traps are
+the bus's reading (CW_BUS=1), a service of the worker's `Services`. Those two traps are
 hooks only a build with the C macro HTTPSERVER_TRAP_HOOKS has. --isolated also bounds how long a request may compute
 without waiting (CW_RUN_BOUND_MS=250, ceesafec ADR 0186), which needs polls compiled in (CEE_POLLS): a request that
 spins then traps with `Overran` and costs its connection, and its worker, not stalled, answers the others meanwhile.
@@ -27,10 +30,10 @@ args.add_argument("--inherit", action="store_true")
 args.add_argument("--isolated", action="store_true")
 a = args.parse_args()
 
-def get(path, timeout=3.0):
+def get(path, timeout=3.0, port=None):
     """(status, body), or None if the connection failed or timed out."""
     try:
-        c = http.client.HTTPConnection("127.0.0.1", a.port, timeout=timeout)
+        c = http.client.HTTPConnection("127.0.0.1", port or a.port, timeout=timeout)
         c.request("GET", path)
         r = c.getresponse()
         body = r.read()
@@ -95,8 +98,8 @@ try:
 
     if a.isolated:
         # A trap holding the cache's lock. `/bus/forget/7`, answered by another worker, reaches the one whose lock
-        # is poisoned through the bus, outside any isolated task: it empties the table and heals the lock, where a
-        # panic would end that worker. Then `/forget/7` forgets in the request too.
+        # is poisoned through the bus, in its bus service: it empties the table and heals the lock, where a panic
+        # would cost a start of that service. Then `/forget/7` forgets in the request too.
         kept = [get("/kept/7") for _ in range(30)]
         expect("kept: /kept/7 is answered", all(r is not None and r[0] == 200 for r in kept))
         expect("lock 1: the request that traps holding the cache's lock gets no answer", get("/crash/kept") is None)
@@ -191,7 +194,7 @@ lines = text.split("\n")
 report = lines[lines.index("bench: started, crashed, stalled, killed") + 1:][:4] if "bench: started, crashed, stalled, killed" in lines else []
 if a.isolated:
     # Seven traps over three workers (two of them holding a lock) and two requests ended by the run bound: at least
-    # one worker took two and was replaced, none crashed, not even in the bus's `carry`, and none stalled or was killed.
+    # one worker took two and was replaced, none crashed, and none stalled or was killed.
     recycled = text.count("passed the bound: draining, to be replaced")
     overran = text.count("past its bound of 250 ms")
     expect(f"the report counts no crash, no stall and no kill ({report})",
@@ -201,6 +204,63 @@ if a.isolated:
     expect(f"a worker whose tasks trapped twice was replaced ({recycled})", recycled >= 1 and int(report[0]) >= 5)
 else:
     expect(f"the report counts 5 crashes and 1 stall ({report})", len(report) == 4 and report[1] == "5" and report[2] == "1")
+
+# Services (src/services.cee): one worker whose scheduler (CW_JOBS=1) runs a job every second under its `Services`
+# supervisor. A job that traps ends that start of the scheduler alone: the worker answers on, the scheduler is started
+# again and the job runs again. A job that traps at every run is then restarted until three restarts lie within 30 s,
+# and at the next end the supervisor gives up: the worker ends, and the process supervisor starts it again, with a job
+# that runs.
+print("--- services: one worker, CW_JOBS=1, CW_SERVICE_RESTARTS=3")
+sport = a.port + 2
+senv = dict(os.environ, CW_PORT=str(sport), CW_PROCS="1", CW_STALL_MS="1500", CW_JOBS="1", CW_SERVICE_RESTARTS="3")
+if a.inherit:
+    senv["CW_INHERIT"] = "1"
+slog_path = "/tmp/supervisor_check_services.log"
+slog = open(slog_path, "w")
+proc = subprocess.Popen([str(binary)], env=senv, stdout=slog, stderr=subprocess.STDOUT)
+
+def runs():
+    r = get("/job", port=sport)
+    return int(r[1]) if r is not None and r[0] == 200 else -1
+
+def wait_for(test, seconds):
+    end = time.time() + seconds
+    while time.time() < end:
+        if test():
+            return True
+        time.sleep(0.1)
+    return test()
+
+try:
+    time.sleep(1.0)
+    expect("services: the job runs", wait_for(lambda: runs() >= 2, 5.0))
+    before = runs()
+    expect("services: the job is told to trap at its next run", get("/job/trap/1", port=sport) == (200, b"ok"))
+    expect("services: the job runs again after its trap, the scheduler started again",
+           wait_for(lambda: runs() >= before + 2, 6.0))
+    expect("services: the worker answered throughout",
+           all(get("/small", port=sport) == (200, b"hello, world\n") for _ in range(20)))
+    expect("services: the job is told to trap at every run", get("/job/trap/2", port=sport) == (200, b"ok"))
+    gave_up = wait_for(lambda: "a service restarted too often" in open(slog_path).read(), 15.0)
+    expect("services: past the intensity the supervisor gives up and the worker ends", gave_up)
+    time.sleep(1.0)
+    expect("services: the worker started in its place answers",
+           wait_for(lambda: get("/small", port=sport) == (200, b"hello, world\n"), 5.0))
+    expect("services: and its job runs", wait_for(lambda: runs() >= 1, 5.0))
+    proc.send_signal(signal.SIGTERM)
+    code = proc.wait(10)
+    expect(f"services: the supervisor ends on SIGTERM (status {code})", code == 0)
+finally:
+    if proc.poll() is None:
+        proc.kill()
+slog.close()
+text = open(slog_path).read()
+lines = text.split("\n")
+report = lines[lines.index("bench: started, crashed, stalled, killed") + 1:][:4] if "bench: started, crashed, stalled, killed" in lines else []
+expect(f"services: one worker replaced, as a crash, no stall, no kill ({report})", report == ["2", "1", "0", "0"])
+# Four traps: the one asked for once, restarted (one restart within the 30 s), then three at every run, restarted
+# twice more; at the third the restarts would pass three, and the supervisor gives up.
+expect(f"services: each of the job's traps ended alone ({text.count('ended alone)')} of 4)", text.count("ended alone)") == 4)
 
 if a.isolated:
     # The bound on one event loop: a single worker, which a crash does not recycle. A request on a second connection

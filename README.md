@@ -290,7 +290,18 @@ HTTP/3, give `applicationOf(app)` to `web_http3`'s server. Both are CeeSafe.Web'
   expression is parsed once into bit sets and asked for its next time, so an idle scheduler does one comparison a
   job each second. Jobs run one at a time on the server's event loop; one that is late runs once, not once for each
   time it missed. `jobs.run` is raced against the server as `tend` is, and stops running jobs when the drain
-  starts. Under the supervisor, start it in one worker (`worker.index() == 0`).
+  starts; or `jobs.service()` gives it to a `Services` supervisor (below), so a job that traps costs one start of
+  the scheduler, not the worker. Under the supervisor, start it in one worker (`worker.index() == 0`).
+- **Services: a supervisor for a worker's long-lived tasks** (`src/services.cee`, docs/elixir-gaps.md §3). A
+  `Service` runs until the drain; `Services.add(name, service, restart)` takes it, and `services.run` is raced
+  beside the server as `tend` is. Each start of a service is an isolated task (ceesafec ADR 0175): a trap ends that
+  start alone, and the service is started again after a pause that grows while it keeps ending at once
+  (`Restart.Permanent`; `Transient` only after a trap or an `Err`; `Temporary` never). `Strategy.OneForAll`
+  starts them all again together. Past an `Intensity` (so many restarts within so long) `run` gives up with
+  `NetError.LimitExceeded`, the worker ends, and the process supervisor starts it again: the next level of the
+  tree. `services.watch(n)` is a channel of `ServiceEvent`s (started, crashed, returned, gave up). The scheduler
+  (`Scheduler.service`) and the bus's reading (`BusCarrier`, which reads from `Bus.reader` in each start) are
+  services; `tend` is not, since it is what beats and drains.
 - **Static files** (`static/`): `Files<S>.create(root, FilesOptions.defaults())` is a handler for GET and HEAD
   that serves the regular files under `root`. The path is decoded once and checked lexically (a refused path, a
   FIFO or a device is 404), the validators are read from the open file, conditional requests and one range are

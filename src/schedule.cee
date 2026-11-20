@@ -347,7 +347,8 @@ fn noTime() -> i64 => 0x7FFFFFFFFFFFFFFF;
 
 /// One job and when it runs next.
 struct Entry {
-    job: Box<dyn Job + Send + Share>;
+    /// Shared, so that each start of the scheduler as a service (`Scheduler.service`) runs the same jobs.
+    job: Arc<Box<dyn Job + Send + Share>>;
     cron: Cron;
     /// The interval of a job that has one; 0 for a cron job.
     everyMs: u64;
@@ -371,8 +372,12 @@ public struct Scheduler {
 
     fn add(borrow mut this, job: Box<dyn Job + Send + Share>, cron: Cron, everyMs: u64) -> Result<u32, ScheduleError> {
         let id = truncate<u32>(this.jobs.length);
+        let shared = match (Arc<Box<dyn Job + Send + Share>>.create(job)) {
+            Ok(a) => a,
+            Err(_) => { return Err(ScheduleError.OutOfMemory); },
+        };
         let entry = Entry {
-            job: job,
+            job: shared,
             cron: cron,
             everyMs: everyMs,
             nextAt: unknownTime(),
@@ -456,7 +461,7 @@ public struct Scheduler {
                 continue;
             }
             let began = nowMs();
-            let failed = (await this.jobs[i].job.run(at)).isErr();
+            let failed = (await this.jobs[i].job.get().run(at)).isErr();
             this.jobs[i].report.runs += 1;
             if (failed) {
                 this.jobs[i].report.failures += 1;
@@ -493,5 +498,53 @@ public struct Scheduler {
                 Err(e) => { return Err(NetErrors.fromAsync(e)); }
             }
         }
+    }
+
+    /// The scheduler as a `Service` (services.cee), for a `Services` supervisor to start: a job that traps then ends
+    /// that start of the scheduler alone, and the supervisor starts it again. Each start runs the same jobs from a
+    /// fresh schedule: an interval job's first run is one interval after the start, and the reports begin again.
+    public fn service(this) -> Result<Box<dyn Service + Send + Share>, AllocError> {
+        let b: Box<dyn Service + Send + Share> = Box.create(Scheduled { jobs: this.jobs, zone: this.zone })?;
+        return Ok(b);
+    }
+}
+
+/// `Scheduler.service`: the jobs and their schedules, from which each start makes a scheduler of its own.
+struct Scheduled {
+    jobs: Vector<Entry>;
+    zone: Zone;
+}
+
+impl Service for Scheduled {
+    /// Runs the jobs as they come due until `drain` starts.
+    async fn run(borrow this, drain: Drain) -> Result<void, NetError> {
+        var scheduler = Scheduler.create(this.zone);
+        for (i in 0..this.jobs.length) {
+            let entry = Entry {
+                job: this.jobs[i].job.clone(),
+                cron: this.jobs[i].cron,
+                everyMs: this.jobs[i].everyMs,
+                nextAt: unknownTime(),
+                nextMs: 0,
+                started: false,
+                report: JobReport { runs: 0, failures: 0, lastAt: 0, lastMs: 0 },
+            };
+            if (scheduler.jobs.push(entry).isErr()) {
+                return Err(NetError.OutOfMemory);
+            }
+        }
+        let running = borrow mut scheduler;
+        let draining = borrow drain;
+        let r: Result<Raced<u8>, NetError> = await Async.race(
+            async move () => await running.run<u8>(draining),
+            async move () => {
+                await draining.wait()?;
+                return Ok(0u8);
+            },
+        );
+        return match (r) {
+            Ok(_) => Ok(),
+            Err(e) => Err(e),
+        };
     }
 }
