@@ -1,7 +1,8 @@
 # Where Elixir's isolation is still ahead, and the plan to close it
 
-Status: **proposed**, 2026-11-20, for the owner to review together with CeeSafe ADRs 0189 and 0190 and CeeSafe.Web
-ADR 0017 ("Draft ADRs for all gaps"). Nothing here is implemented. It starts from httpserver at ceesafec 0.80.0:
+Status: **accepted** by the owner, 2026-11-20 ("I accept all the above ADRs as written", together with CeeSafe ADRs
+0189 and 0190 and CeeSafe.Web ADR 0017; §6's questions as recommended). Proposed the same day ("Draft ADRs for all
+gaps"). Implementation notes: §7. It starts from httpserver at ceesafec 0.80.0:
 isolated connections and streams (ceesafec ADR 0175, Web ADR 0016), request budgets (ADR 0170), and a bound on how
 long a task runs without waiting (ADR 0186), on branch `adr0186-run-bound`.
 
