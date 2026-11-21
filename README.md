@@ -202,9 +202,9 @@ polls = true              # the bound on a request that computes without waiting
 
 [dependencies]
 httpserver = { git = "https://github.com/CeeSafe/httpserver.git", rev = "<a commit of this repository>" }
-web_core = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "9c38d143e2601c260c37a90eaeae8e308ea40188", dir = "packages/web_core" }
-web_transport = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "9c38d143e2601c260c37a90eaeae8e308ea40188", dir = "packages/web_transport" }
-web_http = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "9c38d143e2601c260c37a90eaeae8e308ea40188", dir = "packages/web_http" }
+web_core = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "1b77e9779feee1f90732ff8450a3a0406ad3dbe4", dir = "packages/web_core" }
+web_transport = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "1b77e9779feee1f90732ff8450a3a0406ad3dbe4", dir = "packages/web_transport" }
+web_http = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "1b77e9779feee1f90732ff8450a3a0406ad3dbe4", dir = "packages/web_http" }
 ```
 
 The other packages are directories of this repository: add `dir`, as in
@@ -500,8 +500,11 @@ first checked by CeeSafe.Web's `conform.py`; the full tables, the method and the
   1 000 crashes a second with per-request isolation, httpserver's healthy p99 and p99.9 are 1.7 and 6.5 ms against
   Bandit's 1.8 and 5.2. httpserver replaces a worker every 100 crashes, and a draining worker still answers its idle
   connections' next request (CeeSafe.Web's Web ADR 0019), so 22 healthy requests in 100 000 were retried on a new
-  connection, where Bandit retried none. That recycling is what a garbage-collected heap does not need, and the gap
-  that is left.
+  connection, where Bandit retried none. An independent benchmark on one core found what those were: the request
+  read in the very turn the drain began was dropped, and on Linux it then waited out the linger, a second. Web ADR
+  0021 keeps it: one worker at 200 crashes a second, healthy p99 805 ms before and 6.2 ms after
+  ([docs/elixir-benchmark.md](docs/elixir-benchmark.md)). That recycling is what a garbage-collected heap does not
+  need, and the gap that is left.
 - **Requests that compute beside them** (four, 100 ms at a time): healthy p99 and p99.9 1.5 and 3.1 ms under the
   2 ms slice, against Bandit's 3.8 and 9.5 ms. Two requests that never end cost neither server anything measurable.
 

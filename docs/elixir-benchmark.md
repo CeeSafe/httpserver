@@ -171,6 +171,42 @@ others about what it costs under Bandit, and a computing neighbour costs them le
 the crash's memory goes: Bandit frees it with the process, and httpserver replaces the worker every 100 crashes,
 which now costs a handful of retried requests rather than one or two in a hundred.
 
+## An independent benchmark, and CeeSafe.Web's Web ADR 0021 (2026-11-21)
+
+An independent benchmark (not in this repository) ran httpserver at `f44fc0d` against Bandit and Cowboy on Linux,
+each server on one core, under an open-loop healthy load of 3 000 requests a second over 30 keep-alive
+connections, with its own load client written in Go. httpserver ran under the supervisor with one worker.
+
+- **Speed and memory, as here:** HTTP/1.1 85 000 to 94 000 requests a second against Bandit's 20 000 to 21 000
+  and Cowboy's 13 000 to 16 000; h2c 3.8 to 6.4 times Bandit's; 5 MiB idle against 133.
+- **Memory a request takes** (two requests a second that each hold 256 MiB): with `app.budget(64 MiB)` the healthy
+  p99 was 1.8 ms, and without a budget 154 ms. Bandit's was 33 s, and it died in one run of two; Cowboy's was 116 s.
+- **Crashes: a second's tail.** At 20, 200 and 1 000 crashes a second, and with one, two or four workers, the healthy
+  p99 was 0.8 to 0.9 s and the p99.9 1.0 s, against Bandit's 3.5 to 4.4 ms p99, and every worst case was 1 000 ms.
+
+The tail was not recycling itself. Reproduced on the Xeon above, `bench` with one worker pinned to one core, with a
+probe that logs each slow request beside the server's lines: at every replacement, the one request a client sent in
+the turn the drain began was taken from its socket and dropped, and the connection closed when Web ADR 0019's
+linger ended, a second later. The idle read was raced against the drain, and when both finished in one turn of the
+executor the drain's error decided the race and the bytes were lost (on Linux's epoll; not on macOS). Before Web ADR
+0019 that connection closed at once, and the request was sent again: the 1.2 to 1.5 % of healthy requests retried
+above, and the 22 left after it, were most likely the same loss. Web ADR 0021 keeps a value that comes in the drain's
+turn, for the idle read and for the accept loops (`drainBegun`, `drainTaken`).
+
+The probe, before → after, at 3 000 healthy requests a second over 30 connections (10 to 12 s each):
+
+| | healthy p99 | p99.9 | worst | requests over 100 ms |
+|---|---|---|---|---|
+| 20 crashes/s (three runs) | 0.4 → 0.3 ms | 823 → 2.0 to 4.3 ms | 1 003 → 7 to 12 ms | 182 → 0 |
+| 200 crashes/s | 805 → 6.2 ms | 988 → 13.5 ms | 1 007 → 18 ms | 1 292 → 0 |
+| 1 000 crashes/s | 767 → 13.2 ms | 987 → 18.4 ms | 1 015 → 24 ms | 958 → 0 |
+| 200 crashes/s, per-request isolation | 675 → 0.4 ms | 973 → 1.4 ms | 1 003 → 3 ms | 787 → 0 |
+
+The same benchmark also measured two costs that remain. Per-request isolation serves 30 to 40 % fewer HTTP/1.1
+requests a second than isolation per connection (57 000 against 90 000 on one core). Beside two requests that
+compute for 200 ms at a time, the 2 ms slice makes the healthy median 2.4 ms against Bandit's 0.8, a slice's wait,
+with the p99 the same (5 ms).
+
 ## Measurement notes
 
 - h2load is not used under faults: when the server closes connections under it, as a worker being replaced does, it
