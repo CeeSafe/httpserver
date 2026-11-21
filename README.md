@@ -13,7 +13,7 @@ port of CosmoApiServer (.NET) by what it does, not line by line. There is no gar
 install: a server is one native program, which answers about 100 000 small requests a second on one core in 8 to
 22 MB of memory ([Measured](#measured)).
 
-**Status:** version 0.2.0, on ceesafec 0.83.0. `App.run` serves each connection in an isolated task (a trap costs
+**Status:** version 0.2.0, on ceesafec 0.84.1. `App.run` serves each connection in an isolated task (a trap costs
 the connection, not the worker); `app.isolateRequests(true)` isolates each HTTP/1.1 request, answering 500 for one
 that traps; a request that computes is paused every 2 ms slice so its neighbours run, and ended past a bound of 30 s
 (ceesafec ADRs 0186, 0189 and 0191, in a build with `polls = true`). How that compares with Elixir's process
@@ -39,7 +39,7 @@ and macOS; the supervisor is POSIX only.
 
 You need:
 
-- `ceesafec` 0.83.0 or later ([releases](https://github.com/CeeSafe/CeeSafe/releases), or the
+- `ceesafec` 0.84.1 or later ([releases](https://github.com/CeeSafe/CeeSafe/releases), or the
   [guide](https://ceesafe.github.io/CeeSafe/)'s installation page) and a C compiler (`cc`);
 - for `auth/` only, OpenSSL's libcrypto; for `compress/` only, libzstd and libbrotli
   (`brew install zstd brotli`; `apt install libzstd-dev libbrotli-dev`). The core package needs no C library.
@@ -197,7 +197,7 @@ name = "myserver"
 version = "0.1.0"
 kind = "executable"
 sources = ["src"]
-ceesafec = ">=0.83.0"
+ceesafec = ">=0.84.1"
 polls = true              # the bound on a request that computes without waiting (below)
 
 [dependencies]
@@ -621,8 +621,8 @@ python3 tools/ws_check.py         # the hub, with WebSocket clients written from
 python3 tools/ws_check.py --workers 4   # the same over four workers and the bus (add --inherit on macOS)
 ```
 
-The compiler: ceesafec 0.83.0 or later, whose executor runs the tasks woken behind a paused one first and keeps a busy
-worker's timers running (ADR 0191); `Async.runSlice` (ADR 0189) and `polls = true` in a manifest (ADR 0190) came with
+The compiler: ceesafec 0.84.1 or later, whose bound counts the time a sliced request ran (ADR 0193), and whose
+executor runs the tasks woken behind a paused one first and keeps a busy worker's timers running (ADR 0191, 0.83.0); `Async.runSlice` (ADR 0189) and `polls = true` in a manifest (ADR 0190) came with
 0.82.0, `Async.runBound` (ADR 0186), which `run` sets, with 0.80.0. Isolated tasks (ADR 0175), which `app.run` serves connections in,
 came with 0.75.0; `Process.spawnWith` and `SharedMemory.anonymous` (ADR 0173, 0.73.1) start the workers and hand them
 what they share; `Budget`, for a request's memory, came with 0.70.0; and the stock middleware are impls for every

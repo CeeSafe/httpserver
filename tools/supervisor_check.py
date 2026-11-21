@@ -245,7 +245,11 @@ if isolated:
            len(report) == 4 and report[1] == "0" and report[2] == "0" and report[3] == "0")
     expect(f"each trap ended alone ({text.count('ended alone)')} of 9)", text.count("ended alone)") == 9)
     expect(f"the two spins were ended by the run bound ({overran} of 2)", overran == 2)
-    expect(f"a worker whose tasks trapped twice was replaced ({recycled})", recycled >= 1 and int(report[0]) >= 5)
+    # How many are replaced depends on where the traps land, and a draining worker still serves its idle connections'
+    # next request for a while (CeeSafe.Web's Web ADR 0019), so traps it takes replace no one: at least one, and each
+    # counted once among the workers started.
+    expect(f"a worker whose tasks trapped twice was replaced ({recycled})",
+           recycled >= 1 and len(report) == 4 and int(report[0]) == a.procs + recycled)
 else:
     expect(f"the report counts 5 crashes and 1 stall ({report})", len(report) == 4 and report[1] == "5" and report[2] == "1")
 

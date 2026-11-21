@@ -275,6 +275,11 @@ from 19 439 requests a second with workers killed to 74 521 with none, and a hea
 computing ones from 69 ms (9.9 s with per-request isolation) to 9.8 ms (4.6 ms). The check above that failed on
 macOS's CI under 0.82.0 (a median of 0.232 s beside `/spin`) is the first symptom.
 
+ceesafec 0.84.1 (ADR 0193) makes the bound mean what it says under a slice. It counted a sliced resume's slices times
+the slice, and the monitor sees every slice late, so with `App`'s default slice lowered from 10 to 2 ms a 250 ms bound
+ended a spin on macOS's CI after 1.5 s, past the supervisor's stall. The time a resume ran is now measured at each
+pause: the same check ends it after 0.26 s here, where 0.84.0 took 0.39 s.
+
 ## What ceesafec 0.65.1 to 0.71.0 changed
 
 Released 2026-11-18 from these findings and httpclient's. 0.65.1 fixed S1, S6 and S13. 0.67.0 carries three ADRs:

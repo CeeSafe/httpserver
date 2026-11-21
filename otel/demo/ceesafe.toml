@@ -3,7 +3,7 @@ name = "otel_demo"
 version = "0.1.0"
 kind = "executable"
 sources = ["src"]
-ceesafec = ">=0.83.0"
+ceesafec = ">=0.84.1"
 polls = true                   # ADR 0190: `App.run`'s bound sees a request that computes without waiting
 
 [dependencies]
