@@ -126,6 +126,13 @@ fn main() {
     let port = portFrom("CW_PORT", 8080);
     var dev: ViteDevServer? = null;
     if (mode == FrontendMode.Development) {
+        // Said at once: Vite's first start, or one after its config changed, optimizes the dependencies first, and
+        // the server listens only once Vite takes connections, seconds later.
+        Console.write("vite_app: starting vp dev in frontend/ on port ");
+        Console.write(options.devPort);
+        Console.writeLine(" (up to 30 s)");
+        Console.flush();
+        let since = Timer.now();
         var started = match (ViteDevServer.start(options)) {
             Ok(d) => d,
             Err(_) => { fail("vite_app: could not start vp dev (is Vite+ installed, and vp on the PATH?)"); },
@@ -135,6 +142,9 @@ fn main() {
             Async.run(stopped(mut started));
             fail("vite_app: vp dev did not start within 30 s (run vp install in frontend/)");
         }
+        Console.write("vite_app: vp dev is up after ");
+        Console.write(Timer.now() - since);
+        Console.writeLine(" ms");
         dev = Some(started);
     }
     let listen = ListenOptions { backlog: 0, reuseAddress: true, reusePort: false, v6Only: false };
