@@ -1,0 +1,159 @@
+// An API and its Vue frontend on one origin (httpserver_vite): the page calls `/api/hello` with no CORS.
+//
+//   cd frontend && vp install && cd ..                  once
+//   ceesafec build && HTTPSERVER_FRONTEND=dev out/vite_app
+//       development: starts `vp dev` beside the server and sends it every path the server does not route; edit
+//       frontend/src and the page in the browser changes (HMR, through the same port)
+//   (cd frontend && vp build) && out/vite_app
+//       built: serves frontend/dist, with index.html for the application's routes
+//
+// Then open http://127.0.0.1:8080. CW_PORT changes the server's port and CW_VITE_PORT the dev server's (5173), and
+// SIGTERM or Ctrl-C ends the server and the dev server together.
+import web_core;
+import web_transport;
+import web_http;
+import httpserver;
+import httpserver_vite;
+
+/// What every request can reach: `ctx.state()`.
+struct Site {
+    greetings: AtomicU64;
+}
+
+/// `GET /api/hello`: what the page shows.
+struct Hello {}
+
+impl Handler<Site> for Hello {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut Context<Site>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        let n = ctx.state().greetings.fetchAdd(1) + 1;
+        var text = [0u8; 96];
+        var w = TextWriter.create(mut text[..]);
+        w.text("{\"message\":\"Hello from httpserver\",\"greetings\":");
+        w.decimal(n);
+        w.text("}\n");
+        return await Reply.json(exchange, Status.ok(), w.written());
+    }
+}
+
+fn application(options: borrow FrontendOptions, mode: FrontendMode) -> App<Site>? {
+    var app = match (App<Site>.create(Site { greetings: AtomicU64.create(0) }, Limits.defaults())) {
+        Ok(a) => a,
+        Err(_) => { return null; },
+    };
+    let hello: Box<dyn Handler<Site> + Send + Share> = match (Box.create(Hello {})) {
+        Ok(b) => b,
+        Err(_) => { return null; },
+    };
+    match (app.get("/api/hello", hello)) {
+        Ok() => {}
+        Err(_) => { return null; }
+    }
+    // Every other path: Vite's dev server, or the built files.
+    match (Frontend.mount(mut app, options, mode)) {
+        Ok() => {}
+        Err(_) => { return null; }
+    }
+    return Some(app);
+}
+
+/// Starts `drain` on SIGTERM or SIGINT; returns only an error, so it can race the server.
+async fn stopOnSignal<T>(drain: borrow Drain) -> Result<T, NetError> {
+    let signals = match (ProcessSignals.subscribe()) {
+        Ok(s) => s,
+        Err(_) => { return Err(NetError.OutOfMemory); },
+    };
+    loop {
+        if (signals.poll().isSome()) {
+            drain.start();
+        }
+        match (await Timer.sleep(100)) {
+            Ok() => {}
+            Err(e) => { return Err(NetErrors.fromAsync(e)); }
+        }
+    }
+}
+
+async fn serve(app: App<Site>, listener: borrow Listener) -> Result<ServerReport, NetError> {
+    let drain = Drain.create()?;
+    return await serveUntil(app, listener, drain);
+}
+
+/// Serves until `drain` finishes, which a signal starts.
+async fn serveUntil(app: App<Site>, listener: borrow Listener, drain: borrow Drain) -> Result<ServerReport, NetError> {
+    let limits = ConnectionLimits.defaults();
+    let acceptor: Box<dyn Acceptor + Send + Share> = match (Box.create(PlainAcceptor {})) {
+        Ok(b) => b,
+        Err(_) => { return Err(NetError.OutOfMemory); },
+    };
+    let r: Result<Raced<ServerReport>, NetError> = await Async.race(
+        async move () => await app.run(listener, acceptor, limits, drain),
+        async move () => await stopOnSignal<ServerReport>(drain),
+    );
+    return match (r) {
+        Ok(raced) => Ok(raced.value),
+        Err(e) => Err(e),
+    };
+}
+
+async fn waitFor(dev: borrow mut ViteDevServer) -> bool => await dev.ready(30000);
+
+/// The port in the environment variable `name`, else `otherwise`.
+fn portFrom(name: StringView, otherwise: u16) -> u16 => match (Environment.variable(name)) {
+    Some(t) => checkedTruncate<u16>(Ascii.parseDecimal(t.bytes()) ?? (otherwise as u64)) ?? otherwise,
+    null => otherwise,
+};
+
+fn fail(message: StringView) -> never {
+    Console.writeLine(message);
+    Process.exit(1);
+}
+
+fn main() {
+    var options = match (FrontendOptions.inDirectory("frontend")) {
+        Ok(o) => o,
+        Err(_) => { fail("vite_app: out of memory"); },
+    };
+    options.devPort = portFrom("CW_VITE_PORT", 5173);
+    let mode = Frontend.mode();
+    let app = application(options, mode) ?? { fail("vite_app: could not build the routes"); };
+    let port = portFrom("CW_PORT", 8080);
+    var dev: ViteDevServer? = null;
+    if (mode == FrontendMode.Development) {
+        var started = match (ViteDevServer.start(options)) {
+            Ok(d) => d,
+            Err(_) => { fail("vite_app: could not start vp dev (is Vite+ installed, and vp on the PATH?)"); },
+        };
+        let up = Async.run(waitFor(mut started));
+        if (!up) {
+            started.stop();
+            fail("vite_app: vp dev did not start within 30 s (run vp install in frontend/)");
+        }
+        dev = Some(started);
+    }
+    let listen = ListenOptions { backlog: 0, reuseAddress: true, reusePort: false, v6Only: false };
+    let listener = match (Listener.bindWith(SocketAddresses.v4Loopback(port), listen)) {
+        Ok(l) => l,
+        Err(e) => { fail(NetErrors.describe(e)); },
+    };
+    Console.write("vite_app: listening on http://127.0.0.1:");
+    Console.writeLine(port);
+    Console.writeLine(
+        if (mode == FrontendMode.Development) "vite_app: the frontend is vp dev's"
+            else "vite_app: the frontend is frontend/dist",
+    );
+    Console.flush();
+    let served = Async.run(serve(app, listener));
+    match (borrow mut dev) {
+        Some(d) => { d.stop(); }
+        null => {}
+    }
+    match (served) {
+        Ok(_) => {}
+        Err(e) => { fail(NetErrors.describe(e)); }
+    }
+}

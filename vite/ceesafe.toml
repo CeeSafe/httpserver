@@ -1,0 +1,17 @@
+[package]
+name = "httpserver_vite"
+version = "0.1.0"
+kind = "library"
+sources = ["src"]
+tests = ["tests"]
+ceesafec = ">=0.84.1"
+
+[dependencies]
+httpserver = { path = ".." }
+httpserver_static = { path = "../static" }   # the built files, with the single-page fallback
+web_core = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "9c38d143e2601c260c37a90eaeae8e308ea40188", dir = "packages/web_core" }
+web_transport = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "9c38d143e2601c260c37a90eaeae8e308ea40188", dir = "packages/web_transport" }   # the tests' mock connection
+web_http = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "9c38d143e2601c260c37a90eaeae8e308ea40188", dir = "packages/web_http" }
+web_http1 = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "9c38d143e2601c260c37a90eaeae8e308ea40188", dir = "packages/web_http1" }   # the tests' driver
+# The development proxy to Vite's dev server: requests relayed, and the HMR WebSocket's upgrade made a tunnel.
+web_proxy = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "9c38d143e2601c260c37a90eaeae8e308ea40188", dir = "packages/web_proxy" }

@@ -1,4 +1,4 @@
-# httpserver CI: check, format and tests of the six packages, the core's also with ASan and UBSan, the builds of the
+# httpserver CI: check, format and tests of the seven packages, the core's also with ASan and UBSan, the builds of the
 # example, the benchmark server and the collector demo, and the checks that run several processes (tools/), on macOS
 # and Linux.
 name: ci
@@ -50,7 +50,7 @@ jobs:
       - name: Check and format
         run: |
           set -e
-          for p in . auth static ws compress otel otel/demo examples/hello examples/shop bench; do
+          for p in . auth static ws compress otel otel/demo vite examples/hello examples/shop examples/vite bench; do
             echo "== $p"
             (cd "$p" && ceesafec fetch && git diff --exit-code -- ceesafe.lock && ceesafec check && ceesafec fmt --check)
           done
@@ -61,7 +61,7 @@ jobs:
         run: |
           set -e
           ceesafec test --cflag -DHTTPSERVER_TRAP_HOOKS=1
-          for p in auth static ws compress otel; do
+          for p in auth static ws compress otel vite; do
             echo "== $p"
             (cd "$p" && ceesafec test)
           done
@@ -72,7 +72,7 @@ jobs:
       - name: Example, benchmark server and collector demo builds
         run: |
           set -e
-          for p in examples/hello examples/shop bench otel/demo; do
+          for p in examples/hello examples/shop examples/vite bench otel/demo; do
             echo "== $p"
             (cd "$p" && ceesafec build)
           done
@@ -113,3 +113,13 @@ jobs:
 
       - name: Spans to a collector
         run: python3 tools/otel_check.py
+
+      # Vite+ (vp), its version from the example frontend's lockfile, for httpserver_vite's check: the built
+      # frontend and `vp dev` behind the server, with its HMR WebSocket, on the API's origin.
+      - name: Install Vite+
+        uses: voidzero-dev/setup-vp@v1.22.0
+        with:
+          working-directory: examples/vite/frontend
+
+      - name: A Vite+ frontend on the API's origin
+        run: python3 tools/vite_check.py

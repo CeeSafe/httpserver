@@ -41,6 +41,7 @@ would restart a node.
 | `Phoenix.PubSub` on one node | `Bus` between the workers of one machine | across machines: a broker |
 | Phoenix Channels, `WebSock` | `httpserver_ws`'s `Hub`: sessions, groups, `broadcast`, `toGroup` | the hub reaches other workers over the bus |
 | `Plug.Static` | `httpserver_static`'s `Files` | ranges, validators, `sendfile`, a single-page app's fallback |
+| The endpoint's `watchers` (esbuild, Tailwind) and `Phoenix.LiveReload` | `httpserver_vite`: `ViteDevServer` runs `vp dev`, and `Frontend` proxies to it, HMR included | a Vite+ frontend on the API's origin; built, its files |
 | `Plug.Session`, `Plug.CSRFProtection` | `httpserver_auth`'s `Sessions` (signed cookies) and `Csrf` | nothing stored on the server |
 | Guardian, Joken | `httpserver_auth`'s `JwtVerifier`, `BearerAuth`, `RequireClaim` | HS256, RS256, EdDSA, ES256, JWKS |
 | `Plug.Logger`, Telemetry | `app.logTo(log)` (`ConsoleLog`, or your own `AccessLog`), `Trace`, `httpserver_otel` | spans as OTLP/JSON |
