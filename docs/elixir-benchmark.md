@@ -202,10 +202,18 @@ The probe, before → after, at 3 000 healthy requests a second over 30 connecti
 | 1 000 crashes/s | 767 → 13.2 ms | 987 → 18.4 ms | 1 015 → 24 ms | 958 → 0 |
 | 200 crashes/s, per-request isolation | 675 → 0.4 ms | 973 → 1.4 ms | 1 003 → 3 ms | 787 → 0 |
 
-The same benchmark also measured two costs that remain. Per-request isolation serves 30 to 40 % fewer HTTP/1.1
-requests a second than isolation per connection (57 000 against 90 000 on one core). Beside two requests that
-compute for 200 ms at a time, the 2 ms slice makes the healthy median 2.4 ms against Bandit's 0.8, a slice's wait,
-with the p99 the same (5 ms).
+The same benchmark also measured two other costs.
+
+- **Beside requests that compute,** the 2 ms slice made the healthy median 2.4 ms against Bandit's 0.8: a request
+  waited for the rest of the slice and the monitor's millisecond. CeeSafe's ADR 0203 (ceesafec 0.89.0) ends a slice
+  when the worker has I/O to serve. Reproduced and measured on the Xeon, one worker on one core, 3 000 healthy
+  requests a second beside two clients computing `/spin/200`: p50 1.81 → 0.30 ms, p99 3.41 → 1.35 to 1.56 ms (0.60 ms
+  with two cores), the computing requests 201 ms, `/small`'s rate the same (71 881 against 72 178 a second).
+- **Per-request isolation** serves 30 to 40 % fewer HTTP/1.1 requests a second than isolation per connection (57 000
+  against 90 000 on one core; 47 000 against 72 800 here). That remains: on the Xeon the extra 6 µs a request is the
+  request task itself (spawning it, the C compiler clearing and copying its large async frames, about 1.4 µs, the head
+  parsed again, about 1 µs, the wait for it), and the messages between it and its connection were a small part (one
+  message in place of three changed the rate by a few per cent, within the runs' spread).
 
 ## Measurement notes
 

@@ -280,6 +280,12 @@ the slice, and the monitor sees every slice late, so with `App`'s default slice 
 ended a spin on macOS's CI after 1.5 s, past the supervisor's stall. The time a resume ran is now measured at each
 pause: the same check ends it after 0.26 s here, where 0.84.0 took 0.39 s.
 
+ceesafec 0.89.0 (ADR 0203, from an independent benchmark against Bandit and Cowboy) ends a slice when the worker has
+I/O to serve, not only when the slice has run: a request beside one that computes waited for the rest of the slice
+and the monitor's lateness, a median of 1.8 ms on one Linux core with the 2 ms slice, against Bandit's 0.8. On the
+Xeon, one worker on one core beside two `/spin/200` clients: p50 0.30 ms and p99 1.35 to 1.56 ms (1.81 and 3.41 before),
+with `/small`'s rate unchanged.
+
 ## What ceesafec 0.65.1 to 0.71.0 changed
 
 Released 2026-11-18 from these findings and httpclient's. 0.65.1 fixed S1, S6 and S13. 0.67.0 carries three ADRs:

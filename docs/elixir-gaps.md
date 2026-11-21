@@ -1,14 +1,16 @@
 # Where Elixir's isolation is still ahead, and the plan to close it
 
-**Where it stands (2026-11-21, ceesafec 0.84.1, CeeSafe.Web at #58's merge `9c38d14`).** Gaps 1, 3, 4 and 5 are
+**Where it stands (2026-11-21, ceesafec 0.89.0, CeeSafe.Web at #60's merge `1b77e97`).** Gaps 1, 3, 4 and 5 are
 closed as planned, and gap 2 is as small as recycling makes it. Measured against Bandit in docs/elixir-benchmark.md:
 with a 2 ms slice, a healthy request beside computing ones waits less than under Bandit (p99.9 3.1 against 9.5 ms);
 at 1 000 crashes a second with per-request isolation, 22 healthy requests in 100 000 are retried on a new connection
 (Bandit: none) and their p99 is 1.7 against 1.8 ms. What stays different by design: a crash's memory is freed by
 replacing the worker, not with a heap (gap 2), and there are no supervision trees beyond a worker's `Services`.
 The fixes the benchmark needed outside this repository: CeeSafe ADR 0191 (0.83.0, a busy executor runs its timers
-and the tasks woken behind a paused one), ADR 0193 (0.84.1, the bound under a slice is the time a request ran), and
-CeeSafe.Web's Web ADR 0019 (a drain's linger) and 0020 (an isolated request's file goes out with `sendfile`).
+and the tasks woken behind a paused one), ADR 0193 (0.84.1, the bound under a slice is the time a request ran), ADR
+0203 (0.89.0, a slice ends when the worker has I/O to serve), and
+CeeSafe.Web's Web ADR 0019 (a drain's linger), 0020 (an isolated request's file goes out with `sendfile`) and 0021
+(a drain keeps the request that came in its turn, which had cost a second on Linux).
 The rest of this document is the plan as accepted, and its notes as built.
 
 Status: **accepted** by the owner, 2026-11-20 ("I accept all the above ADRs as written", together with CeeSafe ADRs
