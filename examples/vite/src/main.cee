@@ -102,6 +102,8 @@ async fn serveUntil(app: App<Site>, listener: borrow Listener, drain: borrow Dra
 
 async fn waitFor(dev: borrow mut ViteDevServer) -> bool => await dev.ready(30000);
 
+async fn stopped(dev: borrow mut ViteDevServer) => await dev.stop(5000);
+
 /// The port in the environment variable `name`, else `otherwise`.
 fn portFrom(name: StringView, otherwise: u16) -> u16 => match (Environment.variable(name)) {
     Some(t) => checkedTruncate<u16>(Ascii.parseDecimal(t.bytes()) ?? (otherwise as u64)) ?? otherwise,
@@ -130,7 +132,7 @@ fn main() {
         };
         let up = Async.run(waitFor(mut started));
         if (!up) {
-            started.stop();
+            Async.run(stopped(mut started));
             fail("vite_app: vp dev did not start within 30 s (run vp install in frontend/)");
         }
         dev = Some(started);
@@ -149,7 +151,7 @@ fn main() {
     Console.flush();
     let served = Async.run(serve(app, listener));
     match (borrow mut dev) {
-        Some(d) => { d.stop(); }
+        Some(d) => { Async.run(stopped(mut d)); }
         null => {}
     }
     match (served) {

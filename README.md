@@ -332,8 +332,8 @@ HTTP/3, give `applicationOf(app)` to `web_http3`'s server. Both are CeeSafe.Web'
     127.0.0.1:5173, and the frontend's paths go to it through CeeSafe.Web's reverse proxy (`web_proxy`): the page as
     Vite writes it, its modules, and the HMR WebSocket, whose upgrade the proxy makes a tunnel. Vite's client is told
     no HMR port of its own, so it connects to the page's, the server's: `vite.config.ts` needs no `server.proxy` and
-    no `hmr` setting. SIGTERM or Ctrl-C ends both: the dev server runs in a process group of its own, which is ended
-    whole, since `vp` signalled alone leaves its node processes holding the port.
+    no `hmr` setting. SIGTERM or Ctrl-C ends both: the dev server is started through `sh`, which sends the signal on to
+    every process under it, since `vp` signalled alone leaves its node processes holding the port.
   - Built (`vp build`): `frontend/dist`, through `httpserver_static`. `assets/`, whose names carry their content's
     hash, is cached for a year as immutable; the page, at `/` and for the frontend's own routes (`/about`), is never
     cached, since it names the current build's assets.

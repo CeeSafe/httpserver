@@ -13,9 +13,10 @@ public struct ViteDevServer {
     /// no input. `vp` must be on the PATH (Vite+'s installer puts it there) and the frontend's dependencies installed
     /// (`vp install`).
     ///
-    /// On a system with `sh`, through it: the dev server gets a process group of its own, and a SIGTERM to `sh` ends
-    /// the whole group. Signalled alone, `vp` exits and leaves its node processes running, still holding the port.
-    /// Without `sh` (Windows), `vp` itself, which `terminate` reaches through its console's process group.
+    /// On a system with `sh`, through it: a SIGTERM to `sh` is sent on to every process under it, the deepest first.
+    /// Signalled alone, `vp` exits and leaves its node processes running, still holding the port. (A process group of
+    /// its own would need job control, which dash, Debian's and Ubuntu's `sh`, turns off without a terminal.) Without
+    /// `sh` (Windows), `vp` itself, which `terminate` reaches through its console's process group.
     public fn start(options: borrow FrontendOptions) -> Result<ViteDevServer, IoError> {
         let directory = StringView.fromUtf8(options.directory.view()) ?? { return Err(IoError.InvalidInput); };
         var portText = Vector<u8>.create();
@@ -83,10 +84,24 @@ public struct ViteDevServer {
         }
     }
 
-    /// Ends the dev server and waits for it: call it outside async code, once the server has returned.
-    public fn stop(borrow mut this) {
+    /// Ends the dev server: asks it to, waits for it at most `withinMs`, and then ends it at once (SIGKILL).
+    public async fn stop(borrow mut this, withinMs: u64) {
         let _ = this.child.terminate();
-        let _ = this.child.wait();
+        let started = Timer.now();
+        loop {
+            match (this.child.poll()) {
+                Ok(null) => {}
+                _ => { return; }
+            }
+            if (Timer.now() - started >= withinMs) {
+                let _ = this.child.kill();
+                return;
+            }
+            match (await Timer.sleep(50)) {
+                Ok() => {}
+                Err(_) => { return; }
+            }
+        }
     }
 
     /// Asks the dev server to end, if `stop` has not.
@@ -95,8 +110,7 @@ public struct ViteDevServer {
     }
 }
 
-/// `sh -c`'s script: the command in the arguments, as a job of its own (`set -m`: its own process group, which a
-/// terminal's Ctrl-C does not reach either), and TERM, INT or HUP sent on to that whole group; then the wait for it
-/// to end.
+/// `sh -c`'s script: the command in the arguments, with no input, and TERM, INT or HUP sent on to it and every process
+/// under it (`pgrep -P`, on Linux, macOS and the BSDs), the deepest first; then the wait for it to end.
 fn groupScript() -> StringView =>
-    "set -m; \"$@\" < /dev/null & child=$!; trap 'kill -TERM -$child 2>/dev/null' TERM INT HUP; wait $child 2>/dev/null; trap - TERM INT HUP; wait $child 2>/dev/null";
+    "down() { for c in $(pgrep -P \"$1\"); do down \"$c\"; done; kill -TERM \"$1\" 2>/dev/null; }; \"$@\" < /dev/null & child=$!; trap 'down $child' TERM INT HUP; wait $child 2>/dev/null; trap - TERM INT HUP; wait $child 2>/dev/null";
