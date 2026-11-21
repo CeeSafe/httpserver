@@ -478,17 +478,19 @@ first checked by CeeSafe.Web's `conform.py`; the full tables, the method and the
   `/json` at 128 connections: 154 504 against 41 868 over HTTP/1.1, 68 931 against 22 802 over h2c).
 - **Memory:** 15 to 45 MiB for four workers, against 160 to 190 MiB.
 - **Crashes beside 10 000 healthy requests a second:** neither server lets one touch another client's request. At
-  1 000 crashes a second Bandit's healthy p99 is 2.4 ms with nothing retried; httpserver's is 3.7 ms with per-request
-  isolation (7.4 ms without), and 1.2 to 1.5 % of healthy requests are retried on a new connection, since a replaced
-  worker closes its keep-alive connections as it drains. That recycling is what a garbage-collected heap does not
-  need, and the gap that is left.
-- **Requests that compute beside them** (four, 100 ms at a time): healthy p99.9 4.6 ms with per-request isolation and
-  9.8 ms with the defaults, against Bandit's 7.5 ms. Two requests that never end cost neither server anything
-  measurable.
+  1 000 crashes a second with per-request isolation, httpserver's healthy p99 and p99.9 are 1.7 and 6.5 ms against
+  Bandit's 1.8 and 5.2. httpserver replaces a worker every 100 crashes, and a draining worker still answers its idle
+  connections' next request (CeeSafe.Web's Web ADR 0019), so 22 healthy requests in 100 000 were retried on a new
+  connection, where Bandit retried none. That recycling is what a garbage-collected heap does not need, and the gap
+  that is left.
+- **Requests that compute beside them** (four, 100 ms at a time): healthy p99 and p99.9 1.5 and 3.1 ms under the
+  2 ms slice, against Bandit's 3.8 and 9.5 ms. Two requests that never end cost neither server anything measurable.
 
 The benchmark found two faults in CeeSafe's executor, which Bandit does not have: a worker kept busy by HTTP/2 never
 ran its heartbeat and was killed, and requests behind a paused one waited seconds. ceesafec 0.83.0 (ADR 0191) fixed
-both; the numbers above are with it, and docs/elixir-benchmark.md has the ones before.
+both. The numbers above are with it, Web ADR 0019 and the 2 ms slice; docs/elixir-benchmark.md has the ones before.
+The 2 ms slice then found a third fault: under a small slice the bound counted slices, not the time a request ran,
+and ceesafec 0.84.1 (ADR 0193) measures it.
 
 ## Measured
 

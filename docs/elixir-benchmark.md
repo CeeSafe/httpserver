@@ -103,6 +103,11 @@ p50 (340 to 380 µs) is mostly the client's own; the differences between rows ar
 
 ## What this says about the gaps (docs/elixir-gaps.md)
 
+*As first measured, on ceesafec 0.82.0. Points 2 and 3 are answered by the two sections after this one: CeeSafe's
+ADR 0191 for the executor, and Web ADR 0019 with a 2 ms slice for recycling and latency. A third fault, found by
+httpserver's CI with the 2 ms slice, is fixed by CeeSafe's ADR 0193 (0.84.1): the bound under a slice counted slices
+times the slice, not the time a request ran.*
+
 1. **Speed and memory** are httpserver's: 1.4 to 3.7× the rate over HTTP/1.1 and h2c at moderate concurrency, in a
    tenth of the memory.
 2. **Gap 1 (fair preemption) is not closed.** Bandit's scheduler keeps every healthy p99 under 4 ms whatever the
