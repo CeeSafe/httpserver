@@ -224,9 +224,11 @@ HTTP/3, give `applicationOf(app)` to `web_http3`'s server. Both are CeeSafe.Web'
 | `ws/` | `httpserver_ws` | A WebSocket hub: sessions, groups, broadcast, delivery across workers over the bus | none |
 | `compress/` | `httpserver_compress` | Zstandard and Brotli responses by what the request accepts | libzstd, libbrotli |
 | `otel/` | `httpserver_otel` | Traced requests as spans, exported to a collector as OTLP/JSON | none |
+| `vite/` | `httpserver_vite` | A Vite+ (Vite) frontend on the API's origin, so no CORS: `vp dev` behind a proxy with its HMR WebSocket in development, the built files when built | none |
 | `bench/` | `bench` | The benchmark server: a whole program | as `compress/` |
 | `examples/hello/` | `hello` | The quick start's program | none |
 | `examples/shop/` | `shop` | A route group behind an API-key middleware: [docs/from-elixir.md](docs/from-elixir.md)'s example | none |
+| `examples/vite/` | `vite_app` | An API and its Vue frontend, made with `vp create vue`, on one origin | none |
 
 ## What is here
 
@@ -320,6 +322,21 @@ HTTP/3, give `applicationOf(app)` to `web_http3`'s server. Both are CeeSafe.Web'
   FIFO or a device is 404), the validators are read from the open file, conditional requests and one range are
   honoured, and the body goes out with `sendfile`, isolated requests too (CeeSafe.Web's ADR 0020). `FilesOptions.singlePage(page)` answers every path that is not a
   file with a single-page application's page.
+- **A frontend on the API's origin** (`vite/`, `examples/vite/`): a Vite application, made and built with
+  [Vite+](https://viteplus.dev) (`vp`), served by the same server and port as the API, so the browser's calls to
+  the API are same-origin and need no CORS, in development as when built.
+  `Frontend.mount(mut app, FrontendOptions.inDirectory("frontend")?, Frontend.mode())`, after or before the
+  application's own routes, which win: the frontend takes every path they do not route, and a path under a reserved
+  prefix (`/api` by default, `options.reserve("/health")`) that they do not route is 404, not the page.
+  - Development (`HTTPSERVER_FRONTEND=dev`): `ViteDevServer.start(options)` runs `vp -C frontend dev` on
+    127.0.0.1:5173, and the frontend's paths go to it through CeeSafe.Web's reverse proxy (`web_proxy`): the page as
+    Vite writes it, its modules, and the HMR WebSocket, whose upgrade the proxy makes a tunnel. Vite's client is told
+    no HMR port of its own, so it connects to the page's, the server's: `vite.config.ts` needs no `server.proxy` and
+    no `hmr` setting. SIGTERM or Ctrl-C ends both: the dev server is started through `sh`, which sends the signal on to
+    every process under it, since `vp` signalled alone leaves its node processes holding the port.
+  - Built (`vp build`): `frontend/dist`, through `httpserver_static`. `assets/`, whose names carry their content's
+    hash, is cached for a year as immutable; the page, at `/` and for the frontend's own routes (`/about`), is never
+    cached, since it names the current build's assets.
 - **WebSockets** (`ws/`): a `Hub` keeps the sessions of a process. A session joins (`hub.join(sender)`), enters
   groups (`membership.enter("room")`), and the hub sends to all (`broadcast`), to a group (`toGroup`) or to one
   session (`to`). A session that does not read is not waited for: what it missed is counted. Under the supervisor,
@@ -442,8 +459,10 @@ declares from C is `setrlimit`, for `memoryBytes`.
 
 Of CosmoApiServer, nothing that was planned. Spans go to a collector over plain HTTP only (TLS through an agent),
 and a span is named by its method, not its route's pattern. Not planned: reflection controllers and
-dependency injection (handlers are structs), Razor and Blazor, the front-end development helpers, SignalR's wire
-protocol; gRPC and OpenAPI unless asked for.
+dependency injection (handlers are structs), Razor and Blazor, SignalR's wire protocol; gRPC and OpenAPI unless asked
+for. Of the front-end helpers, `httpserver_vite` has the dev server, the proxy and the built files; not CosmoApiServer's
+`ViteFrontendMiddleware`, which writes the page itself from the build's manifest with a CSP nonce and server-rendered
+HTML, since a Vite application's own `index.html` already names its assets.
 
 ## Compared with Elixir
 
@@ -609,6 +628,7 @@ ceesafec test --cflag -DHTTPSERVER_TRAP_HOOKS=1 --cflag -fsanitize=address,undef
 (cd ws && ceesafec test)
 (cd compress && ceesafec test)   # needs libzstd and libbrotli
 (cd otel && ceesafec test)
+(cd vite && ceesafec test)
 (cd examples/hello && ceesafec build)
 (cd bench && ceesafec build)      # then: python3 <CeeSafe.Web>/benchmarks/servers/conform.py --port 8090
 python3 tools/supervisor_check.py --shared   # connections in plain tasks, against bench/out/bench
@@ -621,6 +641,7 @@ python3 tools/bus_check.py        # the bus between four workers (add --inherit 
 python3 tools/otel_check.py       # exported spans, with a collector written here (build otel/demo first)
 python3 tools/ws_check.py         # the hub, with WebSocket clients written from RFC 6455
 python3 tools/ws_check.py --workers 4   # the same over four workers and the bus (add --inherit on macOS)
+python3 tools/vite_check.py       # examples/vite built and under `vp dev`, HMR included (needs vp on the PATH)
 ```
 
 The compiler: ceesafec 0.84.1 or later, whose bound counts the time a sliced request ran (ADR 0193), and whose

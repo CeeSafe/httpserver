@@ -1,0 +1,233 @@
+// `Frontend` on an `App`, over HTTP/1.1's driver on mock connections: the built files against a `dist` made in a
+// temporary directory, and development's routes with no dev server running (tools/vite_check.py runs `vp dev`).
+import web_core;
+import web_transport;
+import web_http;
+import web_http1;
+import httpserver;
+
+struct St {}
+
+struct Hello {}
+
+impl Handler<St> for Hello {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut Context<St>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> => await Reply.text(exchange, Status.ok(), "hi");
+}
+
+fn alloc<T>(r: Result<T, AllocError>) -> Result<T, TestFailure> {
+    match (r) {
+        Ok(v) => { return Ok(v); }
+        Err(_) => { return Err(TestFailure.create("out of memory")); }
+    }
+}
+
+fn io<T>(r: Result<T, IoError>, what: StringView) -> Result<T, TestFailure> {
+    match (r) {
+        Ok(v) => { return Ok(v); }
+        Err(_) => { return Err(TestFailure.create(what)); }
+    }
+}
+
+fn joined(dir: StringView, name: StringView) -> Result<String, TestFailure> {
+    var s = String.create();
+    alloc(s.append(dir))?;
+    alloc(s.append("/"))?;
+    alloc(s.append(name))?;
+    return Ok(s);
+}
+
+fn writeFile(dir: StringView, name: StringView, text: StringView) -> Result<void, TestFailure> {
+    let path = joined(dir, name)?;
+    var f = io(File.create(path.view()), "creating a file")?;
+    io(f.write(text.bytes()), "writing a file")?;
+    return Ok();
+}
+
+/// `<dir>/dist` as `vp build` writes it: `index.html`, `favicon.ico` and `assets/index-abc123.js`.
+fn dist() -> Result<String, TestFailure> {
+    let dir = io(Directory.temporary(), "a temporary directory")?;
+    let root = joined(dir.view(), "dist")?;
+    io(Directory.create(root.view()), "a directory")?;
+    writeFile(root.view(), "index.html", "<p>page</p>")?;
+    writeFile(root.view(), "favicon.ico", "icon")?;
+    let assets = joined(root.view(), "assets")?;
+    io(Directory.create(assets.view()), "a directory")?;
+    writeFile(assets.view(), "index-abc123.js", "let a = 1;")?;
+    return Ok(dir);
+}
+
+fn removed(dir: StringView) {
+    for (n in ["dist/index.html", "dist/favicon.ico", "dist/assets/index-abc123.js"]) {
+        match (joined(dir, n)) {
+            Ok(p) => { let _ = File.remove(p.view()); }
+            Err(_) => {}
+        }
+    }
+    for (n in ["dist/assets", "dist"]) {
+        match (joined(dir, n)) {
+            Ok(p) => { let _ = Directory.remove(p.view()); }
+            Err(_) => {}
+        }
+    }
+    let _ = Directory.remove(dir);
+}
+
+async fn served(app: borrow App<St>, text: Slice<u8>) -> Result<Vector<u8>, TestFailure> {
+    var conn = match (MockTransport.create(text)) {
+        Ok(m) => m,
+        Err(_) => { return Err(TestFailure.create("a mock")); },
+    };
+    let drain = match (Drain.create()) {
+        Ok(d) => d,
+        Err(_) => { return Err(TestFailure.create("a drain")); },
+    };
+    let ctx = ConnectionContext.acceptedNow(1, drain);
+    match (await web_http1.serve(mut conn, ctx, app, app.limits())) {
+        Ok() => {}
+        Err(e) => { return Err(TestFailure.create(NetErrors.describe(e))); }
+    }
+    var out = Vector<u8>.create();
+    for (b in conn.written()) {
+        alloc(out.push(b))?;
+    }
+    return Ok(out);
+}
+
+/// The response to `GET target`.
+async fn got(app: borrow App<St>, target: StringView) -> Result<Vector<u8>, TestFailure> {
+    var request = Vector<u8>.create();
+    alloc(request.extend("GET ".bytes()))?;
+    alloc(request.extend(target.bytes()))?;
+    alloc(request.extend(" HTTP/1.1\r\nhost: a\r\nconnection: close\r\n\r\n".bytes()))?;
+    return await served(app, request.view());
+}
+
+/// Where `part` is in `text`, or null.
+fn find(text: Slice<u8>, part: StringView) -> usize? {
+    let p = part.bytes();
+    if (p.length > text.length) {
+        return null;
+    }
+    for (at in 0..text.length - p.length + 1) {
+        var same = true;
+        for (i in 0..p.length) {
+            if (text[at + i] != p[i]) {
+                same = false;
+                break;
+            }
+        }
+        if (same) {
+            return Some(at);
+        }
+    }
+    return null;
+}
+
+fn starts(response: borrow Vector<u8>, status: StringView, what: StringView) -> Result<void, TestFailure> =>
+    Check.isTrue(find(response.view(), status) == Some(0usize), what);
+
+fn has(response: borrow Vector<u8>, part: StringView, what: StringView) -> Result<void, TestFailure> =>
+    Check.isTrue(find(response.view(), part).isSome(), what);
+
+fn application() -> Result<App<St>, TestFailure> {
+    var limits = Limits.defaults();
+    limits.sendDate = false;
+    var app = match (App<St>.create(St {}, limits)) {
+        Ok(a) => a,
+        Err(_) => { return Err(TestFailure.create("an app")); },
+    };
+    let hello: Box<dyn Handler<St> + Send + Share> = alloc(Box.create(Hello {}))?;
+    match (app.get("/api/hello", hello)) {
+        Ok() => {}
+        Err(_) => { return Err(TestFailure.create("a route")); }
+    }
+    return Ok(app);
+}
+
+async fn builtChecks(dir: StringView) -> Result<void, TestFailure> {
+    var options = alloc(FrontendOptions.inDirectory("frontend"))?;
+    let root = joined(dir, "dist")?;
+    alloc(options.builtInto(root.view()))?;
+    var app = application()?;
+    Check.isTrue(Frontend.mount(mut app, options, FrontendMode.Built).isOk(), "mounted")?;
+
+    // The page, at `/` and for the application's own routes, is never used stale; a hashed asset is kept a year.
+    let home = await got(app, "/")?;
+    starts(home, "HTTP/1.1 200 OK\r\n", "the page at /")?;
+    has(home, "\r\ncache-control: no-cache\r\n", "the page at / is not cached")?;
+    has(home, "\r\n\r\n<p>page</p>", "the page's body")?;
+    let route = await got(app, "/settings/profile")?;
+    starts(route, "HTTP/1.1 200 OK\r\n", "a route of the frontend's is the page")?;
+    has(route, "no-cache", "the page for a route is not cached")?;
+    has(route, "<p>page</p>", "the page's body for a route")?;
+    let script = await got(app, "/assets/index-abc123.js")?;
+    starts(script, "HTTP/1.1 200 OK\r\n", "an asset")?;
+    has(script, "\r\ncache-control: public, max-age=31536000, immutable\r\n", "an asset is immutable")?;
+    has(script, "let a = 1;", "the asset's body")?;
+    let icon = await got(app, "/favicon.ico")?;
+    starts(icon, "HTTP/1.1 200 OK\r\n", "a file at the root")?;
+    Check.isTrue(find(icon.view(), "immutable").isNull(), "a file at the root is not immutable")?;
+
+    // What names a file that is not there is 404, not the page.
+    for (missing in ["/assets/index-old.js", "/missing.css", "/../secret"]) {
+        let r = await got(app, missing)?;
+        starts(r, "HTTP/1.1 404 Not Found\r\n", missing)?;
+    }
+    // The server's own prefix: its routes answer, and what it does not route is 404, not the page.
+    let api = await got(app, "/api/hello")?;
+    has(api, "\r\n\r\nhi", "the application's route")?;
+    for (reserved in ["/api", "/api/", "/api/nothing"]) {
+        let r = await got(app, reserved)?;
+        starts(r, "HTTP/1.1 404 Not Found\r\n", reserved)?;
+    }
+    let other = await got(app, "/apiary")?;
+    has(other, "<p>page</p>", "a path that only starts like a reserved prefix is the frontend's")?;
+    return Ok();
+}
+
+@test
+fn theBuiltFrontend() -> Result<void, TestFailure> {
+    let dir = dist()?;
+    let result = Async.run(builtChecks(dir.view()));
+    removed(dir.view());
+    return result;
+}
+
+async fn developmentChecks() -> Result<void, TestFailure> {
+    var options = alloc(FrontendOptions.inDirectory("frontend"))?;
+    // Nothing listens on port 1: the proxy's answer is its own 502, so the request did go to the dev server.
+    options.devPort = 1;
+    var app = application()?;
+    Check.isTrue(Frontend.mount(mut app, options, FrontendMode.Development).isOk(), "mounted")?;
+    let page = await got(app, "/")?;
+    starts(page, "HTTP/1.1 502 Bad Gateway\r\n", "the page goes to the dev server")?;
+    let post = await served(app, "POST /login HTTP/1.1\r\nhost: a\r\ncontent-length: 2\r\nconnection: close\r\n\r\nhi".bytes())?;
+    starts(post, "HTTP/1.1 502 Bad Gateway\r\n", "every method goes to the dev server")?;
+    let api = await got(app, "/api/hello")?;
+    has(api, "\r\n\r\nhi", "the application's route stays the application's")?;
+    let reserved = await got(app, "/api/nothing")?;
+    starts(reserved, "HTTP/1.1 404 Not Found\r\n", "a reserved path does not go to the dev server")?;
+    return Ok();
+}
+
+@test
+fn theDevelopmentProxy() -> Result<void, TestFailure> => Async.run(developmentChecks());
+
+@test
+fn mountingFails() -> Result<void, TestFailure> {
+    var options = alloc(FrontendOptions.inDirectory("frontend"))?;
+    options.devPort = 0;
+    var app = application()?;
+    let zero = Frontend.mount(mut app, options, FrontendMode.Development);
+    Check.isTrue(match (zero) { Err(FrontendError.BadDevPort) => true, _ => false }, "port 0")?;
+    options.devPort = 5173;
+    Check.isTrue(Frontend.mount(mut app, options, FrontendMode.Built).isOk(), "the first mount")?;
+    let twice = Frontend.mount(mut app, options, FrontendMode.Built);
+    Check.isTrue(match (twice) { Err(FrontendError.Conflict) => true, _ => false }, "a second mount")?;
+    return Ok();
+}

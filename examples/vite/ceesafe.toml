@@ -1,0 +1,15 @@
+[package]
+name = "vite_app"
+version = "0.1.0"
+kind = "executable"
+sources = ["src"]
+ceesafec = ">=0.84.1"
+polls = true                   # ADR 0190: `App.run`'s bound sees a request that computes without waiting
+
+[dependencies]
+httpserver = { path = "../.." }
+httpserver_vite = { path = "../../vite" }
+httpserver_static = { path = "../../static" }
+web_core = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "9c38d143e2601c260c37a90eaeae8e308ea40188", dir = "packages/web_core" }
+web_transport = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "9c38d143e2601c260c37a90eaeae8e308ea40188", dir = "packages/web_transport" }
+web_http = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "9c38d143e2601c260c37a90eaeae8e308ea40188", dir = "packages/web_http" }

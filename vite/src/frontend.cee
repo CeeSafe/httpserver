@@ -1,0 +1,313 @@
+// A Vite application's frontend (built with Vite+, `vp`) on the server's own origin, so that the browser calls the
+// server's API with no CORS: one origin, one port.
+//
+// - Development: every path the application does not route goes to Vite's dev server through CeeSafe.Web's reverse
+//   proxy (`web_proxy`), which also makes the HMR WebSocket's upgrade a tunnel. Vite writes the page, serves the
+//   modules and pushes the changes; nothing here knows Vite's own paths. `ViteDevServer` starts `vp dev` beside the
+//   server and ends it with the server.
+// - Built: the files `vp build` wrote are served from their directory (`httpserver_static`): `assets/`, whose names
+//   change with their content, cached for a year as immutable, and every other path that names no file answered
+//   with `index.html`, never cached, for the application's own routes.
+//
+// In both, a path under a reserved prefix (`/api`) that the application does not route is 404, not the page.
+import web_core;
+import web_http;
+import web_proxy;
+import httpserver;
+import httpserver_static;
+
+/// Where the frontend's responses come from.
+public enum FrontendMode {
+    /// Vite's dev server, through the proxy: the page as Vite writes it, its modules, and hot module replacement.
+    Development,
+    /// The files `vp build` wrote.
+    Built,
+}
+
+/// Why the frontend could not be mounted.
+public enum FrontendError {
+    /// The dev server's port is 0.
+    BadDevPort,
+    /// The application already routes `/{*path}` for one of the methods.
+    Conflict,
+    OutOfMemory,
+}
+
+/// What the frontend is and where it lives.
+public struct FrontendOptions {
+    /// The frontend's directory, where its `vite.config.ts` is, as `vp -C` takes it.
+    public directory: Vector<u8>;
+    /// What `vp build` wrote: its `build.outDir` (Vite's default is `dist` under the frontend's directory).
+    public built: Vector<u8>;
+    /// The port of Vite's dev server, on 127.0.0.1. `ViteDevServer` starts it there, strictly: a port in use fails
+    /// the dev server rather than moving it.
+    public devPort: u16;
+    /// The path prefixes that belong to the server (`/api`): a path under one that no route takes is 404, rather than
+    /// the frontend's page or Vite's answer.
+    public reserved: Vector<Vector<u8>>;
+    /// `Cache-Control` for the built `assets/` directory, whose file names carry a hash of their content.
+    public assetsCacheControl: Vector<u8>;
+
+    /// The frontend in `directory` (`frontend`), built into its `dist`, its dev server on port 5173 (Vite's own
+    /// default), `/api` reserved, and its assets cached for a year as immutable.
+    public fn inDirectory(directory: StringView) -> Result<FrontendOptions, AllocError> {
+        var o = FrontendOptions {
+            directory: Vector<u8>.create(),
+            built: Vector<u8>.create(),
+            devPort: 5173,
+            reserved: Vector<Vector<u8>>.create(),
+            assetsCacheControl: Vector<u8>.create(),
+        };
+        o.directory.extend(directory.bytes())?;
+        o.built.extend(directory.bytes())?;
+        o.built.extend("/dist".bytes())?;
+        o.assetsCacheControl.extend("public, max-age=31536000, immutable".bytes())?;
+        o.reserve("/api")?;
+        return Ok(o);
+    }
+
+    /// Keeps `prefix` (`/health`, starting with `/` and not ending with one) for the server.
+    public fn reserve(borrow mut this, prefix: StringView) -> Result<void, AllocError> {
+        var p = Vector<u8>.create();
+        p.extend(prefix.bytes())?;
+        this.reserved.push(p)?;
+        return Ok();
+    }
+
+    /// Takes the built files from `built` (a directory path), where `vp build` writes them (`build.outDir`).
+    public fn builtInto(borrow mut this, built: StringView) -> Result<void, AllocError> {
+        this.built.clear();
+        this.built.extend(built.bytes())?;
+        return Ok();
+    }
+}
+
+/// Mounting a frontend on an `App`.
+public struct Frontend {
+    /// `HTTPSERVER_FRONTEND=dev` in the environment is `Development`; anything else, or nothing, is `Built`.
+    public fn mode() -> FrontendMode {
+        match (Environment.variable("HTTPSERVER_FRONTEND")) {
+            Some(v) => {
+                if (v == "dev") {
+                    return FrontendMode.Development;
+                }
+                return FrontendMode.Built;
+            }
+            null => { return FrontendMode.Built; }
+        }
+    }
+
+    /// Mounts the frontend on `app`, after the application's own routes or before them: a route of the
+    /// application's wins over the frontend's `/{*path}`, whatever the order. In development the frontend takes
+    /// every method (Vite answers what it answers); built, GET and HEAD.
+    public fn mount<S: Send + Share>(
+        app: borrow mut App<S>,
+        options: borrow FrontendOptions,
+        mode: FrontendMode,
+    ) -> Result<void, FrontendError> {
+        var prefixes = Vector<Vector<u8>>.create();
+        for (i in 0..options.reserved.length) {
+            var p = Vector<u8>.create();
+            mounted(p.extend(options.reserved[i].view()))?;
+            mounted(prefixes.push(p))?;
+        }
+        let reserved = mounted(Arc<Reserved>.create(Reserved { prefixes: prefixes }))?;
+        match (mode) {
+            FrontendMode.Development => { return Frontend.development(app, options, reserved); }
+            FrontendMode.Built => { return Frontend.built(app, options, reserved); }
+        }
+    }
+
+    fn development<S: Send + Share>(
+        app: borrow mut App<S>,
+        options: borrow FrontendOptions,
+        reserved: Arc<Reserved>,
+    ) -> Result<void, FrontendError> {
+        if (options.devPort == 0) {
+            return Err(FrontendError.BadDevPort);
+        }
+        var url = Vector<u8>.create();
+        mounted(url.extend("http://127.0.0.1:".bytes()))?;
+        mounted(appendDecimal(mut url, options.devPort as u64))?;
+        let text = StringView.fromUtf8(url.view()) ?? { return Err(FrontendError.OutOfMemory); };
+        // Vite's dev server is one process on this machine, which the developer restarts: an answer from it, or a
+        // 502 while it is down, never a retry. Its own Host is kept, so Vite sees the page's origin.
+        var o = ProxyOptions.defaults();
+        o.maxAttempts = 1;
+        o.retryMinimum = 0;
+        o.retryPercent = 0;
+        var builder = ProxyBuilder.create(o);
+        match (builder.backend(text, 1)) {
+            Ok() => {}
+            Err(ProxySetupError.OutOfMemory) => { return Err(FrontendError.OutOfMemory); }
+            Err(_) => { return Err(FrontendError.BadDevPort); }
+        }
+        let proxy = match (builder.build(null)) {
+            Ok(p) => p,
+            Err(_) => { return Err(FrontendError.OutOfMemory); },
+        };
+        for (method in [Method.Get, Method.Post, Method.Put, Method.Delete, Method.Patch, Method.Options]) {
+            let pages = DevPages<S> { proxy: proxy.handler(), reserved: reserved.clone() };
+            let h: Box<dyn Handler<S> + Send + Share> = match (Box.create(pages)) {
+                Ok(b) => b,
+                Err(_) => { return Err(FrontendError.OutOfMemory); },
+            };
+            routed(app.route(method, "/{*path}", h))?;
+        }
+        return Ok();
+    }
+
+    fn built<S: Send + Share>(
+        app: borrow mut App<S>,
+        options: borrow FrontendOptions,
+        reserved: Arc<Reserved>,
+    ) -> Result<void, FrontendError> {
+        let root = StringView.fromUtf8(options.built.view()) ?? { return Err(FrontendError.OutOfMemory); };
+        // assets/: hashed names, so a year as immutable; no fallback, so a missing one is 404, not the page
+        var assetsRoot = Vector<u8>.create();
+        mounted(assetsRoot.extend(options.built.view()))?;
+        mounted(assetsRoot.extend("/assets".bytes()))?;
+        let assetsText = StringView.fromUtf8(assetsRoot.view()) ?? { return Err(FrontendError.OutOfMemory); };
+        var assetOptions = FilesOptions.defaults();
+        mounted(assetOptions.cacheControl.extend(options.assetsCacheControl.view()))?;
+        let assets = mounted(Files<S>.create(assetsText, assetOptions))?;
+        let a: Box<dyn Handler<S> + Send + Share> = match (Box.create(assets)) {
+            Ok(b) => b,
+            Err(_) => { return Err(FrontendError.OutOfMemory); },
+        };
+        routed(app.get("/assets/{*path}", a))?;
+        // the rest: a file under the root, else index.html for a path whose last segment has no `.`
+        let pageOptions = mounted(FilesOptions.singlePage("index.html"))?;
+        let files = mounted(Files<S>.create(root, pageOptions))?;
+        let pages = BuiltPages<S> { files: files, reserved: reserved };
+        let p: Box<dyn Handler<S> + Send + Share> = match (Box.create(pages)) {
+            Ok(b) => b,
+            Err(_) => { return Err(FrontendError.OutOfMemory); },
+        };
+        routed(app.get("/{*path}", p))?;
+        return Ok();
+    }
+}
+
+/// The prefixes the server keeps.
+struct Reserved {
+    prefixes: Vector<Vector<u8>>;
+}
+
+impl Reserved {
+    /// Whether `path` is one of the prefixes or under one.
+    fn holds(borrow this, path: Slice<u8>) -> bool {
+        for (i in 0..this.prefixes.length) {
+            let p = this.prefixes[i].view();
+            if (path.length < p.length || (path.length > p.length && path[p.length] != 47)) {
+                continue;
+            }
+            var same = true;
+            for (k in 0..p.length) {
+                if (path[k] != p[k]) {
+                    same = false;
+                    break;
+                }
+            }
+            if (same) {
+                return true;
+            }
+        }
+        return false;
+    }
+}
+
+/// Development: what the application does not route, through the proxy to Vite's dev server.
+struct DevPages<S: Send + Share> {
+    proxy: ProxyHandler;
+    reserved: Arc<Reserved>;
+}
+
+impl<S: Send + Share> Handler<S> for DevPages<S> {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut Context<S>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        if (this.reserved.get().holds(request.path().bytes())) {
+            return await exchange.send(Status.notFound(), "".bytes());
+        }
+        return await this.proxy.handle(request, exchange, ctx.connection());
+    }
+}
+
+/// Built: what the application does not route, from the built files.
+struct BuiltPages<S: Send + Share> {
+    files: Files<S>;
+    reserved: Arc<Reserved>;
+}
+
+impl<S: Send + Share> Handler<S> for BuiltPages<S> {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut Context<S>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        let path = request.path().bytes();
+        if (this.reserved.get().holds(path)) {
+            return await exchange.send(Status.notFound(), "".bytes());
+        }
+        // The page names the current build's assets, so it is never used stale: `/` as well as the fallback, which
+        // `Files` marks itself.
+        if (path[path.length - 1] == 47 || endsWith(path, "/index.html")) {
+            exchange.header("cache-control", "no-cache".bytes())?;
+        }
+        return await this.files.handle(ctx, request, exchange);
+    }
+}
+
+fn mounted<T>(r: Result<T, AllocError>) -> Result<T, FrontendError> {
+    match (r) {
+        Ok(v) => { return Ok(v); }
+        Err(_) => { return Err(FrontendError.OutOfMemory); }
+    }
+}
+
+fn routed(r: Result<void, RouteError>) -> Result<void, FrontendError> {
+    match (r) {
+        Ok() => { return Ok(); }
+        Err(RouteError.OutOfMemory) => { return Err(FrontendError.OutOfMemory); }
+        Err(_) => { return Err(FrontendError.Conflict); }
+    }
+}
+
+fn endsWith(text: Slice<u8>, end: StringView) -> bool {
+    let e = end.bytes();
+    if (text.length < e.length) {
+        return false;
+    }
+    let at = text.length - e.length;
+    for (k in 0..e.length) {
+        if (text[at + k] != e[k]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Appends `n` in decimal.
+fn appendDecimal(out: borrow mut Vector<u8>, n: u64) -> Result<void, AllocError> {
+    var digits = [0u8; 20];
+    var count: usize = 0;
+    var rest = n;
+    loop {
+        digits[count] = truncate<u8>(48 + rest % 10);
+        count += 1;
+        rest = rest / 10;
+        if (rest == 0) {
+            break;
+        }
+    }
+    while (count > 0) {
+        count -= 1;
+        out.push(digits[count])?;
+    }
+    return Ok();
+}

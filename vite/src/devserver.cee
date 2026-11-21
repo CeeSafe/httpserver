@@ -1,0 +1,116 @@
+// `vp dev` beside the server: Vite's dev server for the frontend, started by the program and ended with it, so a
+// developer runs one command.
+import httpserver;
+
+/// The dev server a `ViteDevServer.start` ran: `vp dev` for the frontend's directory, on 127.0.0.1 at the port the
+/// options name. Dropping it, or `stop`, ends it.
+@noncopy
+public struct ViteDevServer {
+    private child: ChildProcess;
+    private port: u16;
+
+    /// Runs `vp -C <directory> dev --port <devPort> --strictPort --host 127.0.0.1`, its output on this program's and
+    /// no input. `vp` must be on the PATH (Vite+'s installer puts it there) and the frontend's dependencies installed
+    /// (`vp install`).
+    ///
+    /// On a system with `sh`, through it: a SIGTERM to `sh` is sent on to every process under it, the deepest first.
+    /// Signalled alone, `vp` exits and leaves its node processes running, still holding the port. (A process group of
+    /// its own would need job control, which dash, Debian's and Ubuntu's `sh`, turns off without a terminal.) Without
+    /// `sh` (Windows), `vp` itself, which `terminate` reaches through its console's process group.
+    public fn start(options: borrow FrontendOptions) -> Result<ViteDevServer, IoError> {
+        let directory = StringView.fromUtf8(options.directory.view()) ?? { return Err(IoError.InvalidInput); };
+        var portText = Vector<u8>.create();
+        match (appendDecimal(mut portText, options.devPort as u64)) {
+            Ok() => {}
+            Err(_) => { return Err(IoError.OutOfMemory); }
+        }
+        let port = StringView.fromUtf8(portText.view()) ?? { return Err(IoError.OutOfMemory); };
+        let streams = ChildOptions { input: ChildStream.Null, output: ChildStream.Inherit, error: ChildStream.Inherit };
+        var wrapped = Vector<StringView>.create();
+        for (a in [
+            "-c",
+            groupScript(),
+            "sh",
+            "vp",
+            "-C",
+            directory,
+            "dev",
+            "--port",
+            port,
+            "--strictPort",
+            "--host",
+            "127.0.0.1",
+        ]) {
+            match (wrapped.push(a)) {
+                Ok() => {}
+                Err(_) => { return Err(IoError.OutOfMemory); }
+            }
+        }
+        match (Process.spawn("sh", wrapped, streams)) {
+            Ok(child) => { return Ok(ViteDevServer { child: child, port: options.devPort }); }
+            Err(_) => {}
+        }
+        var direct = Vector<StringView>.create();
+        for (a in ["-C", directory, "dev", "--port", port, "--strictPort", "--host", "127.0.0.1"]) {
+            match (direct.push(a)) {
+                Ok() => {}
+                Err(_) => { return Err(IoError.OutOfMemory); }
+            }
+        }
+        let child = Process.spawn("vp", direct, streams)?;
+        return Ok(ViteDevServer { child: child, port: options.devPort });
+    }
+
+    /// Waits until the dev server takes a connection on its port, at most `withinMs`: true once it does; false if
+    /// it has not by then, or if it has ended (its port in use, the frontend's dependencies not installed).
+    public async fn ready(borrow mut this, withinMs: u64) -> bool {
+        let started = Timer.now();
+        loop {
+            match (this.child.poll()) {
+                Ok(null) => {}
+                _ => { return false; }
+            }
+            match (await AsyncTcpStream.connect("127.0.0.1", this.port)) {
+                Ok(_) => { return true; }
+                Err(_) => {}
+            }
+            if (Timer.now() - started >= withinMs) {
+                return false;
+            }
+            match (await Timer.sleep(100)) {
+                Ok() => {}
+                Err(_) => { return false; }
+            }
+        }
+    }
+
+    /// Ends the dev server: asks it to, waits for it at most `withinMs`, and then ends it at once (SIGKILL).
+    public async fn stop(borrow mut this, withinMs: u64) {
+        let _ = this.child.terminate();
+        let started = Timer.now();
+        loop {
+            match (this.child.poll()) {
+                Ok(null) => {}
+                _ => { return; }
+            }
+            if (Timer.now() - started >= withinMs) {
+                let _ = this.child.kill();
+                return;
+            }
+            match (await Timer.sleep(50)) {
+                Ok() => {}
+                Err(_) => { return; }
+            }
+        }
+    }
+
+    /// Asks the dev server to end, if `stop` has not.
+    drop {
+        let _ = this.child.terminate();
+    }
+}
+
+/// `sh -c`'s script: the command in the arguments, with no input, and TERM, INT or HUP sent on to it and every process
+/// under it (`pgrep -P`, on Linux, macOS and the BSDs), the deepest first; then the wait for it to end.
+fn groupScript() -> StringView =>
+    "down() { for c in $(pgrep -P \"$1\"); do down \"$c\"; done; kill -TERM \"$1\" 2>/dev/null; }; \"$@\" < /dev/null & child=$!; trap 'down $child' TERM INT HUP; wait $child 2>/dev/null; trap - TERM INT HUP; wait $child 2>/dev/null";
