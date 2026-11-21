@@ -210,10 +210,18 @@ The same benchmark also measured two other costs.
   requests a second beside two clients computing `/spin/200`: p50 1.81 → 0.30 ms, p99 3.41 → 1.35 to 1.56 ms (0.60 ms
   with two cores), the computing requests 201 ms, `/small`'s rate the same (71 881 against 72 178 a second).
 - **Per-request isolation** serves 30 to 40 % fewer HTTP/1.1 requests a second than isolation per connection (57 000
-  against 90 000 on one core; 47 000 against 72 800 here). That remains: on the Xeon the extra 6 µs a request is the
-  request task itself (spawning it, the C compiler clearing and copying its large async frames, about 1.4 µs, the head
-  parsed again, about 1 µs, the wait for it), and the messages between it and its connection were a small part (one
-  message in place of three changed the rate by a few per cent, within the runs' spread).
+  against 90 000 on one core; 47 000 against 72 800 here). Profiled on the Xeon, the extra 6 µs a request was the
+  request task itself, not the messages between it and its connection. Two changes take part of it:
+  - CeeSafe.Web's Web ADR 0022: a small response goes back with the request's kit, one message in place of three
+    and no allocation for its body;
+  - CeeSafe's ADR 0204 (ceesafec 0.91.0): the C locals of an async function's resume function are no longer zeroed
+    at every resume (the relay's had 56, 3 042 bytes, each its own store); in this server's C, zeroed locals fell
+    from 5 279 to 717.
+
+  One worker on one core, `/small` at 64 connections, four alternating runs each: isolated 46 691 requests a second
+  before, 48 534 with ADR 0204, 49 286 with Web ADR 0022, 51 280 with both (+10 %); direct 73 278 against 72 718, the
+  same. What is left (about 4.5 µs a request) is spawning and waking the request's task and parsing its head a second
+  time in it.
 
 ## Measurement notes
 

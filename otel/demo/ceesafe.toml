@@ -3,12 +3,12 @@ name = "otel_demo"
 version = "0.1.0"
 kind = "executable"
 sources = ["src"]
-ceesafec = ">=0.89.0"
+ceesafec = ">=0.91.0"
 polls = true                   # ADR 0190: `App.run`'s bound sees a request that computes without waiting
 
 [dependencies]
 httpserver = { path = "../.." }
 httpserver_otel = { path = ".." }
-web_core = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "1b77e9779feee1f90732ff8450a3a0406ad3dbe4", dir = "packages/web_core" }
-web_transport = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "1b77e9779feee1f90732ff8450a3a0406ad3dbe4", dir = "packages/web_transport" }
-web_http = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "1b77e9779feee1f90732ff8450a3a0406ad3dbe4", dir = "packages/web_http" }
+web_core = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "bbf01c4109c32f1bfd965de9cc82d7c3f2c3c345", dir = "packages/web_core" }
+web_transport = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "bbf01c4109c32f1bfd965de9cc82d7c3f2c3c345", dir = "packages/web_transport" }
+web_http = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "bbf01c4109c32f1bfd965de9cc82d7c3f2c3c345", dir = "packages/web_http" }

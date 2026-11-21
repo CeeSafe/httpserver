@@ -13,7 +13,7 @@ port of CosmoApiServer (.NET) by what it does, not line by line. There is no gar
 install: a server is one native program, which answers about 100 000 small requests a second on one core in 8 to
 22 MB of memory ([Measured](#measured)).
 
-**Status:** version 0.2.0, on ceesafec 0.89.0. `App.run` serves each connection in an isolated task (a trap costs
+**Status:** version 0.2.0, on ceesafec 0.91.0. `App.run` serves each connection in an isolated task (a trap costs
 the connection, not the worker); `app.isolateRequests(true)` isolates each HTTP/1.1 request, answering 500 for one
 that traps; a request that computes is paused every 2 ms slice so its neighbours run, and ended past a bound of 30 s
 (ceesafec ADRs 0186, 0189 and 0191, in a build with `polls = true`). How that compares with Elixir's process
@@ -39,7 +39,7 @@ and macOS; the supervisor is POSIX only.
 
 You need:
 
-- `ceesafec` 0.89.0 or later ([releases](https://github.com/CeeSafe/CeeSafe/releases), or the
+- `ceesafec` 0.91.0 or later ([releases](https://github.com/CeeSafe/CeeSafe/releases), or the
   [guide](https://ceesafe.github.io/CeeSafe/)'s installation page) and a C compiler (`cc`);
 - for `auth/` only, OpenSSL's libcrypto; for `compress/` only, libzstd and libbrotli
   (`brew install zstd brotli`; `apt install libzstd-dev libbrotli-dev`). The core package needs no C library.
@@ -197,14 +197,14 @@ name = "myserver"
 version = "0.1.0"
 kind = "executable"
 sources = ["src"]
-ceesafec = ">=0.89.0"
+ceesafec = ">=0.91.0"
 polls = true              # the bound on a request that computes without waiting (below)
 
 [dependencies]
 httpserver = { git = "https://github.com/CeeSafe/httpserver.git", rev = "<a commit of this repository>" }
-web_core = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "1b77e9779feee1f90732ff8450a3a0406ad3dbe4", dir = "packages/web_core" }
-web_transport = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "1b77e9779feee1f90732ff8450a3a0406ad3dbe4", dir = "packages/web_transport" }
-web_http = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "1b77e9779feee1f90732ff8450a3a0406ad3dbe4", dir = "packages/web_http" }
+web_core = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "bbf01c4109c32f1bfd965de9cc82d7c3f2c3c345", dir = "packages/web_core" }
+web_transport = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "bbf01c4109c32f1bfd965de9cc82d7c3f2c3c345", dir = "packages/web_transport" }
+web_http = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "bbf01c4109c32f1bfd965de9cc82d7c3f2c3c345", dir = "packages/web_http" }
 ```
 
 The other packages are directories of this repository: add `dir`, as in
@@ -647,8 +647,8 @@ python3 tools/ws_check.py --workers 4   # the same over four workers and the bus
 python3 tools/vite_check.py       # examples/vite built and under `vp dev`, HMR included (needs vp on the PATH)
 ```
 
-The compiler: ceesafec 0.89.0 or later, which pauses a computing request as soon as its worker has I/O to serve
-(ADR 0203), whose bound counts the time a sliced request ran (ADR 0193, 0.84.1), and whose
+The compiler: ceesafec 0.91.0 or later, which no longer zeroes an async function's locals at every resume (ADR
+0204), pauses a computing request as soon as its worker has I/O to serve (ADR 0203, 0.89.0), whose bound counts the time a sliced request ran (ADR 0193, 0.84.1), and whose
 executor runs the tasks woken behind a paused one first and keeps a busy worker's timers running (ADR 0191, 0.83.0); `Async.runSlice` (ADR 0189) and `polls = true` in a manifest (ADR 0190) came with
 0.82.0, `Async.runBound` (ADR 0186), which `run` sets, with 0.80.0. Isolated tasks (ADR 0175), which `app.run` serves connections in,
 came with 0.75.0; `Process.spawnWith` and `SharedMemory.anonymous` (ADR 0173, 0.73.1) start the workers and hand them

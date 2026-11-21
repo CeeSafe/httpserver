@@ -13,7 +13,7 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
-  CEESAFE_VERSION: v0.89.0 # the release the packages were last tested with and are formatted by; their manifests ask for 0.89.0 or later
+  CEESAFE_VERSION: v0.91.0 # the release the packages were last tested with and are formatted by; their manifests ask for 0.91.0 or later
 
 jobs:
   test:

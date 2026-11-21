@@ -4,10 +4,10 @@ version = "0.1.0"
 kind = "library"
 sources = ["src"]
 tests = ["tests"]
-ceesafec = ">=0.89.0"
+ceesafec = ">=0.91.0"
 
 [dependencies]
-web_core = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "1b77e9779feee1f90732ff8450a3a0406ad3dbe4", dir = "packages/web_core" }
-web_http = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "1b77e9779feee1f90732ff8450a3a0406ad3dbe4", dir = "packages/web_http" }
+web_core = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "bbf01c4109c32f1bfd965de9cc82d7c3f2c3c345", dir = "packages/web_core" }
+web_http = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "bbf01c4109c32f1bfd965de9cc82d7c3f2c3c345", dir = "packages/web_http" }
 # The WebSocket session, and the queue other tasks send through.
-web_ws = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "1b77e9779feee1f90732ff8450a3a0406ad3dbe4", dir = "packages/web_ws" }
+web_ws = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "bbf01c4109c32f1bfd965de9cc82d7c3f2c3c345", dir = "packages/web_ws" }

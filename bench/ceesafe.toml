@@ -3,16 +3,16 @@ name = "bench"
 version = "0.1.0"
 kind = "executable"
 sources = ["src"]
-ceesafec = ">=0.89.0"          # ADR 0190: `polls`; ADR 0186: `Async.runBound` for CW_RUN_BOUND_MS
+ceesafec = ">=0.91.0"          # ADR 0190: `polls`; ADR 0186: `Async.runBound` for CW_RUN_BOUND_MS
 polls = true                   # ADR 0190: the bound sees a request that computes without waiting
 
 [dependencies]
 httpserver = { path = ".." }
 httpserver_ws = { path = "../ws" }
 httpserver_compress = { path = "../compress" }
-web_ws = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "1b77e9779feee1f90732ff8450a3a0406ad3dbe4", dir = "packages/web_ws" }
-web_core = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "1b77e9779feee1f90732ff8450a3a0406ad3dbe4", dir = "packages/web_core" }
-web_transport = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "1b77e9779feee1f90732ff8450a3a0406ad3dbe4", dir = "packages/web_transport" }
-web_http = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "1b77e9779feee1f90732ff8450a3a0406ad3dbe4", dir = "packages/web_http" }
+web_ws = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "bbf01c4109c32f1bfd965de9cc82d7c3f2c3c345", dir = "packages/web_ws" }
+web_core = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "bbf01c4109c32f1bfd965de9cc82d7c3f2c3c345", dir = "packages/web_core" }
+web_transport = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "bbf01c4109c32f1bfd965de9cc82d7c3f2c3c345", dir = "packages/web_transport" }
+web_http = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "bbf01c4109c32f1bfd965de9cc82d7c3f2c3c345", dir = "packages/web_http" }
 # /json's writer, as CeeSafe.Web's own benchmark server uses
 json = { git = "https://github.com/CeeSafe/CeeSafeLibs.git", rev = "ca0a13fec248bbe192f0b61b930c8b8259175eed", dir = "json" }

@@ -286,6 +286,11 @@ and the monitor's lateness, a median of 1.8 ms on one Linux core with the 2 ms s
 Xeon, one worker on one core beside two `/spin/200` clients: p50 0.30 ms and p99 1.35 to 1.56 ms (1.81 and 3.41 before),
 with `/small`'s rate unchanged.
 
+ceesafec 0.91.0 (ADR 0204) declares an async function's C locals as a sync function's: zeroed only when written in
+part or borrowed. Every one had been zeroed at every resume, each with a store of its own: 56 of them in the isolated
+relay's resume function. With CeeSafe.Web's Web ADR 0022, isolated `/small` on one core went from 46 691 to 51 280
+requests a second.
+
 ## What ceesafec 0.65.1 to 0.71.0 changed
 
 Released 2026-11-18 from these findings and httpclient's. 0.65.1 fixed S1, S6 and S13. 0.67.0 carries three ADRs:

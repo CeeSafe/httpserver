@@ -4,13 +4,13 @@ version = "0.1.0"
 kind = "library"
 sources = ["src"]
 tests = ["tests"]
-ceesafec = ">=0.89.0"
+ceesafec = ">=0.91.0"
 
 [dependencies]
 httpserver = { path = ".." }
-web_core = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "1b77e9779feee1f90732ff8450a3a0406ad3dbe4", dir = "packages/web_core" }
-web_transport = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "1b77e9779feee1f90732ff8450a3a0406ad3dbe4", dir = "packages/web_transport" }   # the tests' mock connection
-web_http = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "1b77e9779feee1f90732ff8450a3a0406ad3dbe4", dir = "packages/web_http" }
-web_http1 = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "1b77e9779feee1f90732ff8450a3a0406ad3dbe4", dir = "packages/web_http1" }
+web_core = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "bbf01c4109c32f1bfd965de9cc82d7c3f2c3c345", dir = "packages/web_core" }
+web_transport = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "bbf01c4109c32f1bfd965de9cc82d7c3f2c3c345", dir = "packages/web_transport" }   # the tests' mock connection
+web_http = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "bbf01c4109c32f1bfd965de9cc82d7c3f2c3c345", dir = "packages/web_http" }
+web_http1 = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "bbf01c4109c32f1bfd965de9cc82d7c3f2c3c345", dir = "packages/web_http1" }
 # The path check, media types, validators, conditional requests and ranges; its own handler is web_server's.
-web_static = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "1b77e9779feee1f90732ff8450a3a0406ad3dbe4", dir = "packages/web_static" }
+web_static = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "bbf01c4109c32f1bfd965de9cc82d7c3f2c3c345", dir = "packages/web_static" }
