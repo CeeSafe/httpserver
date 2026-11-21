@@ -202,9 +202,9 @@ polls = true              # the bound on a request that computes without waiting
 
 [dependencies]
 httpserver = { git = "https://github.com/CeeSafe/httpserver.git", rev = "<a commit of this repository>" }
-web_core = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "9e83e4d6a3c0a448481bfdf829d582038164d46b", dir = "packages/web_core" }
-web_transport = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "9e83e4d6a3c0a448481bfdf829d582038164d46b", dir = "packages/web_transport" }
-web_http = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "9e83e4d6a3c0a448481bfdf829d582038164d46b", dir = "packages/web_http" }
+web_core = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "9c38d143e2601c260c37a90eaeae8e308ea40188", dir = "packages/web_core" }
+web_transport = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "9c38d143e2601c260c37a90eaeae8e308ea40188", dir = "packages/web_transport" }
+web_http = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "9c38d143e2601c260c37a90eaeae8e308ea40188", dir = "packages/web_http" }
 ```
 
 The other packages are directories of this repository: add `dir`, as in
@@ -318,7 +318,7 @@ HTTP/3, give `applicationOf(app)` to `web_http3`'s server. Both are CeeSafe.Web'
 - **Static files** (`static/`): `Files<S>.create(root, FilesOptions.defaults())` is a handler for GET and HEAD
   that serves the regular files under `root`. The path is decoded once and checked lexically (a refused path, a
   FIFO or a device is 404), the validators are read from the open file, conditional requests and one range are
-  honoured, and the body goes out with `sendfile`. `FilesOptions.singlePage(page)` answers every path that is not a
+  honoured, and the body goes out with `sendfile`, isolated requests too (CeeSafe.Web's ADR 0020). `FilesOptions.singlePage(page)` answers every path that is not a
   file with a single-page application's page.
 - **WebSockets** (`ws/`): a `Hub` keeps the sessions of a process. A session joins (`hub.join(sender)`), enters
   groups (`membership.enter("room")`), and the hub sends to all (`broadcast`), to a group (`toGroup`) or to one

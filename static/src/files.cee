@@ -4,7 +4,8 @@
 // The work is CeeSafe.Web's `web_static`: the path is decoded once and checked lexically (`StaticPaths.relative`; a
 // refused path is 404), the file is opened as a regular file (a FIFO or a device is 404), its validators are read
 // from the open file, conditional requests and one range are honoured, and the body goes out with
-// `Exchange.sendFile`. This package is the handler for httpserver's `App`, and the fallback page.
+// `Exchange.sendFileOwned`, which gives the file away: an isolated request's connection then sends it with `sendfile`
+// too (Web ADR 0020). This package is the handler for httpserver's `App`, and the fallback page.
 import web_core;
 import web_http;
 import httpserver;
@@ -241,7 +242,7 @@ impl<S: Send + Share> Handler<S> for Files<S> {
                 exchange.header("content-range", range.view())?;
                 exchange.setStatus(Status.partialContent());
                 exchange.setContentLength(last - first + 1);
-                return await exchange.sendFile(mut file, first, last - first + 1);
+                return await exchange.sendFileOwned(file, first, last - first + 1);
             }
             RangeAsk.Unsatisfiable => {
                 var range = Vector<u8>.create();
@@ -253,7 +254,7 @@ impl<S: Send + Share> Handler<S> for Files<S> {
             RangeAsk.Whole => {
                 exchange.setStatus(Status.ok());
                 exchange.setContentLength(size);
-                return await exchange.sendFile(mut file, 0, size);
+                return await exchange.sendFileOwned(file, 0, size);
             }
         }
     }

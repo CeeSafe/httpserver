@@ -8,6 +8,6 @@ polls = true                   # ADR 0190: `App.run`'s bound sees a request that
 
 [dependencies]
 httpserver = { path = "../.." }
-web_core = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "9e83e4d6a3c0a448481bfdf829d582038164d46b", dir = "packages/web_core" }
-web_transport = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "9e83e4d6a3c0a448481bfdf829d582038164d46b", dir = "packages/web_transport" }
-web_http = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "9e83e4d6a3c0a448481bfdf829d582038164d46b", dir = "packages/web_http" }
+web_core = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "9c38d143e2601c260c37a90eaeae8e308ea40188", dir = "packages/web_core" }
+web_transport = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "9c38d143e2601c260c37a90eaeae8e308ea40188", dir = "packages/web_transport" }
+web_http = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "9c38d143e2601c260c37a90eaeae8e308ea40188", dir = "packages/web_http" }
